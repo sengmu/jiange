@@ -1,0 +1,75 @@
+extends Control
+## Top-right minimap (touch UI only, 2026-11-14 手游操作改版).
+## Reads live game state through `game` and redraws at ~10 Hz:
+## enemies red, boss orange large, allies green, hero gold ringed,
+## towers pale squares, seal core purple (west), rift mouths (east).
+
+var game: Node = null
+var _acc: float = 0.0
+const WORLD_X := 100.0
+const WORLD_Z := 52.0
+
+
+func _process(delta: float) -> void:
+	_acc += delta
+	if _acc >= 0.1:
+		_acc = 0.0
+		queue_redraw()
+
+
+func _map_pos(p: Vector3) -> Vector2:
+	var u := clampf((p.x + WORLD_X) / (WORLD_X * 2.0), 0.0, 1.0)
+	var v := clampf((p.z + WORLD_Z) / (WORLD_Z * 2.0), 0.0, 1.0)
+	return Vector2(6.0 + u * (size.x - 12.0), 6.0 + v * (size.y - 12.0))
+
+
+func _dot(p: Vector3, r: float, col: Color) -> void:
+	draw_circle(_map_pos(p), r, col)
+
+
+func _draw() -> void:
+	draw_rect(Rect2(Vector2.ZERO, size), Color(0.09, 0.07, 0.03, 0.78))
+	draw_rect(Rect2(Vector2.ZERO, size), Color(0.788, 0.635, 0.153, 0.80), false, 2.0)
+	if game == null:
+		return
+	# Lane guides: rift mouths (east) converging on the seal core (west).
+	var core_pos: Vector3 = game.get("CORE_POS")
+	_dot(core_pos, 5.0, Color(0.608, 0.302, 1.0))
+	for mouth in [Vector3(74, 0, -26), Vector3(74, 0, 26)]:
+		draw_line(_map_pos(mouth), _map_pos(core_pos), Color(1, 1, 1, 0.13), 3.0)
+		_dot(mouth, 4.0, Color(0.95, 0.35, 0.85))
+	# Towers as pale squares.
+	for t in game.get("towers"):
+		var tp: Vector3 = t["position"]
+		var c := _map_pos(tp)
+		draw_rect(Rect2(c - Vector2(3, 3), Vector2(6, 6)), Color(0.92, 0.88, 0.70))
+	# Allies: guard general + trainees in green.
+	# 已释放实例赋给类型化变量会直接报错（实测：守将阵亡后 general 仍指已释放节点，_draw 每 0.1s 刷一条错）；先无类型接、再判有效。
+	var general = game.get("general")
+	if is_instance_valid(general) and bool(general.get("alive")):
+		_dot(general.global_position, 3.0, Color(0.40, 1.0, 0.50))
+	for tr in game.get("trainees"):
+		if is_instance_valid(tr) and bool(tr.get("alive")):
+			_dot(tr.global_position, 2.0, Color(0.55, 0.95, 0.60))
+	# Enemies: red dots, beasts larger orange-red, bosses largest orange.
+	# A hidden assassin shows no dot (2D: invisible units are not drawn);
+	# once revealed or detected it reads as an ordinary enemy dot.
+	for e in game.get("enemies"):
+		if not is_instance_valid(e) or not bool(e.get("alive")):
+			continue
+		if bool(game.call("_assassin_hidden", e)):
+			continue
+		var arch := String(e.get("archetype"))
+		if arch == "boss":
+			_dot(e.global_position, 5.0, Color(1.0, 0.62, 0.15))
+		elif arch == "beast":
+			_dot(e.global_position, 4.0, Color(1.0, 0.45, 0.25))
+		else:
+			_dot(e.global_position, 2.5, Color(1.0, 0.30, 0.22))
+	# Hero last: gold dot with a white ring so he is findable at a glance.
+	# 同上：英雄阵亡到重生之间 strategist 也可能指已释放节点，先无类型接、再判有效。
+	var hero = game.get("strategist")
+	if is_instance_valid(hero) and bool(hero.get("alive")):
+		var hc := _map_pos(hero.global_position)
+		draw_arc(hc, 6.0, 0.0, TAU, 24, Color(1, 1, 1, 0.95), 2.0)
+		draw_circle(hc, 4.0, Color(1.0, 0.85, 0.30))

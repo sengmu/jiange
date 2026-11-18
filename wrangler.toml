@@ -1,0 +1,7 @@
+name = "jiange-packs-game"
+main = "deploy/worker.js"
+compatibility_date = "2024-11-01"
+
+[assets]
+directory = "./build/web"
+binding = "ASSETS"

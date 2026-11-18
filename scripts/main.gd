@@ -1,0 +1,10678 @@
+extends Node3D
+## Jiange 3D vertical slice: one dusk mountain-pass defense battle.
+## All geometry is original and procedural. Combat damage flows through
+## apply_damage()/damage_core() only.
+
+const UnitScript: GDScript = preload("res://scripts/articulated_unit.gd")
+const BeastScript: GDScript = preload("res://scripts/siege_beast.gd")
+const JoystickScript: GDScript = preload("res://scripts/joystick.gd")
+const MinimapScript: GDScript = preload("res://scripts/minimap.gd")
+
+# Embedded CJK fonts (subsetted Noto Sans CJK SC, 724 chars: the 515
+# CJK/punct chars used in scripts/scenes + ASCII + Latin-1). The project
+# previously relied on the engine default font + system fallback, which
+# does not exist in Web exports -> tofu boxes. Label3D nodes get the
+# Regular face explicitly; Controls inherit it via gui/theme/custom_font.
+const CJK_FONT: Font = preload("res://assets/fonts/NotoSansCJKsc-Regular.ttf")
+const CJK_FONT_BOLD: Font = preload("res://assets/fonts/NotoSansCJKsc-Bold.ttf")
+
+const CORE_MAX_HP: float = 520.0
+const MAX_WAVES: int = 20 # stage-1: full 20-wave run (was 5 in the slice)
+const SPAWN_INTERVAL: float = 1.15
+const INTERMISSION_TIME: float = 12.0
+const CHAIN_DAMAGE: float = 30.0 # was 34.0 before the optimization-round balance pass
+const CHAIN_MAX_TARGETS: int = 5
+const CHAIN_RANGE: float = 25.0
+const CHAIN_JUMP_RANGE: float = 9.0
+const SKILL_COOLDOWN_TIME: float = 5.0
+const TOWER_RANGE: float = 26.0
+const TOWER_DAMAGE: float = 9.0 # was 11.0 before the optimization-round balance pass
+const TOWER_COOLDOWN_TIME: float = 0.65 # was 0.55 before the optimization-round balance pass
+const PROJECTILE_SPEED: float = 32.0
+# Content-expansion round: economy + buildable towers.
+const START_GOLD: int = 50
+const INFANTRY_BOUNTY: int = 10
+const ARCHER_BOUNTY: int = 14
+const CAVALRY_BOUNTY: int = 16
+const BEAST_BOUNTY: int = 80
+const THUNDER_COST: int = 120
+const FLAME_COST: int = 100
+const REPAIR_COST: int = 80
+const REPAIR_AMOUNT: float = 160.0
+const THUNDER_RANGE: float = 20.0
+const THUNDER_DAMAGE: float = 22.0 # was 26.0 before the optimization-round balance pass
+const THUNDER_MAX_TARGETS: int = 3
+const THUNDER_JUMP_RANGE: float = 8.0
+const THUNDER_COOLDOWN_TIME: float = 2.2
+const FLAME_RANGE: float = 24.0
+const FLAME_DAMAGE: float = 26.0 # was 30.0 before the optimization-round balance pass
+const FLAME_AOE: float = 3.2
+const FLAME_COOLDOWN_TIME: float = 1.6
+# Stage-2 tower system: the six 2D buildable types （箭塔/玄冰塔/天雷塔/
+# 投石塔/天火塔/强弩塔）. Prices anchor on the slice's thunder (120) and
+# flame (100); the rest follow the 2D table's relative tiers (2D gold
+# 300/450/550/600/650/800, wood dropped like the mercenary table).
+# dmg/range/cd are level-1 values; upgrades multiply damage by
+# (1 + 0.55*(lvl-1)) like the 2D game.
+const TOWER_DEFS := {
+	"arrow": {"name": "箭塔", "cost": 60, "dmg": 9.0, "range": 26.0, "cd": 0.65, "desc": "廉价速射"},
+	"frost": {"name": "玄冰塔", "cost": 110, "dmg": 12.0, "range": 22.0, "cd": 1.0, "desc": "范围减速"},
+	"thunder": {"name": "天雷塔", "cost": 120, "dmg": 22.0, "range": 20.0, "cd": 2.2, "desc": "链式闪电"},
+	"stone": {"name": "投石塔", "cost": 150, "dmg": 34.0, "range": 27.0, "cd": 2.2, "desc": "范围轰击"},
+	"flame": {"name": "天火塔", "cost": 100, "dmg": 26.0, "range": 24.0, "cd": 1.6, "desc": "范围燃烧"},
+	"crossbow": {"name": "强弩塔", "cost": 180, "dmg": 46.0, "range": 30.0, "cd": 1.9, "desc": "远程重击"},
+}
+const TOWER_TYPES_ORDER := ["arrow", "frost", "thunder", "stone", "flame", "crossbow"]
+const TOWER_BASE_HP: float = 600.0
+const TOWER_UP_COSTS := [25, 50] # Lv1->2, Lv2->3 (2D 250/500 gold at 1/10, wood dropped)
+const TOWER_UP_HP: float = 250.0
+const FROST_SLOW_MUL: float = 0.55
+const FROST_SLOW_TIME: float = 2.0
+const FROST_AOE: float = 2.5
+const STONE_AOE: float = 3.8
+
+# Per-wave pressure scaling. The slice used 5-entry tables; stage-1 uses
+# formulas over the full 20 waves (see wave_hp_scale() etc. below).
+func wave_hp_scale(w: int) -> float:
+	# Calibration G1 (2026-11-15, user-approved): foe HP growth raised
+	# 0.15 -> 0.30/wave (2D foeStats uses 0.50; 3D fields ~2.3x the
+	# bodies, so ~60% of the 2D slope). ATK growth is new (was flat).
+	return 1.0 + 0.30 * float(w - 1)
+
+
+func wave_atk_scale(w: int) -> float:
+	return 1.0 + 0.12 * float(w - 1)
+
+
+func wave_beast_scale(w: int) -> float:
+	return 1.0 + 0.10 * float(w - 1)
+
+
+func wave_spawn_interval(w: int) -> float:
+	return maxf(0.60, 1.15 - 0.03 * float(w - 1))
+
+
+# Stage-1 full-map layout (one connected battlefield, ~2.3x the slice's
+# span): main base west (seal core behind a north-south wall line with a
+# gate), TWO enemy approach lanes from the north-east and south-east rifts
+# converging at the boss plaza, then a shared trunk road to the gate.
+const CORE_POS := Vector3(-72, 0, 0)
+const GUARD_POS := Vector3(-46, 0, 0)
+const HERO_HOME := Vector3(-62, 0, 6)
+const PLAZA_POS := Vector3(24, 0, 0)
+const LANE_NORTH: Array = [Vector3(74, 0, -26), Vector3(52, 0, -25), Vector3(36, 0, -12), Vector3(26, 0, -2), Vector3(2, 0, 0), Vector3(-28, 0, 1), Vector3(-52, 0, 0), Vector3(-63, 0, 0)]
+const LANE_SOUTH: Array = [Vector3(74, 0, 26), Vector3(52, 0, 25), Vector3(36, 0, 12), Vector3(26, 0, 2), Vector3(2, 0, 0), Vector3(-28, 0, 1), Vector3(-52, 0, 0), Vector3(-63, 0, 0)]
+# Training grounds (stage-1: zones + basic weak spawns; entry fees, the
+# growth-gear rooms and officer levels are stage 2).
+const TRAIN_ZONE := Rect2(-63, 25, 22, 16) # brush-soldiers pen, south-west
+const TRAIN_SPAWN_POINTS: Array = [Vector3(-58, 0, 29), Vector3(-52, 0, 33), Vector3(-46, 0, 29), Vector3(-52, 0, 37)]
+const TRAIN_BOSS_ZONE := Rect2(-63, -41, 29, 16) # small-boss pen, north-west
+const TRAIN_BRUSH_FEE := 50 # 2D 500 at the 1/10 price scale (books/refine precedent)
+const TRAIN_BOSS_FEE := 300 # 2D 3000, same scale
+const GROWTH_ITEM_NAMES: Array = ["的卢", "李广之弓", "龙鳞铠甲", "方天画戟"]
+# Quest catalogue (2D QUEST_DEFS; shangfanggu is the wave-20 finale
+# and lands with its own stage-2 item, listed here for the log).
+const QUEST_DEFS: Array = [
+	{"id": "qiangdao", "n": "强盗任务", "g": "村长", "d": "去森林西缘杀强盗头子（他会复活一次），带人头回村长处", "r": "黄金装备 1 件"},
+	{"id": "xincheng", "n": "新城书信", "g": "孔明（第 8 波后）", "d": "雅丹丞相死后回孔明处取书信，送往左上新城交给孟达；徐晃会来杀孟达，务必护住", "r": "新城开放 + 孟达助守"},
+	{"id": "shoupi", "n": "兽皮收购", "g": "猎人", "d": "野兽掉落兽皮，猎人收购：普通 150 / 优质 400（常驻）", "r": "金币"},
+	{"id": "baixing", "n": "百姓护送", "g": "事件（每 5 波）", "d": "村民自东面逃向基地，途中强盗截杀；护送存活计数，累计救满 30 人后找村长", "r": "每救 1 人 30 金 / 幽灵护符"},
+	{"id": "yuxi", "n": "玉玺", "g": "玄武", "d": "击败水域玄武得玉玺，交给帅帐旁的孔明", "r": "孔明连升 2 级（守将成长）"},
+	{"id": "dudan", "n": "鱼肠剑·毒腺", "g": "村外老头", "d": "训练长官等级 > 6 后找老头接任务，杀森林东南的血浴之母取毒腺回报", "r": "徐夫人（匕首）"},
+	{"id": "xiangyu", "n": "挑战·项羽之魂", "g": "墓地", "d": "墓地定点挑战，死后重生（3 分钟）", "r": "随机黄金装备"},
+	{"id": "xingtian", "n": "挑战·刑天", "g": "西南刑天出生地", "d": "定点挑战，死后重生（3 分钟）", "r": "随机黄金装备"},
+	{"id": "yaoshu", "n": "妖术师头目", "g": "北面林地", "d": "击杀妖术师头目", "r": "斩蛇剑 + 轩辕剑"},
+	{"id": "hun", "n": "魂", "g": "墓地深处", "d": "击杀幽冥魂主得「魂」，使用可化魂 8 秒不受伤害", "r": "魂（圣物）"},
+	{"id": "xuanyuan", "n": "轩辕剑开光", "g": "炼化师", "d": "持轩辕剑杀项羽之魂取「魄」，回炼化师处开光", "r": "开光轩辕剑"},
+	{"id": "shangfanggu", "n": "上方谷", "g": "终局（第 20 波）", "d": "引司马懿入上方谷火困，先杀司马昭、再杀司马师、最后杀司马懿", "r": "通关"},
+]
+# Map-completion zones (LOOP_STATE -0.5, 2026-11-14 round): the wild
+# areas of TEARDOWN §2 fitted into the full map's open ground — the
+# forest in the north-east (青龙's quarter, east per the four-symbols
+# layout) and the graveyard in the north-west (白虎's side, beside the
+# small-boss room). Terrain + points + signs only; the quest / saint /
+# challenge systems they host are stage 2, and the signs say so (same
+# convention as the small-boss room sign).
+const FOREST_ZONE := Rect2(44, -43, 38, 12) # x 44..82, z -43..-31
+const GRAVE_ZONE := Rect2(-34, -43, 30, 13) # x -34..-4, z -43..-30
+const WATER_ZONE := Rect2(44, 31, 38, 12) # x 44..82, z 31..43 (SE mirror of forest)
+const NEWCITY_ZONE := Rect2(-84, -42, 17, 16) # x -84..-67, z -42..-26 (NW strip west of Pen B)
+const VALLEY_ZONE := Rect2(83, -44, 4, 13) # x 83..87, z -44..-31 (NE gorge foot, east of the forest)
+
+# --- Ground readability (VISUAL_AUDIT P1-1, 画面清单「地面可读性」) ---
+# P1-1 fix (2026-11-13): seams read as soil lines, not black cuts —
+# underlay lifted to a mid olive-earth, tiles overlap more (3.30), grass
+# tint brightened with a small deterministic per-tile variation so the
+# field stops reading as a flat checkerboard; road tiles tinted close to
+# the ribbon so their diagonal stripe texture no longer cuts dark bars
+# across the lanes; ribbons widened to cover the whole road band and
+# aprons pave the plaza / courtyard / market / training floors, so every
+# road area is one continuous packed-earth surface.
+# -0.6 地面连续化 (2026-11-14, user device report): the per-tile tint
+# jitter + 0.012 alternating y-step still read as a stark hex
+# checkerboard at phone viewing distances, so the grass is no longer
+# hex tiles at all — it is ONE continuous vertex-colored surface
+# (_build_ground_surface) whose color field keeps only the slow
+# spatial variation, plus a fine low-amplitude mottle. Hex tiles now
+# pave ONLY the hard road areas (under the ribbons / aprons). Zone
+# floors (forest moss, graveyard ash) are baked into the same surface
+# with feathered blends instead of hard-edged apron boxes.
+var ground_tile_scale := 3.30
+var ground_underlay_color := Color.html("#75804f")
+var grass_tint := Color(0.513, 0.647, 0.486) # 全局色调 Rev 4: desat+bluegrey mix, lum kept
+var road_tile_tint := Color(0.714, 0.624, 0.488) # 全局色调 Rev 4: desat+bluegrey mix, lum kept
+var forest_floor_color := Color.html("#485143") # 全局色调 Rev 4: desat+bluegrey mix, lum kept
+var grave_floor_color := Color.html("#595651") # 全局色调 Rev 4: desat+bluegrey mix, lum kept
+var water_floor_color := Color.html("#48574f") # 全局色调 Rev 4: desat+bluegrey mix, lum kept
+var newcity_floor_color := Color.html("#67604e") # 全局色调 Rev 4: desat+bluegrey mix, lum kept
+var valley_floor_color := Color.html("#6a5f48") # 全局色调 Rev 4: desat+bluegrey mix, lum kept
+var ground_surface: MeshInstance3D
+var road_ribbon_color := Color.html("#83745d") # 全局色调 Rev 4: desat+bluegrey mix, lum kept
+var road_ribbon_width := 8.8
+var road_center_color := Color.html("#95866f") # 全局色调 Rev 4: desat+bluegrey mix, lum kept
+# 破损件清零 Rev 1 (2026-11-14): sweep probe verified these tints read
+# pale/white in sun-facing views; harness Test 35 pins the values.
+var field_tree_tint := Color(0.26, 0.42, 0.28)
+var forest_tree_tint := Color(0.24, 0.40, 0.26)
+var rubble_tint_a := Color(0.46, 0.42, 0.37)
+var rubble_tint_b := Color(0.42, 0.38, 0.34)
+var rock_cluster_tint := Color(0.48, 0.44, 0.39)
+var watchtower_stone_tint := Color(0.622, 0.620, 0.609) # 全局色调 Rev 4: desat+bluegrey mix, lum kept
+var wall_stone_tint := Color(0.699, 0.681, 0.662) # 全局色调 Rev 4: desat+bluegrey mix, lum kept
+var ballista_tint := Color(0.55, 0.45, 0.35)
+var banner_red_tint := Color(0.609, 0.232, 0.232) # 全局色调 Rev 4: desat+bluegrey mix, lum kept
+var flag_glyph_index := 0 # 三国身份强化 Rev 1: running index for FlagGlyph nodes
+var rift_shard_tint := Color(0.35, 0.10, 0.80)
+var rift_shard_emission := Color(0.45, 0.12, 1.0)
+var qinglong_crystal_tint := Color(0.22, 0.68, 0.36)
+# 破损件清零 Rev 1: world_root 下同名盒子会被 Godot 自动改名成
+# "@MeshInstance3D@N"（Test 34 的圆盘坑同款），计数断言找不到它们；
+# 岩体/顶石一律按序编号命名，harness 按 glob 计数。
+var _rock_mass_seq := 0
+var road_center_width := 4.4
+
+# --- Hero roster (TEARDOWN §3, all 22, data-driven) -----------------------
+# birth/growth are [str, agi, int]; speed is the original War3 move speed
+# (game speed = speed * 0.016). kit: "full" = bespoke skill implementation
+# in cast_hero_skill(); "generic" = stats-driven archetype kit (the skill
+# carries the hero's signature skill NAME with a generic implementation —
+# disclosed in BUILD_LOG). pw: hidden-hero unlock password (TEARDOWN §3).
+var HERO_ROSTER: Array = [
+	{"id": "zhaotong", "name": "赵统", "kind": "近战", "attr": "agi", "birth": [18, 21, 13], "growth": [2.2, 2.2, 1.6], "speed": 320, "ranged": false, "visual": "rogue", "tint": Color(0.85, 0.90, 1.05), "skill": "line_slash", "skill_name": "残影剑", "kit": "full", "passive": "crit", "pw": ""},
+	{"id": "zhaoguang", "name": "赵广", "kind": "远程", "attr": "agi", "birth": [18, 19, 15], "growth": [2.1, 2.3, 1.6], "speed": 320, "ranged": true, "visual": "archer", "tint": Color(0.80, 0.88, 1.0), "skill": "frost_arrow", "skill_name": "玄冰神箭", "kit": "full", "passive": "", "pw": ""},
+	{"id": "menghuo", "name": "孟获", "kind": "近战", "attr": "str", "birth": [25, 14, 13], "growth": [3.0, 1.6, 1.4], "speed": 270, "ranged": false, "visual": "enemy", "tint": Color(1.05, 0.85, 0.66), "skill": "slam", "skill_name": "雷霆一击", "kit": "full", "passive": "", "pw": ""},
+	{"id": "jiangwei", "name": "姜维", "kind": "远程", "attr": "int", "birth": [17, 15, 21], "growth": [2.0, 1.5, 2.5], "speed": 270, "ranged": true, "visual": "strategist", "tint": Color(0.80, 0.95, 0.85), "skill": "fire_line", "skill_name": "烈火燎原", "kit": "full", "passive": "", "pw": ""},
+	{"id": "guanxing", "name": "关兴", "kind": "近战", "attr": "agi", "birth": [19, 23, 16], "growth": [2.2, 2.2, 1.6], "speed": 320, "ranged": false, "visual": "general", "tint": Color(0.72, 1.0, 0.78), "skill": "blink_strike", "skill_name": "幻影斩", "kit": "full", "passive": "lifesteal", "pw": ""},
+	{"id": "guansuo", "name": "关索", "kind": "近战", "attr": "str", "birth": [26, 14, 13], "growth": [3.0, 1.65, 1.35], "speed": 300, "ranged": false, "visual": "general", "tint": Color(0.62, 0.95, 0.70), "skill": "bind", "skill_name": "束缚", "kit": "full", "passive": "", "pw": ""},
+	{"id": "guanfeng", "name": "关凤", "kind": "近战", "attr": "agi", "birth": [19, 23, 16], "growth": [2.1, 2.15, 1.75], "speed": 320, "ranged": false, "visual": "rogue", "tint": Color(0.95, 0.80, 0.85), "skill": "rift_slash", "skill_name": "裂空斩", "kit": "full", "passive": "", "pw": ""},
+	{"id": "zhangbao", "name": "张苞", "kind": "近战", "attr": "str", "birth": [26, 13, 13], "growth": [3.2, 1.5, 1.3], "speed": 320, "ranged": false, "visual": "enemy", "tint": Color(0.95, 0.80, 0.70), "skill": "earth_stomp", "skill_name": "地裂脚", "kit": "full", "passive": "", "pw": ""},
+	{"id": "wangping", "name": "王平", "kind": "近战", "attr": "str", "birth": [22, 13, 17], "growth": [2.7, 1.5, 1.8], "speed": 320, "ranged": false, "visual": "general", "tint": Color(0.85, 0.88, 0.80), "skill": "armor_break", "skill_name": "削铁如泥", "kit": "full", "passive": "", "pw": ""},
+	{"id": "luxun", "name": "陆逊", "kind": "远程", "attr": "int", "birth": [15, 15, 22], "growth": [2.0, 1.7, 2.3], "speed": 300, "ranged": true, "visual": "strategist", "tint": Color(0.95, 0.85, 0.75), "skill": "heart_curse", "skill_name": "蚀心咒", "kit": "full", "passive": "", "pw": "luboyan"},
+	{"id": "masu", "name": "马谡", "kind": "远程", "attr": "int", "birth": [15, 14, 22], "growth": [2.0, 1.0, 3.0], "speed": 300, "ranged": true, "visual": "strategist", "tint": Color(0.85, 0.88, 1.0), "skill": "thunder_chain", "skill_name": "一指惊雷", "kit": "full", "passive": "", "pw": ""},
+	{"id": "muludawang", "name": "木鹿大王", "kind": "远程", "attr": "str", "birth": [21, 17, 16], "growth": [3.2, 2.3, 2.4], "speed": 280, "ranged": true, "visual": "strategist", "tint": Color(0.80, 0.90, 0.66), "skill": "hex", "skill_name": "妖术", "kit": "full", "passive": "", "pw": "muludawang"},
+	{"id": "huangyueying", "name": "黄月英", "kind": "远程", "attr": "int", "birth": [17, 14, 22], "growth": [1.8, 1.0, 3.2], "speed": 270, "ranged": true, "visual": "strategist", "tint": Color(0.90, 0.95, 0.80), "skill": "heal", "skill_name": "天降甘霖", "kit": "full", "passive": "", "pw": ""},
+	{"id": "xiahhouba", "name": "夏侯霸", "kind": "近战", "attr": "str", "birth": [22, 18, 17], "growth": [2.5, 1.7, 1.8], "speed": 280, "ranged": false, "visual": "general", "tint": Color(0.90, 0.78, 0.66), "skill": "thunder_bomb", "skill_name": "轰天雷", "kit": "full", "passive": "", "pw": ""},
+	{"id": "liuchen", "name": "刘谌", "kind": "近战", "attr": "str", "birth": [22, 15, 15], "growth": [3.1, 1.5, 1.4], "speed": 270, "ranged": false, "visual": "general", "tint": Color(0.95, 0.88, 0.70), "skill": "rift_slash", "skill_name": "裂空斩", "kit": "full", "passive": "curhp", "pw": "beidiwang"},
+	{"id": "jiangwan", "name": "蒋琬", "kind": "远程", "attr": "int", "birth": [16, 14, 23], "growth": [2.0, 1.0, 3.0], "speed": 270, "ranged": true, "visual": "strategist", "tint": Color(0.88, 0.92, 0.85), "skill": "mana_burn", "skill_name": "法力燃烧", "kit": "full", "passive": "", "pw": ""},
+	{"id": "zhugezhan", "name": "诸葛瞻", "kind": "远程", "attr": "int", "birth": [14, 17, 19], "growth": [1.8, 1.0, 3.2], "speed": 270, "ranged": true, "visual": "strategist", "tint": Color(0.82, 0.86, 0.98), "skill": "frost_burst", "skill_name": "玄冰爆", "kit": "full", "passive": "", "pw": ""},
+	{"id": "huaman", "name": "花蔓", "kind": "远程", "attr": "agi", "birth": [18, 19, 15], "growth": [1.9, 2.3, 1.8], "speed": 320, "ranged": true, "visual": "archer", "tint": Color(0.85, 0.95, 0.75), "skill": "poison", "skill_name": "淬毒", "kit": "full", "passive": "", "pw": ""},
+	{"id": "liaohua", "name": "廖化", "kind": "近战", "attr": "str", "birth": [20, 16, 16], "growth": [2.7, 1.5, 1.8], "speed": 270, "ranged": false, "visual": "enemy", "tint": Color(0.90, 0.84, 0.72), "skill": "fire_breath", "skill_name": "火焰呼吸", "kit": "full", "passive": "drunk", "pw": ""},
+	{"id": "zhurong", "name": "祝融夫人", "kind": "远程", "attr": "agi", "birth": [18, 19, 15], "growth": [2.0, 2.2, 1.8], "speed": 330, "ranged": true, "visual": "archer", "tint": Color(1.0, 0.82, 0.70), "skill": "explosive_arrow", "skill_name": "爆裂箭", "kit": "full", "passive": "", "pw": ""},
+	{"id": "madai", "name": "马岱", "kind": "近战", "attr": "agi", "birth": [18, 22, 12], "growth": [2.3, 2.3, 1.4], "speed": 320, "ranged": false, "visual": "rogue", "tint": Color(0.80, 0.85, 0.90), "skill": "sleeve_arrow", "skill_name": "袖箭", "kit": "full", "passive": "", "pw": ""},
+	{"id": "mazhong", "name": "马忠", "kind": "近战", "attr": "agi", "birth": [19, 20, 16], "growth": [2.0, 2.2, 1.6], "speed": 320, "ranged": false, "visual": "rogue", "tint": Color(0.86, 0.80, 0.90), "skill": "poison_arrow", "skill_name": "毒箭", "kit": "full", "passive": "", "pw": ""},
+]
+
+# --- Wave bosses (TEARDOWN §4: waves 1-10 documented per-wave; 11-19 are
+# the documented late-game general pool in escalating order — per-wave
+# assignment flagged 待校准 in PARITY; wave 20 = the Three Simas in the
+# original kill order 昭 -> 师 -> 懿, 上方谷 fire-trap event is stage 2).
+# 邓艾: TEARDOWN §4 late pool lists 10 names for waves 11-19 (9 waves);
+# PARITY §4 and the 2D game both use the 9-name assignment below, so 邓艾
+# stays unassigned (待校准) rather than inventing a wave for him. Wave 6
+# restored to the full three brothers 2026-11-13 (张宝 was missing).
+# Calibration G2 (2026-11-15): each mul moved halfway (geometric mean)
+# toward its 2D BOSSES mul, un-compressing the table (was 0.85-2.60,
+# 2D spans 0.8-3.4).
+var BOSS_TABLE: Dictionary = {
+	1: [{"name": "韩德", "visual": "general", "tint": Color(0.80, 0.82, 0.90), "mul": 0.95, "ranged": false}],
+	2: [{"name": "夏侯楙", "visual": "rogue", "tint": Color(0.85, 0.80, 0.88), "mul": 1.00, "ranged": false}],
+	3: [{"name": "华雄", "visual": "enemy", "tint": Color(0.95, 0.72, 0.60), "mul": 1.10, "ranged": false}],
+	4: [{"name": "王朗", "visual": "strategist", "tint": Color(0.88, 0.85, 0.78), "mul": 0.82, "ranged": true}],
+	5: [{"name": "郭淮", "visual": "general", "tint": Color(0.78, 0.85, 0.92), "mul": 1.15, "ranged": false}],
+	6: [{"name": "张角", "visual": "strategist", "tint": Color(1.0, 0.90, 0.55), "mul": 1.17, "ranged": true}, {"name": "张梁", "visual": "strategist", "tint": Color(0.95, 0.82, 0.60), "mul": 0.92, "ranged": true}, {"name": "张宝", "visual": "strategist", "tint": Color(0.90, 0.78, 0.55), "mul": 0.97, "ranged": true}],
+	7: [{"name": "越吉元帅", "visual": "enemy", "tint": Color(0.92, 0.78, 0.62), "mul": 1.25, "ranged": false}],
+	8: [{"name": "雅丹丞相", "visual": "strategist", "tint": Color(0.84, 0.88, 0.80), "mul": 1.22, "ranged": true}],
+	9: [{"name": "董卓", "visual": "enemy", "tint": Color(1.0, 0.68, 0.55), "mul": 1.52, "ranged": false}],
+	10: [{"name": "王双", "visual": "enemy", "tint": Color(1.0, 0.62, 0.50), "mul": 1.65, "ranged": false}],
+	11: [{"name": "徐晃", "visual": "general", "tint": Color(0.75, 0.82, 0.95), "mul": 1.64, "ranged": false}],
+	12: [{"name": "曹真", "visual": "general", "tint": Color(0.82, 0.80, 0.92), "mul": 1.69, "ranged": false}],
+	13: [{"name": "张郃", "visual": "rogue", "tint": Color(0.78, 0.86, 0.90), "mul": 1.74, "ranged": false}],
+	14: [{"name": "夏侯霸", "visual": "general", "tint": Color(0.90, 0.76, 0.62), "mul": 1.82, "ranged": false}],
+	15: [{"name": "邓忠", "visual": "archer", "tint": Color(0.80, 0.84, 0.95), "mul": 1.87, "ranged": true}],
+	16: [{"name": "许褚", "visual": "enemy", "tint": Color(1.0, 0.70, 0.52), "mul": 2.02, "ranged": false}],
+	17: [{"name": "张辽", "visual": "general", "tint": Color(0.72, 0.80, 1.0), "mul": 2.12, "ranged": false}],
+	18: [{"name": "曹操", "visual": "general", "tint": Color(0.88, 0.78, 0.95), "mul": 2.29, "ranged": false}],
+	19: [{"name": "吕布", "visual": "enemy", "tint": Color(1.05, 0.55, 0.45), "mul": 2.64, "ranged": false}],
+	20: [{"name": "司马昭", "visual": "rogue", "tint": Color(0.70, 0.72, 0.95), "mul": 2.14, "ranged": false}, {"name": "司马师", "visual": "general", "tint": Color(0.66, 0.70, 0.98), "mul": 2.36, "ranged": false}, {"name": "司马懿", "visual": "strategist", "tint": Color(0.60, 0.62, 1.0), "mul": 2.97, "ranged": true}],
+}
+
+
+# Boss signature skills (stage 2, TEARDOWN §4): skill lists mirror the 2D
+# BOSSES table verbatim; primitives (BSK_DEF) map onto the status engine
+# and apply_damage hooks. Boss skill damage = boss.attack_damage x mult
+# (2D flat values rescaled: 2D nuke 900 ~ 40% of an early hero's HP).
+# Adaptations, all deliberate: no mana in 3D -> 法力燃烧 lands as damage +
+# atk_cut (same call as hero 蒋琬「蚀」); no armor stat -> 破甲阵 aura lands
+# as vuln; 召唤战鹰 uses the beast body (no flying in 3D, cf. 朱雀);
+# 白马阵 aura applies to the boss itself; 嗜血 drives the unit's plain
+# attack_cooldown_time var; 天神下凡 grants control/DoT immunity.
+var BOSS_SKILLS: Dictionary = {
+	"韩德": {"skills": ["破甲阵", "倍击", "玄冰咒", "天下无敌", "回生术"], "special": "hande"},
+	"夏侯楙": {"skills": ["倍击", "幻影斩", "分身", "闪避"]},
+	"华雄": {"skills": ["裂空斩", "雷霆一击", "嗜血", "束缚"]},
+	"王朗": {"skills": ["五行罩", "玄冰爆", "法力燃烧", "玄冰真气"]},
+	"郭淮": {"skills": ["束缚", "群体治疗", "红色怒雷", "削铁如泥", "战鼓"]},
+	"张角": {"skills": ["天石术", "治疗术", "五行罩"]},
+	"张梁": {"skills": ["天火", "嗜血"]},
+	"张宝": {"skills": ["傀儡术", "无名火", "烈火燎原"]},
+	"越吉元帅": {"skills": ["冲锋", "白马阵", "地裂脚", "重击", "战鼓"]},
+	"雅丹丞相": {"skills": ["荆棘阵", "天石术", "召唤野兽", "召唤战鹰", "霹雳闪电"]},
+	"董卓": {"skills": ["天神下凡", "分裂", "地裂脚", "狮子吼"], "special": "qixing"},
+	"王双": {"skills": ["雷霆一击", "束缚", "嗜血", "天神下凡", "致命一击"], "special": "lieyan"},
+	"徐晃": {"skills": ["重击", "束缚", "战鼓", "嗜血"]},
+	"曹真": {"skills": ["玄冰爆", "五行罩", "法力燃烧", "束缚"]},
+	"张郃": {"skills": ["幻影斩", "分身", "闪避", "倍击"]},
+	"夏侯霸": {"skills": ["天火", "血刃", "致命一击", "冲锋"]},
+	"邓忠": {"skills": ["束缚", "地裂脚", "狮子吼", "重击"]},
+	"许褚": {"skills": ["重击", "天神下凡", "分裂", "致命一击"]},
+	"张辽": {"skills": ["裂空斩", "冲锋", "白马阵", "重击", "幻影斩"]},
+	"曹操": {"skills": ["蚀心咒", "天石术", "狮子吼", "化魔盾", "召唤野兽"]},
+	"吕布": {"skills": ["天神下凡", "分裂", "致命一击", "冲锋", "雷霆一击"]},
+	"司马昭": {"skills": ["雷霆一击", "束缚", "天火", "战鼓"]},
+	"司马师": {"skills": ["裂空斩", "镜像", "倍击", "幻影斩"]},
+	"司马懿": {"skills": ["雷动九天", "星辰爆", "蚀心咒", "化魔盾"]},
+}
+
+const BSK_GATE_KINDS: Array = ["nuke", "burnmp", "blink", "line", "aoe", "bind", "chain", "dot", "debuff_vuln", "tianshi", "zone"]
+
+var BSK_DEF: Dictionary = {
+	"倍击": {"kind": "pcrit", "ch": 0.25, "mul": 3.0},
+	"致命一击": {"kind": "pcrit", "ch": 0.20, "mul": 4.5},
+	"闪避": {"kind": "pevade", "v": 0.30},
+	"分裂": {"kind": "pcleave", "v": 0.35},
+	"血刃": {"kind": "plife", "v": 0.25},
+	"重击": {"kind": "pbash", "ch": 0.20, "mul": 2.0},
+	"红色怒雷": {"kind": "predthunder"},
+	"破甲阵": {"kind": "paura_vuln", "v": 0.15},
+	"玄冰真气": {"kind": "paura_slow", "v": 0.25},
+	"荆棘阵": {"kind": "paura_reflect", "v": 0.20},
+	"战鼓": {"kind": "paura_atk", "v": 0.25},
+	"白马阵": {"kind": "pspd", "v": 0.20},
+	"玄冰咒": {"kind": "nuke", "mult": 9.0, "stun": 2.5, "cd": 12.0},
+	"玄冰爆": {"kind": "nuke", "mult": 7.0, "slow": 0.5, "cd": 11.0},
+	"法力燃烧": {"kind": "burnmp", "mult": 6.0, "cd": 12.0},
+	"幻影斩": {"kind": "blink", "mult": 6.0, "cd": 10.0},
+	"分身": {"kind": "mirror", "cnt": 2, "pct": 0.6, "cd": 30.0},
+	"镜像": {"kind": "mirror", "cnt": 2, "pct": 0.6, "cd": 30.0},
+	"裂空斩": {"kind": "line", "mult": 9.0, "cd": 12.0},
+	"烈火燎原": {"kind": "line", "mult": 9.0, "cd": 13.0, "flame": true},
+	"雷霆一击": {"kind": "aoe", "mult": 6.0, "stun": 1.5, "cd": 12.0},
+	"地裂脚": {"kind": "aoe", "mult": 5.5, "stun": 2.0, "cd": 12.0},
+	"天火": {"kind": "aoe", "mult": 5.0, "dot": 1.2, "cd": 11.0},
+	"束缚": {"kind": "bind", "dur": 6.0, "dps_mult": 0.8, "cd": 16.0},
+	"霹雳闪电": {"kind": "chain", "mult": 5.0, "jumps": 4, "stun": 1.2, "cd": 13.0},
+	"天石术": {"kind": "tianshi", "mult": 7.5, "cd": 16.0},
+	"蚀心咒": {"kind": "dot", "dps_mult": 1.5, "dur": 12.0, "cd": 14.0},
+	"削铁如泥": {"kind": "debuff_vuln", "v": 0.20, "dur": 10.0, "cd": 13.0},
+	"狮子吼": {"kind": "debuff_roar", "cd": 20.0},
+	"群体治疗": {"kind": "healwave", "pct": 0.18, "cd": 16.0},
+	"治疗术": {"kind": "healself", "pct": 0.18, "cd": 22.0},
+	"回生术": {"kind": "healself", "pct": 0.25, "cd": 30.0},
+	"五行罩": {"kind": "shield", "cd": 25.0},
+	"化魔盾": {"kind": "shield", "cd": 25.0},
+	"嗜血": {"kind": "buff_haste", "dur": 12.0, "cd": 20.0},
+	"天下无敌": {"kind": "buff_invuln", "dur": 5.0, "cd": 35.0},
+	"无名火": {"kind": "buff_fire", "dur": 15.0, "cd": 22.0},
+	"冲锋": {"kind": "buff_charge", "dur": 8.0, "cd": 18.0},
+	"天神下凡": {"kind": "transform", "dur": 20.0, "cd": 45.0},
+	"傀儡术": {"kind": "summon", "sum": "puppet", "cnt": 1, "cd": 28.0},
+	"召唤野兽": {"kind": "summon", "sum": "beast", "cnt": 2, "cd": 26.0},
+	"召唤战鹰": {"kind": "summon", "sum": "eagle", "cnt": 1, "cd": 30.0},
+	"星辰爆": {"kind": "zone", "dur": 12.0, "dps_mult": 2.0, "cd": 30.0},
+	"雷动九天": {"kind": "zone", "dur": 10.0, "dps_mult": 2.0, "cd": 30.0},
+}
+
+# 0.1.53: per-skill cooldown meta keys must be ASCII — Godot metadata names
+# have to be valid identifiers, so the old "bsk_cd_" + <Chinese skill name>
+# keys failed to write (Invalid metadata identifier) and per-skill CDs never
+# took effect since 0.1.33. The old keys never persisted anywhere (writes
+# always failed), so there is nothing to migrate. Every BSK_DEF skill maps
+# to a stable, readable ASCII id here.
+const BSK_CD_ID: Dictionary = {
+	"倍击": "double_strike",
+	"致命一击": "deadly_strike",
+	"闪避": "evasion",
+	"分裂": "cleave",
+	"血刃": "blood_blade",
+	"重击": "bash",
+	"红色怒雷": "red_thunder",
+	"破甲阵": "armor_break_aura",
+	"玄冰真气": "frost_aura",
+	"荆棘阵": "thorns_aura",
+	"战鼓": "war_drum",
+	"白马阵": "white_horse_formation",
+	"玄冰咒": "frost_curse",
+	"玄冰爆": "frost_burst",
+	"法力燃烧": "mana_burn",
+	"幻影斩": "phantom_slash",
+	"分身": "clone_split",
+	"镜像": "mirror_image",
+	"裂空斩": "rift_slash",
+	"烈火燎原": "wildfire",
+	"雷霆一击": "thunder_strike",
+	"地裂脚": "fissure_kick",
+	"天火": "sky_fire",
+	"束缚": "bind",
+	"霹雳闪电": "bolt_chain",
+	"天石术": "meteor",
+	"蚀心咒": "heart_curse",
+	"削铁如泥": "armor_shred",
+	"狮子吼": "lion_roar",
+	"群体治疗": "mass_heal",
+	"治疗术": "heal_self",
+	"回生术": "rebirth",
+	"五行罩": "five_element_shield",
+	"化魔盾": "demon_shield",
+	"嗜血": "bloodlust",
+	"天下无敌": "invincible",
+	"无名火": "nameless_fire",
+	"冲锋": "charge",
+	"天神下凡": "avatar",
+	"傀儡术": "puppet",
+	"召唤野兽": "summon_beast",
+	"召唤战鹰": "summon_eagle",
+	"星辰爆": "star_burst",
+	"雷动九天": "thunder_zone",
+}
+
+func _bsk_cd_key(skill_name: String) -> String:
+	return "bsk_cd_" + String(BSK_CD_ID.get(skill_name, "unmapped"))
+
+var boss_zones: Array = []
+var boss_pending: Array = []
+var bsk_global_next_cast: float = 0.0 # 0.1.52: global gate — hero-bound boss skills from ANY boss land at least 1.35 s apart; other casts queue up, never dropped.
+var _boss_splash_busy := false
+var _dot_tick_active := false
+
+
+func bosses_for_wave(w: int) -> Array:
+	return BOSS_TABLE.get(w, [])
+
+
+var world_root: Node3D
+var units_root: Node3D
+var projectiles_root: Node3D
+var effects_root: Node3D
+var camera: Camera3D
+
+var core_hp: float = CORE_MAX_HP
+var game_state: String = "battle"
+var spawned_count: int = 0
+var spawn_timer: float = 0.0
+var skill_cooldown: float = 0.0
+var selected: bool = false
+var last_chain_hit_count: int = 0
+var last_damage_events: int = 0
+var current_wave: int = 1
+var wave_total: int = 14
+var spawn_interval: float = SPAWN_INTERVAL
+var spawn_queue: Array = []
+var intermission_timer: float = 0.0
+var gold: int = START_GOLD
+var pads: Array = []
+var built_tower_damage_events: int = 0
+
+var strategist: ArticulatedUnit
+var general: ArticulatedUnit
+var enemies: Array = []
+var towers: Array = []
+var projectiles: Array = []
+var effects: Array = []
+
+var crystal_group: Node3D
+var crystal_light: OmniLight3D
+var core_fill_light: OmniLight3D
+var cool_fill_light: DirectionalLight3D
+var cliff_fill_light: SpotLight3D
+var gate_fill_light: SpotLight3D
+var gate_front_fill_light: SpotLight3D
+var gate_roof_fill_light: SpotLight3D
+var core_wash_light: OmniLight3D
+var rift_fill_lights: Array = []
+var core_flash: float = 0.0
+var rift_groups: Array = []
+var rift_rings: Array = []
+var rift_lights: Array = []
+
+# --- Stage-1 state: hero select / roster / bosses / training -------------
+var hero_index: int = -1
+var chosen_index: int = -1
+var unlocked_hidden: Dictionary = {}
+var hero_level: int = 1
+var hero_xp: int = 0
+var hero_was_alive: bool = false
+var hero_respawn_timer: float = 0.0
+var current_boss_list: Array = []
+var boss_spawn_index: int = 0
+var bosses_spawned_names: Array = []
+var trainees: Array = []
+var train_timer: float = 0.0
+var train_level: int = 0 # 训练长官等级 = paid brush-room entries （刷兵次数）.
+var brush_session: bool = false
+var boss_session: bool = false
+var brush_timer: float = 0.0
+var train_boss: ArticulatedUnit = null
+var quest_state: Dictionary = {} # quest id -> "on" / "on2" / "done"
+var quest_npc_defs: Array = [] # {id, pos} for tap routing
+var wilds: Array = [] # neutral / challenge units (never in `enemies`)
+var wild_points: Array = [] # {kind, pos, respawn, timer, unit} spawn points
+var villagers: Array = []
+var saved_villagers: int = 0
+var escort_active: bool = false
+var escort_pending: int = 0
+var escort_saved_round: int = 0
+var hides_n: int = 0
+var hides_f: int = 0
+var letter_pending: bool = false
+var general_level: int = 1
+var soul_timer: float = 0.0
+var kongming_unit: ArticulatedUnit = null
+var defeat_reason := ""
+# --- 刺客偷袭 (stage-2, TEARDOWN §2 / PARITY §9: 高难度刺客直扑孔明) ---
+# 2D 原制 (game/index.html): 难度≥3、6 波后，计时器 rand(75,130)s
+# （初值 50s），自裂隙口随机一门现身，隐形、直扑孔明；近身攻击时
+# 现形 3s（revealedUntil）；反隐＝和氏璧/魂形态/鹰眼/战鹰；赏金 200、
+# 经验 300；孔明死则败。本版无难度选择（与既往简化同口径），刺客
+# 自第 6 波起常开；鹰眼与战鹰在 3D 未实现，反隐只剩和氏璧＋魂形态
+# （魂：使用后 8s 化魂，2D 原制化魂 30s 反隐＋隐身，本版只取反隐）。
+const ASSASSIN_FIRST_DELAY := 50.0
+const ASSASSIN_MIN_DELAY := 75.0
+const ASSASSIN_MAX_DELAY := 130.0
+const ASSASSIN_REVEAL_TIME := 3.0
+var assassin_timer: float = ASSASSIN_FIRST_DELAY
+var pending_quest_items: Array = []
+# --- 赌场 (stage-2, TEARDOWN §5 / PARITY §5: 赌场随机装备 + 神兽触发) ---
+# SOL 设计稿红线 1 (recon-jiange/SOL_CHAIN_IAP_DESIGN.md): 赌场与真钱完全
+# 隔离——一期保持关闭，二期只用独立免费筹码。本轮按二期口径直接落地：
+# 每局开局赠 10 枚免费筹码，1 筹码赌一把；筹码不可用金币购买、不可兑换
+# 金币、与金币零互通；赌博全程不碰 gold。2D 原制 (game/index.html
+# gamble): 500 金/把、3% 惊动神兽、7% 消耗品、20% 极品、其余普通装备
+# （跟随装备店档位）——本版把 500 金换成 1 免费筹码，其余概率照搬。
+const CASINO_CHIPS_PER_GAME := 10
+const CASINO_BEASTS := ["青龙", "朱雀", "玄武", "白虎"]
+var casino_chips: int = 0
+var casino_pulls: int = 0
+var casino_last_roll: float = -1.0
+var casino_last_result: String = ""
+var casino_beast_name: String = ""
+var mercs: Array = []
+var saints_active: Array = []
+var finale_active: bool = false
+var finale_done: bool = false
+var sima_state := {"司马昭": "pending", "司马师": "pending", "司马懿": "pending"}
+var sima_yi: ArticulatedUnit = null
+var yi_revive_timer: float = -1.0
+var yi_trapped: bool = false
+var finale_hint_stage: int = 0
+var finale_hint_timer: float = 0.0
+var finale_flames: Array = []
+var dot_effects: Array = []
+var status_units: Array = []
+const SAINT_TINTS := {"青龙": Color(0.18, 0.63, 0.26), "朱雀": Color(0.90, 0.33, 0.29), "玄武": Color(0.23, 0.43, 0.54), "白虎": Color(0.85, 0.85, 0.85)}
+var upkeep_timer: float = 0.0
+
+# Mercenaries (stage-2, TEARDOWN section 5 / PARITY): the 2D MERCS
+# table (game/index.html). Conversions: gold costs at the usual 1/10
+# (425 -> 45 rounded), combat stats at the refine precedent (hp and
+# atk at 1/2 of 2D, pixel ranges/speeds mapped to world units); the
+# 2D wood cost is dropped (this slice runs a gold-only economy) and
+# population counts mercenaries only (2D also counted built towers
+# and summons; player-built towers are a later system). popCap keeps
+# the 2D formula 6 + the strategist's level — in this slice the
+# 玉玺 quest grows general_level, which is the same ledger the quest
+# reward already uses.
+const MERC_DEFS: Array = [
+	{"id": "farmer", "name": "农民", "cost": 15, "pop": 1, "hp": 160.0, "dmg": 6.0, "range": 2.2, "speed": 2.3, "cd": 1.0, "wave": 0, "visual": "trainee", "tint": Color(0.80, 0.69, 0.53), "scale": 1.0, "desc": "自动修理防御塔与封印核"},
+	{"id": "xiliang", "name": "西凉女兵", "cost": 45, "pop": 1, "hp": 260.0, "dmg": 17.0, "range": 2.2, "speed": 2.8, "cd": 0.9, "wave": 0, "visual": "general", "tint": Color(0.85, 0.55, 0.60), "scale": 1.0, "desc": "近战女兵"},
+	{"id": "bubing", "name": "步兵", "cost": 60, "pop": 1, "hp": 450.0, "dmg": 21.0, "range": 2.2, "speed": 2.5, "cd": 1.0, "wave": 2, "visual": "general", "tint": Color(0.55, 0.62, 0.75), "scale": 1.05, "desc": "重甲步兵"},
+	{"id": "gongbing", "name": "弓箭手", "cost": 65, "pop": 1, "hp": 280.0, "dmg": 23.0, "range": 9.0, "speed": 2.6, "cd": 1.1, "wave": 3, "visual": "trainee", "tint": Color(0.55, 0.75, 0.55), "scale": 1.0, "desc": "远程弓手"},
+	{"id": "feijun", "name": "无当飞军", "cost": 120, "pop": 1, "hp": 500.0, "dmg": 39.0, "range": 10.5, "speed": 2.9, "cd": 0.6, "wave": 6, "visual": "trainee", "tint": Color(0.45, 0.80, 0.75), "scale": 1.0, "desc": "精锐射手，攻速快"},
+	{"id": "piliche", "name": "霹雳车", "cost": 180, "pop": 2, "hp": 700.0, "dmg": 85.0, "range": 11.0, "speed": 1.7, "cd": 1.6, "wave": 8, "visual": "beast", "tint": Color(0.62, 0.58, 0.52), "scale": 1.6, "siege": true, "desc": "攻城器械，对 Boss 高伤"},
+	{"id": "shanyue", "name": "山岳蛮兵", "cost": 150, "pop": 1, "hp": 900.0, "dmg": 44.0, "range": 2.2, "speed": 2.4, "cd": 1.0, "wave": 10, "visual": "general", "tint": Color(0.72, 0.58, 0.42), "scale": 1.25, "desc": "蛮族重步兵"},
+]
+const MERC_ICONS := {"farmer": "hoe", "xiliang": "atk", "bubing": "armor", "gongbing": "bow", "feijun": "bow", "piliche": "tower_stone", "shanyue": "axe"}
+var mengda_unit: ArticulatedUnit = null
+@onready var Wallet: WalletManager = get_node("/root/Wallet")
+var wallet_panel: PanelContainer
+var wallet_status_label: Label
+var wallet_connect_button: Button
+var wallet_disconnect_button: Button
+var wallet_sign_button: Button
+var wallet_p0_button: Button
+var wallet_fallback_label: Label
+var wallet_address_edit: LineEdit
+var wallet_balance_button: Button
+var wallet_button_select: Button
+var wallet_button_hud: Button
+var quest_panel: PanelContainer
+var quest_box: VBoxContainer
+var train_spawn_cursor: int = 0
+var shop_nodes: Array = []
+var shop_defs: Array = [] # {name, kind, pos, npc} — one entry per market shop.
+# --- Shop purchase (-0.4, TEARDOWN §5 市肆): 6 shops; the casino opened
+# in stage 2 (free chips only, SOL design doc red line 1), the mercenary
+# stays stage-2 (separate loop item). Equipment tiers
+# rise one step every 5 waves (20-wave adaptation of the original's
+# "one tier per 7 waves"); books/consumables keep the original's prices
+# scaled 1/10 to this slice's gold economy (infantry bounty 10).
+var hero_inventory: Array = [] # item dicts, max SHOP_MAX_SLOTS (6-slot bag).
+var crafted_count: int = 0 # stage-2 炼化合成: successful forges this run.
+var hero_bonus_damage: float = 0.0
+var hero_bonus_max_hp: float = 0.0
+var hero_bonus_str: float = 0.0
+var hero_bonus_agi: float = 0.0
+var hero_bonus_int: float = 0.0
+var hero_bonus_speed: float = 0.0
+var shop_panel: PanelContainer
+var shop_title: Label
+var shop_gold_label: Label
+var shop_items_box: VBoxContainer
+var shop_scroll: ScrollContainer
+var _open_shop_index: int = -1
+var inv_row: HBoxContainer
+var inv_buttons: Array = []
+var training_officer: Node3D = null
+var selection_ring: Node3D
+var selection_pillar: MeshInstance3D
+var selection_chevron: MeshInstance3D
+var selection_diamond: MeshInstance3D
+var move_marker: MeshInstance3D
+var move_marker_timer: float = 0.0
+var elapsed: float = 0.0
+
+# Camera control: wheel zoom + drag pan around a ground target, with a
+# reset view. Default framing (camera-fix round, owner directive): the
+# classic War3 map camera of the original 《守卫剑阁》 — camera due SOUTH
+# of the field looking NORTH, steep 55-degree pitch, whole battlefield in
+# one frame: seal core west/left, rift east/right, wall line between.
+# Offset = 64.0 * (0, sin55, cos55) = (0, 52.43, 36.71); FOV stays 34.
+# (First cut at 58.0 cropped the seal-crystal cluster at the left edge;
+# 64.0 puts both objective meshes fully in frame with margin.)
+# CAM_MAX_DIST raised 64 -> 84 so wheel zoom-out still has headroom
+# beyond the new, farther default distance.
+# Stage-1: same classic framing, retargeted for the bigger map — the
+# default frame holds the main base (left) and the lane trunk / plaza;
+# the rifts sit one pan to the east. Distance 100 at the same 55-degree
+# pitch: offset = 100 * (0, sin55, cos55) = (0, 81.92, 57.36).
+const CAM_DEFAULT_TARGET := Vector3(-24.0, 0.0, 0.0)
+const CAM_DEFAULT_POS := Vector3(-24.0, 81.92, 57.36)
+const CAM_MIN_DIST := 16.0
+const CAM_MAX_DIST := 150.0
+var cam_target: Vector3 = CAM_DEFAULT_TARGET
+var cam_dir: Vector3 = Vector3.ZERO
+var cam_dist: float = 100.0
+var _mid_dragging: bool = false
+var _right_held: bool = false
+var _right_dragged: bool = false
+var _right_press_pos := Vector2.ZERO
+
+# Touch controls (mobile round): one finger taps select-or-moves, drags pan
+# the camera, two fingers pinch-zoom. Desktop mouse paths below are
+# untouched; taps also arrive as emulated mouse presses on real devices,
+# and both paths resolve to the same select/move outcome (idempotent).
+const TAP_MAX_DIST := 14.0
+const TAP_MAX_TIME := 0.6
+var _touch_active: bool = false
+var _touch_index: int = -1
+var _touch_press_pos := Vector2.ZERO
+var _touch_press_time_msec: int = 0
+var _touch_dragged: bool = false
+var _touch_last_pos := Vector2.ZERO
+var _pinch_active: bool = false
+var _pinch_indices: Array = []
+var _pinch_pos: Dictionary = {}
+var _pinch_prev_dist: float = 0.0
+var _pinch_prev_center := Vector2.ZERO
+# Touch control revamp (2026-11-14, user-approved 王者-style layout):
+# virtual joystick (left), big skill button (right) and a minimap —
+# all touch-UI only; desktop mouse/keyboard paths unchanged. Camera:
+# the follow camera chosen at 15:05 was replaced the same day (17:04)
+# by the user's call for a free camera — pans persist, nothing trails
+# the hero, same as desktop.
+var _joy: Control = null
+var _joy_index: int = -1
+var _joy_press_msec: int = 0
+var _joy_drove: bool = false
+var _big_skill_button: Button = null
+var _big_skill_cd_label: Label = null
+var _minimap: Control = null
+var _action_col: VBoxContainer = null
+
+var last_chain_feedback: String = ""
+var bounty_popups_enabled: bool = true
+var bounty_popups_spawned: int = 0
+
+var core_bar: ProgressBar
+var core_bar_fill_style: StyleBoxFlat
+var core_label: Label
+var wave_label: Label
+var wave_preview_label: Label
+var gold_label: Label
+var hero_emblem_label: Label
+var hero_emblem_portrait: TextureRect
+var hero_portrait_textures: Array = []
+var hero_portrait_circ_textures: Array = []
+var ui_icon_textures: Dictionary = {}
+var skill_icon_textures: Dictionary = {}
+var hero_name_label: Label
+var hero_atk_label: Label
+var hero_hp_label: Label
+var hero_xp_label: Label
+var _big_skill_icon: TextureRect = null
+var _big_skill_name_label: Label = null
+var message_label: Label
+# Hero select panel widgets.
+var select_panel: PanelContainer
+var hero_detail_label: Label
+var hero_buttons: Array = []
+var start_button: Button
+var pw_edit: LineEdit
+var skill_button: Button
+var cooldown_label: Label
+var repair_button: Button
+var next_wave_button: Button
+var build_popup: PanelContainer
+var thunder_button: Button
+var flame_button: Button
+var build_type_buttons: Dictionary = {}
+var tower_popup: PanelContainer
+var tower_info_label: Label
+var tower_upgrade_button: Button
+var _popup_pad_index: int = -1
+# Mobile screen & posture (round 2026-11-13): edge-anchored HUD widgets
+# that the safe area must re-position, and the touch-UI switch (enlarged
+# HUD on phones). _safe_insets are left/top/right/bottom in logical px.
+var hud_panel: PanelContainer
+var bottom_bar: HBoxContainer
+var help_label: Label
+var _touch_ui: bool = false
+var _safe_insets := Vector4.ZERO
+
+# Mobile performance (round 2026-11-13): quality tiers + FPS guard.
+# Tier 0 高：阴影＋辉光＋全部植被；Tier 1 中：无阴影、无辉光、植被
+# 一半；Tier 2 低：无阴影、无辉光、植被四分之一。_perf_sample() 每
+# 2 秒取一次平均帧率，连续 3 窗口低于 28fps 自动降一档；手动改过
+# 档位后自动降档关闭，避免与用户选择打架（画质按钮可随时改回）。
+const UI_INK = Color(0.090, 0.071, 0.031)
+const UI_INK2 = Color(0.118, 0.094, 0.067)
+const UI_GOLD = Color(0.788, 0.635, 0.153)
+const UI_GOLD_HI = Color(0.910, 0.780, 0.400)
+const UI_GOLD_DARK = Color(0.541, 0.416, 0.184)
+const UI_RED = Color(0.651, 0.169, 0.122)
+const UI_PURPLE = Color(0.608, 0.302, 1.000)
+const UI_SILK = Color(0.949, 0.890, 0.737)
+const UI_SILK_DIM = Color(0.722, 0.651, 0.471)
+const UI_HP_GREEN = Color(0.341, 0.784, 0.294)
+const UI_XP_GOLD = Color(0.878, 0.663, 0.180)
+
+const PERF_TIER_NAMES: Array = ["高", "中", "低"]
+const PERF_FPS_DROP_BELOW: float = 28.0
+const PERF_SAMPLE_WINDOW: float = 2.0
+const PERF_DROP_WINDOWS: int = 3
+const DYN_BASE: Array = [1.0, 0.85, 0.70]
+const DYN_FLOOR: Array = [0.85, 0.70, 0.60]
+const DYN_STEP: float = 0.05
+const DYN_DOWN_BELOW: float = 45.0
+const DYN_UP_ABOVE: float = 55.0
+var quality_tier: int = 0
+var _dyn_scale: float = 0.0
+var _dyn_up_windows: int = 0
+var _quality_manual: bool = false
+var _perf_accum: float = 0.0
+var _perf_frames: int = 0
+var _perf_fps_avg: float = 0.0
+var _perf_low_windows: int = 0
+var _perf_windows_seen: int = 0 # warmup: first 2 windows never count
+var _perf_fps_text: String = ""
+var sun_light: DirectionalLight3D
+var env_ref: Environment
+var vegetation_root: Node3D
+var vegetation_nodes: Array = []
+var quality_button: Button
+var fps_label: Label
+
+var _capture_mode: bool = false
+var _capture_dir: String = ""
+var _rng := RandomNumberGenerator.new()
+
+
+func _ready() -> void:
+	_rng.randomize()
+	_capture_mode = OS.get_environment("SLICE_CAPTURE") == "1"
+	_capture_dir = OS.get_environment("SLICE_SHOT_DIR")
+	world_root = Node3D.new()
+	world_root.name = "World"
+	add_child(world_root)
+	units_root = Node3D.new()
+	units_root.name = "Units"
+	add_child(units_root)
+	projectiles_root = Node3D.new()
+	projectiles_root.name = "Projectiles"
+	add_child(projectiles_root)
+	effects_root = Node3D.new()
+	effects_root.name = "Effects"
+	add_child(effects_root)
+	_build_environment()
+	_build_world()
+	_merge_world_statics()
+	# Touch UI: real phones report a touchscreen; `--touch-ui` forces the
+	# same layout on desktop so probes/harness can verify it. Must be set
+	# before _build_ui() sizes the HUD.
+	_touch_ui = DisplayServer.is_touchscreen_available() or "--touch-ui" in OS.get_cmdline_user_args()
+	_load_hero_portraits()
+	_load_ui_icons()
+	_build_ui()
+	Wallet.state_changed.connect(_on_wallet_state_changed)
+	Wallet.balance_updated.connect(_on_wallet_balance_updated)
+	Wallet.balance_failed.connect(_on_wallet_balance_failed)
+	Wallet.auth_failed.connect(_on_wallet_auth_failed)
+	Wallet.message_signed.connect(_on_wallet_message_signed)
+	Wallet.message_sign_failed.connect(_on_wallet_message_sign_failed)
+	Wallet.transfer_submitted.connect(_on_wallet_transfer_submitted)
+	Wallet.transfer_failed.connect(_on_wallet_transfer_failed)
+	_refresh_wallet_panel()
+	_apply_safe_area()
+	# Test/launch hook: `--quality=0|1|2` starts at that tier (manual,
+	# so the auto step-down stays off). Never passed on a real device.
+	for arg in OS.get_cmdline_user_args():
+		if arg.begins_with("--quality="):
+			var q := int(arg.trim_prefix("--quality="))
+			if q >= 0 and q <= 2:
+				set_quality_tier(q)
+	get_tree().root.size_changed.connect(_apply_safe_area)
+	reset_game()
+	if _capture_mode:
+		_start_capture()
+
+
+func _mat(color: Color, roughness: float = 0.85, metallic: float = 0.0, emission_color: Color = Color.BLACK, emission_energy: float = 0.0) -> StandardMaterial3D:
+	var m := StandardMaterial3D.new()
+	m.albedo_color = color
+	m.roughness = roughness
+	m.metallic = metallic
+	if emission_energy > 0.0:
+		m.emission_enabled = true
+		m.emission = emission_color
+		m.emission_energy_multiplier = emission_energy
+	return m
+
+
+# --- Pack model helpers (godot-slice-packs reskin) ---
+const PACK_WARM := Color(0.98, 0.92, 0.80) # pressed down per VISUAL_AUDIT P1-2 (was 1.07,0.99,0.85)
+
+
+func _tint_tree(root_node: Node, tint: Color, emission_color: Color = Color.BLACK, emission_energy: float = 0.0, alpha: float = -1.0, strip_texture: bool = false) -> void:
+	var stack: Array = [root_node]
+	while not stack.is_empty():
+		var n: Node = stack.pop_back()
+		for c in n.get_children():
+			stack.push_back(c)
+		if n is MeshInstance3D:
+			var mi := n as MeshInstance3D
+			if mi.mesh == null:
+				continue
+			for s in mi.mesh.get_surface_count():
+				var mat := mi.mesh.surface_get_material(s)
+				if mat is StandardMaterial3D:
+					var dup: StandardMaterial3D = (mat as StandardMaterial3D).duplicate()
+					if strip_texture:
+						dup.albedo_texture = null
+					var c0 := dup.albedo_color
+					dup.albedo_color = Color(minf(c0.r * tint.r, 1.0), minf(c0.g * tint.g, 1.0), minf(c0.b * tint.b, 1.0), c0.a)
+					if emission_energy > 0.0:
+						dup.emission_enabled = true
+						dup.emission = emission_color
+						dup.emission_energy_multiplier = emission_energy
+					if alpha >= 0.0:
+						dup.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+						var ac := dup.albedo_color
+						ac.a = alpha
+						dup.albedo_color = ac
+					mi.set_surface_override_material(s, dup)
+
+
+func _place_model(path: String, parent_node: Node, pos: Vector3, rot_y: float, scl: float, tint: Color = Color.WHITE, emission_color: Color = Color.BLACK, emission_energy: float = 0.0, alpha: float = -1.0, strip_texture: bool = false) -> Node3D:
+	var ps: PackedScene = load(path)
+	if ps == null:
+		push_warning("pack model missing: " + path)
+		return null
+	var inst: Node3D = ps.instantiate()
+	inst.position = pos
+	inst.rotation.y = rot_y
+	inst.scale = Vector3.ONE * scl
+	parent_node.add_child(inst)
+	if tint != Color.WHITE or emission_energy > 0.0 or alpha >= 0.0 or strip_texture:
+		_tint_tree(inst, tint, emission_color, emission_energy, alpha, strip_texture)
+	return inst
+
+func _add_box(parent: Node, box_name: String, size: Vector3, pos: Vector3, material: Material, rot: Vector3 = Vector3.ZERO) -> MeshInstance3D:
+	var mi := MeshInstance3D.new()
+	mi.name = box_name
+	var mesh := BoxMesh.new()
+	mesh.size = size
+	mi.mesh = mesh
+	mi.position = pos
+	mi.rotation = rot
+	mi.material_override = material
+	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
+	parent.add_child(mi)
+	return mi
+
+
+func _add_peak(parent: Node, peak_name: String, size: Vector3, pos: Vector3, material: Material, rot: Vector3, seed: float) -> MeshInstance3D:
+	var corners := PackedVector3Array()
+	for ring in range(2):
+		var top_taper: float = 0.32 if peak_name.begins_with("FarRidgeN") or peak_name.begins_with("FarMountainFar") else 0.46
+		var taper: float = 1.0 if ring == 0 else top_taper
+		for corner in range(4):
+			var corner_id := ring * 4 + corner
+			var sx: float = -1.0 if corner == 0 or corner == 3 else 1.0
+			var sz: float = -1.0 if corner < 2 else 1.0
+			var dx: float = size.x * 0.05 * sin(seed * 3.1 + float(corner_id) * 1.7)
+			var dz: float = size.z * 0.05 * sin(seed * 2.3 + float(corner_id) * 2.9)
+			var y: float = -size.y * 0.5 if ring == 0 else size.y * 0.5
+			if ring == 1:
+				y += sx * 0.04 * size.y * sin(seed * 4.7 + float(corner_id))
+			corners.append(Vector3(sx * size.x * 0.5 * taper + dx, y, sz * size.z * 0.5 * taper + dz - (0.06 * size.z if ring == 1 else 0.0)))
+	var surface := SurfaceTool.new()
+	surface.begin(Mesh.PRIMITIVE_TRIANGLES)
+	surface.set_smooth_group(-1) # Preserve outward normals on each hard facet.
+	# Godot clockwise winding: top faces +Y, bottom faces -Y, sides face out.
+	for face in [[0, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7], [4, 5, 6, 7], [3, 2, 1, 0]]:
+		for index in [face[0], face[1], face[2], face[0], face[2], face[3]]:
+			surface.add_vertex(corners[index])
+	surface.generate_normals()
+	var mi := MeshInstance3D.new()
+	mi.name = peak_name
+	mi.mesh = surface.commit()
+	mi.position = pos
+	mi.rotation = rot
+	mi.material_override = material
+	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
+	parent.add_child(mi)
+	return mi
+
+
+func _add_cylinder(parent: Node, cyl_name: String, top_r: float, bottom_r: float, height: float, pos: Vector3, material: Material, rot: Vector3 = Vector3.ZERO, segments: int = 12) -> MeshInstance3D:
+	var mi := MeshInstance3D.new()
+	mi.name = cyl_name
+	var mesh := CylinderMesh.new()
+	mesh.top_radius = top_r
+	mesh.bottom_radius = bottom_r
+	mesh.height = height
+	mesh.radial_segments = segments
+	mi.mesh = mesh
+	mi.position = pos
+	mi.rotation = rot
+	mi.material_override = material
+	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
+	parent.add_child(mi)
+	return mi
+
+
+func _add_sphere(parent: Node, sph_name: String, radius: float, pos: Vector3, material: Material, scale_factor: Vector3 = Vector3.ONE, segments: int = 12) -> MeshInstance3D:
+	var mi := MeshInstance3D.new()
+	mi.name = sph_name
+	var mesh := SphereMesh.new()
+	mesh.radius = radius
+	mesh.height = radius * 2.0
+	mesh.radial_segments = segments
+	mesh.rings = maxi(4, segments / 2)
+	mi.mesh = mesh
+	mi.position = pos
+	mi.scale = scale_factor
+	mi.material_override = material
+	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
+	parent.add_child(mi)
+	return mi
+
+
+func _add_omni_light(parent: Node, light_name: String, pos: Vector3, color: Color, energy: float, light_range: float, shadow: bool = false) -> OmniLight3D:
+	var light := OmniLight3D.new()
+	light.name = light_name
+	light.position = pos
+	light.light_color = color
+	light.light_energy = energy
+	light.omni_range = light_range
+	light.omni_attenuation = 1.15
+	light.shadow_enabled = shadow
+	parent.add_child(light)
+	return light
+
+
+func _add_spot_light(parent: Node, light_name: String, pos: Vector3, target: Vector3, color: Color, energy: float, light_range: float, angle_deg: float) -> SpotLight3D:
+	var sp := SpotLight3D.new()
+	sp.name = light_name
+	sp.position = pos
+	sp.light_color = color
+	sp.light_energy = energy
+	sp.spot_range = light_range
+	sp.spot_angle = angle_deg
+	sp.spot_attenuation = 0.55
+	sp.shadow_enabled = false
+	parent.add_child(sp)
+	sp.look_at(target, Vector3.UP)
+	return sp
+
+
+# --- Ground discs: contact shadows + glow light pools (光影丰富度 Rev 1) ---
+# Flat radial-gradient quads, one shared 64x64 texture + one shared
+# 2x2 QuadMesh; a disc costs a single cheap transparent draw call.
+# Two uses: black discs under units/towers/buildings so they read as
+# standing ON the ground (baseline: units floated, towers sat on the
+# grass with no contact), and violet discs under the seal core / rift
+# mouths so the glow visibly spills onto the ground instead of ending
+# at the crystal (baseline: bright crystal, no falloff on the ground
+# around it). Discs sit at y 0.05-0.09, above the ground surface (y=0)
+# and the road tiles (~0.012), below every unit's feet.
+static var _radial_tex: ImageTexture = null
+static var _contact_tex: ImageTexture = null
+static var _disc_mesh: QuadMesh = null
+
+
+func _radial_texture() -> ImageTexture:
+	if _radial_tex != null:
+		return _radial_tex
+	var size := 64
+	var img := Image.create(size, size, false, Image.FORMAT_RGBA8)
+	for y in range(size):
+		for x in range(size):
+			var dx := (float(x) + 0.5) / float(size) * 2.0 - 1.0
+			var dy := (float(y) + 0.5) / float(size) * 2.0 - 1.0
+			var d := sqrt(dx * dx + dy * dy)
+			var a := clampf(1.0 - d, 0.0, 1.0)
+			a = pow(a, 1.6)
+			img.set_pixel(x, y, Color(1, 1, 1, a))
+	_radial_tex = ImageTexture.create_from_image(img)
+	return _radial_tex
+
+
+func _contact_texture() -> ImageTexture:
+	# Rev 2: the contact shadow's falloff must read "deepest right at
+	# the feet, fading fast outward" (Codex 首审: the Rev 1 disc read
+	# as a uniform soft dark patch with no clear contact core). A
+	# tighter power (3.0 vs the light pools' 1.6) keeps the dark core
+	# small and lets the rim vanish quickly.
+	# Rev 3: power 3.0->4.2 and the disc radii shrink to the actual
+	# footprints (see _make_unit / static discs) — the Rev 2 复审
+	# still read a wide soft ring rather than a tight contact core.
+	if _contact_tex != null:
+		return _contact_tex
+	var size := 64
+	var img := Image.create(size, size, false, Image.FORMAT_RGBA8)
+	for y in range(size):
+		for x in range(size):
+			var dx := (float(x) + 0.5) / float(size) * 2.0 - 1.0
+			var dy := (float(y) + 0.5) / float(size) * 2.0 - 1.0
+			var d := sqrt(dx * dx + dy * dy)
+			var a := clampf(1.0 - d, 0.0, 1.0)
+			a = pow(a, 4.2)
+			img.set_pixel(x, y, Color(1, 1, 1, a))
+	_contact_tex = ImageTexture.create_from_image(img)
+	return _contact_tex
+
+
+func _disc_mesh_shared() -> QuadMesh:
+	if _disc_mesh != null:
+		return _disc_mesh
+	var q := QuadMesh.new()
+	q.size = Vector2(2.0, 2.0)
+	_disc_mesh = q
+	return q
+
+
+func _add_ground_disc(parent: Node, disc_name: String, pos: Vector3, radius: float, color: Color, alpha: float, tight: bool = false) -> MeshInstance3D:
+	var mi := MeshInstance3D.new()
+	mi.name = disc_name
+	mi.mesh = _disc_mesh_shared()
+	mi.rotation.x = -PI / 2.0
+	mi.position = pos
+	mi.scale = Vector3(radius, radius, radius)
+	var m := StandardMaterial3D.new()
+	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	m.albedo_texture = _contact_texture() if tight else _radial_texture()
+	m.albedo_color = Color(color.r, color.g, color.b, alpha)
+	m.cull_mode = BaseMaterial3D.CULL_DISABLED
+	m.disable_fog = true
+	mi.material_override = m
+	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	parent.add_child(mi)
+	return mi
+
+
+func _attach_contact_shadow(unit: ArticulatedUnit, radius: float, alpha: float = 0.48) -> void:
+	# Direct child of the unit node (NOT visual_root, which tips over
+	# on death): the disc stays flat on the ground and follows the
+	# unit's x/z; radial symmetry makes the unit's yaw irrelevant.
+	_add_ground_disc(unit, "ContactShadow", Vector3(0, 0.06, 0), radius, Color(0, 0, 0), alpha, true)
+	var blob := unit.get_node_or_null("VisualRoot/BlobShadow") as GeometryInstance3D
+	if blob != null:
+		blob.visible = false
+
+
+func _build_environment() -> void:
+	var we := WorldEnvironment.new()
+	we.name = "WorldEnvironment"
+	var env := Environment.new()
+	env.background_mode = Environment.BG_COLOR
+	env.background_color = Color(0.004, 0.009, 0.040)
+	env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
+	# VISUAL_AUDIT P1-2: one dusk grade for the whole field — warm key
+	# sun (below) + a lifted cool ambient fill so shadows keep detail
+	# instead of going dead black; exposure pressed down a notch to
+	# tame the orange-yellow blowouts on road and rooftops.
+	# Rev 2 (2026-11-14, Codex 首审 4/10 不通过后复修): push the grade
+	# cooler toward the anchor's blue-violet dusk — ambient up again
+	# (0.72->0.85, bluer color) and CoolFill 0.26->0.34 so shadowed
+	# faces read cool grey-blue instead of near-black; sun 0.55->0.50
+	# and exposure 0.90->0.88 compress the white-tower highlights;
+	# saturation 0.97->0.93 presses the yellow-green grass and the
+	# red-orange mids together; fog 0.006->0.008 + lighter cooler fog
+	# color so far mountains haze in layers. Glow anchors untouched.
+	# Rev 2 (2026-11-14, Codex 首审 6/10 不通过后复修): shadows still
+	# read as near-black blocks under trees / cliff foot / gatehouse
+	# back faces — opacity 0.70->0.55, blur 2.0->3.0. CoolFill re-aimed
+	# in pitch only (-34->-22, yaw stays 128 so it still lights the
+	# sun-missed east/north faces) so it rakes across vertical faces
+	# (tower sides, cliff feet, walls) instead of washing the ground,
+	# energy 0.34->0.42 so shaded faces read as cool mid-tones rather
+	# than near-black. Sun energy/color untouched.
+	env.ambient_light_color = Color(0.17, 0.205, 0.30)
+	env.ambient_light_energy = 0.85
+	env.reflected_light_source = Environment.REFLECTION_SOURCE_BG
+	env.tonemap_mode = Environment.TONE_MAPPER_ACES
+	env.tonemap_exposure = 0.88
+	env.glow_enabled = true
+	env.glow_intensity = 0.42
+	env.glow_strength = 1.0
+	env.glow_bloom = 0.08
+	env.fog_enabled = true
+	env.fog_light_color = Color.html("#303f5e")
+	env.fog_light_energy = 0.56
+	# 边缘与远景 Rev 1 (2026-11-14): fog stays EXPONENTIAL — depth
+	# mode was tried first and proved to render nothing at all in
+	# the gl_compatibility renderer (extreme begin/end test shot
+	# came back unfogged), which silently killed the haze. Density
+	# 0.008->0.0095 instead: with the new mid ridge ring in place,
+	# the stronger falloff keeps the field and near ring readable
+	# while the far ring melts further into the fog color — the
+	# distance layering the 色调 Rev 3 prescription also asks for.
+	env.fog_density = 0.0100 # 边缘与远景 Rev 4: 明度型空气透视定版 (was 0.0105) — 三轮迭代实证: 本场景最近面也有 ~90 距离、雾即底色, 激进提亮 (0.0070+#4a5f88 / 0.0085+#42557a) 均全帧洗白冲掉黄昏定版; 定版只微调雾 (0.0100 + #303f5e + 0.56), 分层由材质阶梯 (远提亮压平/中提亮) + 几何合并 (长脊/宽山形/双排缺口) 主扛
+	env.adjustment_enabled = true
+	env.adjustment_saturation = 0.93
+	env_ref = env
+	we.environment = env
+	add_child(we)
+
+	var sun := DirectionalLight3D.new()
+	sun.name = "DuskSun"
+	sun_light = sun
+	sun.position = Vector3(-16, 34, -14)
+	sun.rotation_degrees = Vector3(-43, -32, 0)
+	sun.light_color = Color.html("#ffd2a6")
+	sun.light_energy = 0.50
+	sun.shadow_enabled = true
+	sun.shadow_opacity = 0.55
+	sun.shadow_blur = 3.0
+	sun.directional_shadow_max_distance = 230.0
+	sun.directional_shadow_split_1 = 0.25
+	sun.directional_shadow_split_2 = 0.55
+	add_child(sun)
+
+	var warm_fill := DirectionalLight3D.new()
+	warm_fill.name = "CoolFill"
+	cool_fill_light = warm_fill
+	warm_fill.position = Vector3(24, 18, 26)
+	warm_fill.rotation_degrees = Vector3(-22, 128, 0)
+	warm_fill.light_color = Color(0.36, 0.47, 0.85)
+	warm_fill.light_energy = 0.80
+	warm_fill.shadow_enabled = false
+	add_child(warm_fill)
+
+	# Rev 3 (光影丰富度): local cold spot fills — the global params
+	# converged in Rev 1/2 (Codex: 参数变化不直接计分). Two shadowless
+	# cold spots put a readable mid-tone exactly where the reviews
+	# kept failing: the west cliff foot beside the seal core, and the
+	# gatehouse tower sides (sun + CoolFill leave both near-black).
+	# Rev 5 (light f): cone 36 -> 46 — the westernmost low strip sits
+	# outside the 36-degree cone core (energy alone never reached it);
+	# widening measured +3.8 L on that strip.
+	cliff_fill_light = _add_spot_light(self, "CliffFootFill", Vector3(-74, 7, 0), Vector3(-88, 0, -2), Color(0.49, 0.58, 0.80), 5.8, 34.0, 46.0)
+	gate_fill_light = _add_spot_light(self, "GateSideFill", Vector3(-40, 11, -14), Vector3(-57, 2.5, -2), Color(0.49, 0.58, 0.80), 3.0, 36.0, 36.0)
+	gate_front_fill_light = _add_spot_light(self, "GateFrontFill", Vector3(-30, 5, 20), Vector3(-57, 3.2, -0.5), Color(0.56, 0.65, 0.80), 6.5, 52.0, 32.0)
+	# Rev 5 (light e): GateFrontFill range 38 never reached the gate
+	# (~44 away) — widened to 52; GateRoofFill comes from the west so
+	# the east tower's west roof slope (the "side" sample) lifts
+	# without touching the shaded west-tower slope.
+	gate_roof_fill_light = _add_spot_light(self, "GateRoofFill", Vector3(-75, 12, -6), Vector3(-57, 4, -4), Color(0.56, 0.65, 0.80), 3.8, 32.0, 26.0)
+
+	camera = Camera3D.new()
+	camera.name = "BattleCamera"
+	add_child(camera)
+	camera.fov = 34.0
+	camera.near = 0.1
+	camera.far = 420.0
+	camera.current = true
+	cam_target = CAM_DEFAULT_TARGET
+	var cam_off := CAM_DEFAULT_POS - CAM_DEFAULT_TARGET
+	cam_dist = cam_off.length()
+	cam_dir = cam_off / cam_dist
+	_apply_camera()
+
+
+func _apply_camera() -> void:
+	if not is_instance_valid(camera):
+		return
+	camera.global_position = cam_target + cam_dir * cam_dist
+	camera.look_at(cam_target, Vector3.UP)
+
+
+func camera_zoom_by(factor: float) -> void:
+	cam_dist = clampf(cam_dist * factor, CAM_MIN_DIST, CAM_MAX_DIST)
+	_apply_camera()
+
+
+func camera_pan_by(ground_delta: Vector3) -> void:
+	cam_target.x = clampf(cam_target.x + ground_delta.x, -82.0, 82.0)
+	cam_target.z = clampf(cam_target.z + ground_delta.z, -46.0, 46.0)
+	cam_target.y = 0.0
+	_apply_camera()
+
+
+func reset_camera_view() -> void:
+	cam_target = CAM_DEFAULT_TARGET
+	var off := CAM_DEFAULT_POS - CAM_DEFAULT_TARGET
+	cam_dist = off.length()
+	cam_dir = off / cam_dist
+	_apply_camera()
+
+
+func _pan_by_screen_delta(rel: Vector2) -> void:
+	if not is_instance_valid(camera):
+		return
+	var right := camera.global_transform.basis.x
+	right.y = 0.0
+	right = right.normalized()
+	var fwd := -camera.global_transform.basis.z
+	fwd.y = 0.0
+	fwd = fwd.normalized()
+	var k := cam_dist * 0.0016
+	var ground_delta := (-right * rel.x + fwd * rel.y) * k
+	# Free camera (user call 2026-11-14 17:04): a drag pans the target
+	# and it stays there — touch and desktop share this exact path.
+	camera_pan_by(ground_delta)
+
+
+func _merge_world_statics() -> void:
+	# Keep the source nodes intact for name/count lookups; only the baked copies render.
+	var instances: Array[MeshInstance3D] = []
+	var stack: Array[Node] = [world_root]
+	while not stack.is_empty():
+		var node: Node = stack.pop_back()
+		for child in node.get_children():
+			stack.append(child)
+		if node is MeshInstance3D:
+			instances.append(node as MeshInstance3D)
+
+	var groups: Dictionary = {}
+	for mi in instances:
+		if crystal_group != null and (mi == crystal_group or crystal_group.is_ancestor_of(mi)):
+			continue
+		if rift_rings.has(mi) or mi.mesh == null:
+			continue
+		if mi.mesh is ArrayMesh and (mi.mesh as ArrayMesh).get_blend_shape_count() > 0:
+			continue
+		var surfaces: Array = []
+		var has_bones := false
+		for surface in range(mi.mesh.get_surface_count()):
+			var source_arrays: Array = mi.mesh.surface_get_arrays(surface)
+			surfaces.append(source_arrays)
+			var bones: Variant = source_arrays[Mesh.ARRAY_BONES]
+			if bones is PackedInt32Array or bones is PackedByteArray or bones is PackedFloat32Array:
+				if not bones.is_empty():
+					has_bones = true
+		if has_bones:
+			continue
+		for surface in range(surfaces.size()):
+			var material: Material = mi.get_surface_override_material(surface)
+			if material == null:
+				material = mi.material_override
+			if material == null:
+				material = mi.mesh.surface_get_material(surface)
+			var signature: String
+			if material is StandardMaterial3D:
+				var standard := material as StandardMaterial3D
+				var colors: Array = []
+				for color in [standard.albedo_color, standard.emission]:
+					for channel in [color.r, color.g, color.b, color.a]:
+						colors.append(roundf(channel * 24.0) / 24.0)
+				var texture_path := ""
+				if standard.albedo_texture != null:
+					texture_path = standard.albedo_texture.resource_path
+				signature = str([colors, standard.emission_enabled,
+					roundf(standard.emission_energy_multiplier * 10.0) / 10.0,
+					texture_path, roundf(standard.roughness * 20.0) / 20.0,
+					roundf(standard.metallic * 20.0) / 20.0,
+					standard.transparency, standard.shading_mode, standard.cull_mode,
+					standard.vertex_color_use_as_albedo, standard.depth_draw_mode,
+					standard.billboard_mode])
+			else:
+				signature = "res:" + str(material.get_instance_id() if material != null else 0)
+			var key := signature + "|cs=" + str(mi.cast_shadow)
+			if not groups.has(key):
+				groups[key] = []
+			groups[key].append({"mi": mi, "arrays": surfaces[surface],
+				"material": material, "surface": surface})
+
+	# An MI may only be hidden when every one of its surfaces is baked;
+	# drop partially-covered MIs from their groups until stable.
+	var stabilized := false
+	var stab_rounds := 0
+	while not stabilized and stab_rounds < 6:
+		stab_rounds += 1
+		stabilized = true
+		var covered: Dictionary = {}
+		for key in groups:
+			var members2: Array = groups[key]
+			if members2.size() < 2:
+				continue
+			for member in members2:
+				var mid: int = (member["mi"] as MeshInstance3D).get_instance_id()
+				covered[mid] = int(covered.get(mid, 0)) + 1
+		var partial: Dictionary = {}
+		for key in groups:
+			for member in groups[key]:
+				var mi2: MeshInstance3D = member["mi"]
+				var mid2: int = mi2.get_instance_id()
+				if int(covered.get(mid2, 0)) > 0 and int(covered.get(mid2, 0)) < mi2.mesh.get_surface_count():
+					partial[mid2] = true
+		if not partial.is_empty():
+			stabilized = false
+			for key in groups:
+				var kept_members: Array = []
+				for member in groups[key]:
+					if not partial.has((member["mi"] as MeshInstance3D).get_instance_id()):
+						kept_members.append(member)
+				groups[key] = kept_members
+
+	var group_count := 0
+	var merged_surfaces := 0
+	var hidden: Dictionary = {}
+	var world_inverse := world_root.global_transform.affine_inverse()
+	for key in groups:
+		var members: Array = groups[key]
+		if members.size() < 2:
+			continue
+		var valid_members: Array = []
+		var has_uv := false
+		var has_color := false
+		var has_tangent := false
+		for member in members:
+			var source_arrays: Array = member["arrays"]
+			var source_vertices: PackedVector3Array = source_arrays[Mesh.ARRAY_VERTEX]
+			var source_normals: Variant = source_arrays[Mesh.ARRAY_NORMAL]
+			if not source_normals is PackedVector3Array or source_normals.size() != source_vertices.size() or source_vertices.is_empty():
+				print("MERGE_WORLD skip missing normals: ", member["mi"].get_path(), " surface=", member["surface"])
+				continue
+			valid_members.append(member)
+			has_uv = has_uv or (source_arrays[Mesh.ARRAY_TEX_UV] != null and not source_arrays[Mesh.ARRAY_TEX_UV].is_empty())
+			has_color = has_color or (source_arrays[Mesh.ARRAY_COLOR] != null and not source_arrays[Mesh.ARRAY_COLOR].is_empty())
+			has_tangent = has_tangent or (source_arrays[Mesh.ARRAY_TANGENT] != null and not source_arrays[Mesh.ARRAY_TANGENT].is_empty())
+		if valid_members.size() < 2:
+			continue
+		var vertices := PackedVector3Array()
+		var normals := PackedVector3Array()
+		var uvs := PackedVector2Array()
+		var colors := PackedColorArray()
+		var tangents := PackedFloat32Array()
+		var indices := PackedInt32Array()
+		for member in valid_members:
+			var mi: MeshInstance3D = member["mi"]
+			var source_arrays: Array = member["arrays"]
+			var source_vertices: PackedVector3Array = source_arrays[Mesh.ARRAY_VERTEX]
+			var source_normals: PackedVector3Array = source_arrays[Mesh.ARRAY_NORMAL]
+			var source_uvs: Variant = source_arrays[Mesh.ARRAY_TEX_UV]
+			var source_colors: Variant = source_arrays[Mesh.ARRAY_COLOR]
+			var source_tangents: Variant = source_arrays[Mesh.ARRAY_TANGENT]
+			var xform := world_inverse * mi.global_transform
+			var normal_basis := xform.basis.inverse().transposed()
+			var offset := vertices.size()
+			for vertex in range(source_vertices.size()):
+				vertices.append(xform * source_vertices[vertex])
+				normals.append((normal_basis * source_normals[vertex]).normalized())
+				if has_uv:
+					uvs.append(source_uvs[vertex] if source_uvs != null and not source_uvs.is_empty() else Vector2.ZERO)
+				if has_color:
+					colors.append(source_colors[vertex] if source_colors != null and not source_colors.is_empty() else Color.WHITE)
+				if has_tangent:
+					if source_tangents != null and not source_tangents.is_empty():
+						var base := vertex * 4
+						var tangent := xform.basis * Vector3(source_tangents[base], source_tangents[base + 1], source_tangents[base + 2])
+						tangents.append_array(PackedFloat32Array([tangent.x, tangent.y, tangent.z, source_tangents[base + 3]]))
+					else:
+						tangents.append_array(PackedFloat32Array([1.0, 0.0, 0.0, 1.0]))
+			var source_indices: Variant = source_arrays[Mesh.ARRAY_INDEX]
+			if source_indices != null and not source_indices.is_empty():
+				for index in source_indices:
+					indices.append(offset + index)
+			else:
+				for index in range(source_vertices.size()):
+					indices.append(offset + index)
+		var arrays: Array = []
+		arrays.resize(Mesh.ARRAY_MAX)
+		arrays[Mesh.ARRAY_VERTEX] = vertices
+		arrays[Mesh.ARRAY_NORMAL] = normals
+		arrays[Mesh.ARRAY_INDEX] = indices
+		if has_uv:
+			arrays[Mesh.ARRAY_TEX_UV] = uvs
+		if has_color:
+			arrays[Mesh.ARRAY_COLOR] = colors
+		if has_tangent:
+			arrays[Mesh.ARRAY_TANGENT] = tangents
+		var merged_mesh := ArrayMesh.new()
+		merged_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+		var merged := MeshInstance3D.new()
+		merged.name = "MergedStatic%02d" % group_count
+		merged.mesh = merged_mesh
+		var first_mi: MeshInstance3D = valid_members[0]["mi"]
+		merged.cast_shadow = first_mi.cast_shadow
+		merged.set_surface_override_material(0, valid_members[0]["material"])
+		world_root.add_child(merged)
+		for member in valid_members:
+			var mi: MeshInstance3D = member["mi"]
+			mi.visible = false
+			hidden[mi.get_instance_id()] = true
+		group_count += 1
+		merged_surfaces += valid_members.size()
+	print("MERGE_WORLD groups=", group_count, " merged_surfaces=", merged_surfaces, " hidden=", hidden.size(), " kept=", instances.size() - hidden.size())
+
+
+func _build_world() -> void:
+	_build_ground()
+	_build_cliffs()
+	_build_rock_walls()
+	_build_fortress()
+	_build_base_gate()
+	_build_core()
+	_build_rift()
+	_build_market()
+	_build_training_zone()
+	_build_plaza()
+	_build_vegetation_and_rocks()
+	_build_forest_zone()
+	_build_grave_zone()
+	_build_water_zone()
+	_build_newcity_zone()
+	_build_zhuque_marker()
+	_build_valley_zone()
+	_build_refiner_point()
+	_build_quest_npcs()
+	_setup_wild_points()
+	_build_hunter_point()
+	_build_set_dressing()
+	_build_pads()
+	_build_selection_helpers()
+
+
+func _dist_to_segment(p: Vector2, a: Vector2, b: Vector2) -> float:
+	var ab := b - a
+	var t := 0.0
+	if ab.length_squared() > 0.001:
+		t = clampf((p - a).dot(ab) / ab.length_squared(), 0.0, 1.0)
+	return (a + ab * t - p).length()
+
+
+func _is_road_point(p: Vector3) -> bool:
+	var p2 := Vector2(p.x, p.z)
+	for lane in [LANE_NORTH, LANE_SOUTH]:
+		for i in range(lane.size() - 1):
+			if _dist_to_segment(p2, Vector2(lane[i].x, lane[i].z), Vector2(lane[i + 1].x, lane[i + 1].z)) < 4.3:
+				return true
+		var last: Vector3 = lane[lane.size() - 1]
+		if _dist_to_segment(p2, Vector2(last.x, last.z), Vector2(CORE_POS.x, CORE_POS.z)) < 4.3:
+			return true
+	if Vector2(PLAZA_POS.x - p.x, PLAZA_POS.z - p.z).length() < 9.0:
+		return true
+	if p.x >= -79.0 and p.x <= -51.0 and absf(p.z) <= 13.5:
+		return true # base courtyard
+	if p.x >= -77.0 and p.x <= -49.0 and p.z >= -21.5 and p.z <= -10.5:
+		return true # market row ground
+	if TRAIN_ZONE.grow(2.0).has_point(p2):
+		return true # training pen floor
+	if Rect2(-66, -42, 32, 18).has_point(p2):
+		return true # small-boss room floor (stage-2 content, zone now)
+	return false
+
+
+func _rect_blend_weight(p: Vector2, rect: Rect2, feather: float) -> float:
+	# 1.0 inside the rect, smoothstep falloff to 0.0 across `feather`
+	# units outside it (Chebyshev distance — the falloff follows the
+	# rect's shape, so zone floors melt into the field grass).
+	var dx := maxf(rect.position.x - p.x, p.x - (rect.position.x + rect.size.x))
+	var dz := maxf(rect.position.y - p.y, p.y - (rect.position.y + rect.size.y))
+	var d := maxf(dx, dz)
+	if d <= 0.0:
+		return 1.0
+	if d >= feather:
+		return 0.0
+	var t := 1.0 - d / feather
+	return t * t * (3.0 - 2.0 * t)
+
+
+func _lane_distance(x: float, z: float) -> float:
+	# Distance to the nearest lane polyline (same segments _is_road_
+	# point tests, including the run-in to the core). Used for the
+	# worn-earth shoulder tint on the grass side of the roads.
+	var p2 := Vector2(x, z)
+	var d := 1.0e9
+	for lane in [LANE_NORTH, LANE_SOUTH]:
+		for i in range(lane.size() - 1):
+			d = minf(d, _dist_to_segment(p2, Vector2(lane[i].x, lane[i].z), Vector2(lane[i + 1].x, lane[i + 1].z)))
+		var last: Vector3 = lane[lane.size() - 1]
+		d = minf(d, _dist_to_segment(p2, Vector2(last.x, last.z), Vector2(CORE_POS.x, CORE_POS.z)))
+	return d
+
+
+func _ground_color_at(x: float, z: float) -> Color:
+	# The continuous ground's color field. Keeps the slow spatial
+	# variation the hex tiles used (Codex 复审 1's main term) but drops
+	# the ±1.5% per-tile jitter and the per-tile scale/height steps —
+	# those were the checkerboard. A fine ±2.5% mottle (wavelength
+	# ~6 units, sampled on a 2-unit vertex grid) keeps the field from
+	# reading as flat plastic without drawing any boundary.
+	var vt := 1.0 + 0.05 * sin(x * 0.08 + z * 0.05) + 0.04 * sin(x * 0.03 - z * 0.11)
+	vt *= 1.0 + 0.025 * sin(x * 1.03 + z * 0.71) * sin(x * 0.53 - z * 1.21)
+	# Codex 复审（-0.6 首审 8.2）P1: mid-distance grass read as one
+	# flat color — add a mid-scale density wave (~20-unit wavelength,
+	# ±6%) and broad worn-earth patches (incommensurate sines, so
+	# no trackable repeat; capped at a 38% lerp so they stay a stain,
+	# not a second surface). First cut (±4.5% / 32%) rendered
+	# sub-perceptual at the review distance — the mesh colors were
+	# verified changed, the tonemapped pixels were not — so the
+	# amplitudes were raised until the variation survives the grade.
+	vt *= 1.0 + 0.06 * sin(x * 0.31 + 0.8) * sin(z * 0.27 - 1.9)
+	# A near-DC value drift (wavelength ~300 units: a third of a
+	# cycle across the whole field) so even patch-free grass breathes
+	# in broad light/shade zones instead of sitting at one value.
+	vt *= 1.0 + 0.07 * sin(x * 0.021 + 2.0) * sin(z * 0.017 - 0.7)
+	var vertex_hash: float = fposmod(sin(x * 127.1 + z * 311.7) * 43758.5453, 1.0)
+	vt *= 1.0 + 0.03 * (1.0 - 2.0 * vertex_hash)
+	var c := Color(minf(grass_tint.r * vt, 1.0), minf(grass_tint.g * vt, 1.0), minf(grass_tint.b * vt, 1.0))
+	var soil := Color(minf(0.395 * vt, 1.0), minf(0.385 * vt, 1.0), minf(0.321 * vt, 1.0)) # 全局色调 Rev 4: desat+bluegrey mix, lum kept
+	var pn := sin(x * 0.11 + 1.7) * sin(z * 0.13 - 0.6) + 0.6 * sin(x * 0.043 - z * 0.061 + 2.1)
+	var pw := clampf((pn - 0.45) / 0.45, 0.0, 1.0)
+	if pw > 0.0:
+		c = c.lerp(soil, pw * pw * (3.0 - 2.0 * pw) * 0.38)
+	# The sine patches peak near the lanes (hidden under paving);
+	# a numeric sweep showed the open south-west field nearly bare.
+	# Add explicit worn blobs placed in open grass — varied centres
+	# and radii, smooth falloff, capped like the sine layer.
+	for blob: Vector3 in [Vector3(-8, 38, 11), Vector3(28, 40, 9), Vector3(-38, 12, 10), Vector3(8, 22, 8), Vector3(48, 38, 10)]:
+		var bd: float = Vector2(x - blob.x, z - blob.y).length()
+		if bd < blob.z:
+			var bt: float = 1.0 - bd / blob.z
+			c = c.lerp(soil, bt * bt * (3.0 - 2.0 * bt) * 0.42)
+	# P2 (grass side): a worn-earth shoulder hugs the paving — full
+	# strength where the grass first shows past the road tiles
+	# (~9 units from a lane centreline), feathered out by 13 — so the
+	# ribbon no longer sits on the grass like a pasted cover. The
+	# plaza apron gets the same fringe (edge at r=9.6, out to 15).
+	var sw := 0.0
+	var dl := _lane_distance(x, z)
+	if dl < 13.0:
+		sw = 0.38
+		if dl > 9.0:
+			var tt := 1.0 - (dl - 9.0) / 4.0
+			sw = 0.38 * tt * tt * (3.0 - 2.0 * tt)
+	var dp := Vector2(x, z).distance_to(Vector2(PLAZA_POS.x, PLAZA_POS.z))
+	if dp < 15.0 and dp > 11.0:
+		var tp := 1.0 - (dp - 11.0) / 4.0
+		sw = maxf(sw, 0.38 * tp * tp * (3.0 - 2.0 * tp))
+	elif dp <= 11.0:
+		sw = maxf(sw, 0.38)
+	if sw > 0.0:
+		c = c.lerp(soil, sw)
+	var p2 := Vector2(x + 1.25 * sin(z * 0.33 + 1.0) * sin(z * 0.11 - 0.4), z + 1.25 * sin(x * 0.29 - 0.7) * sin(x * 0.13 + 0.9))
+	var fw := _rect_blend_weight(p2, FOREST_ZONE, 5.0)
+	if fw > 0.0:
+		c = c.lerp(Color(minf(forest_floor_color.r * vt, 1.0), minf(forest_floor_color.g * vt, 1.0), minf(forest_floor_color.b * vt, 1.0)), fw)
+	var gw := _rect_blend_weight(p2, GRAVE_ZONE, 5.0)
+	if gw > 0.0:
+		c = c.lerp(Color(minf(grave_floor_color.r * vt, 1.0), minf(grave_floor_color.g * vt, 1.0), minf(grave_floor_color.b * vt, 1.0)), gw)
+	var ww := _rect_blend_weight(p2, WATER_ZONE, 5.0)
+	if ww > 0.0:
+		c = c.lerp(Color(minf(water_floor_color.r * vt, 1.0), minf(water_floor_color.g * vt, 1.0), minf(water_floor_color.b * vt, 1.0)), ww)
+	var nw := _rect_blend_weight(p2, NEWCITY_ZONE, 5.0)
+	if nw > 0.0:
+		c = c.lerp(Color(minf(newcity_floor_color.r * vt, 1.0), minf(newcity_floor_color.g * vt, 1.0), minf(newcity_floor_color.b * vt, 1.0)), nw)
+	# Valley last: its rect overlaps the forest feather, and the
+	# scorched floor must win inside the gorge (see _build_valley_zone
+	# for the site note — the gorge sits on the cliff foot, so its
+	# floor is the narrow flat strip x 83..87).
+	var vw := _rect_blend_weight(p2, VALLEY_ZONE, 2.0)
+	if vw > 0.0:
+		c = c.lerp(Color(minf(valley_floor_color.r * vt, 1.0), minf(valley_floor_color.g * vt, 1.0), minf(valley_floor_color.b * vt, 1.0)), vw)
+	return c
+
+
+func _build_ground_surface() -> void:
+	# -0.6 地面连续化: ONE vertex-colored mesh for every soft floor
+	# (field grass + forest moss + graveyard ash, blended). Top at
+	# y=0.0 — exactly the plane gameplay already assumes (tap picking
+	# intersects y=0, every prop/unit base sits at y=0); the old grass
+	# tile tops alternated 0 / 0.012 around it. Casts no shadow (the
+	# ~500 grass tiles used to cast onto each other, which was half
+	# the visible grid); still receives shadows.
+	var mat := StandardMaterial3D.new()
+	mat.vertex_color_use_as_albedo = true
+	mat.albedo_color = Color.WHITE
+	mat.roughness = 0.98
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	st.set_material(mat)
+	var rect := Rect2(-99, -55, 198, 110)
+	var step := 2.0
+	var nx := int(rect.size.x / step)
+	var nz := int(rect.size.y / step)
+	var grid: Array[PackedVector2Array] = []
+	for iz in range(nz + 1):
+		var row := PackedVector2Array()
+		for ix in range(nx + 1):
+			var gx := rect.position.x + step * float(ix)
+			var gz := rect.position.y + step * float(iz)
+			var point := Vector2(gx, gz)
+			if ix > 0 and ix < nx and iz > 0 and iz < nz:
+				point.x += 0.18 * sin(gx * 1.37 + gz * 2.11) * sin(gx * 0.53 - gz * 1.71)
+				point.y += 0.18 * sin(gx * 1.93 - gz * 0.87) * sin(gx * 2.31 + gz * 0.61)
+			row.append(point)
+		grid.append(row)
+	for iz in range(nz):
+		for ix in range(nx):
+			var a := grid[iz][ix]
+			var b := grid[iz][ix + 1]
+			var c := grid[iz + 1][ix]
+			var d := grid[iz + 1][ix + 1]
+			# Winding MUST face +Y: the first cut copied
+			# _add_heightfield's order and generated (0,-1,0)
+			# normals — the surface was backface-culled from above
+			# and never rendered (every capture showed the slab
+			# underneath; caught 2026-11-14 by a magenta split test
+			# after three pixel-identical "after" renders). Order
+			# below yields +Y normals; harness asserts them.
+			st.set_color(_ground_color_at(a.x, a.y))
+			st.add_vertex(Vector3(a.x, 0, a.y))
+			st.set_color(_ground_color_at(b.x, b.y))
+			st.add_vertex(Vector3(b.x, 0, b.y))
+			st.set_color(_ground_color_at(c.x, c.y))
+			st.add_vertex(Vector3(c.x, 0, c.y))
+			st.set_color(_ground_color_at(c.x, c.y))
+			st.add_vertex(Vector3(c.x, 0, c.y))
+			st.set_color(_ground_color_at(b.x, b.y))
+			st.add_vertex(Vector3(b.x, 0, b.y))
+			st.set_color(_ground_color_at(d.x, d.y))
+			st.add_vertex(Vector3(d.x, 0, d.y))
+	st.generate_normals()
+	ground_surface = MeshInstance3D.new()
+	ground_surface.name = "GroundSurface"
+	ground_surface.mesh = st.commit()
+	ground_surface.material_override = mat
+	ground_surface.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	world_root.add_child(ground_surface)
+
+
+func _build_ground() -> void:
+	# Underlay slab: dropped so its top (y=-0.01) sits just under the
+	# continuous ground surface — it only shows through the pinhole
+	# gaps between the remaining road hex tiles, as soil.
+	var ground_mat := _mat(ground_underlay_color, 0.98)
+	_add_box(world_root, "GroundSlab", Vector3(300, 1.0, 200), Vector3(0, -0.51, 0), ground_mat)
+	_build_ground_surface()
+	# KayKit hex tiles now pave ONLY the hard road areas (lane bands,
+	# plaza, base courtyard, market row, training pens, boss room) —
+	# everywhere else is the continuous surface above. The road
+	# ribbons/aprons still cap these tiles, unchanged.
+	for q in range(-16, 16):
+		for r in range(-10, 10):
+			var p := Vector3(6.0 * float(q) + 3.0 * float(r), 0.0, 5.196 * float(r))
+			if absf(p.x) > 96.0 or absf(p.z) > 52.0:
+				continue
+			if not _is_road_point(p):
+				continue
+			p.y = 0.012 * float((q + r) % 2)
+			var rot := float((q * 7 + r * 13) % 6) * PI / 3.0
+			var rsc := ground_tile_scale * (1.0 + 0.01 * sin(float(q * 5 + r * 11)))
+			# Codex 复审 4：剥掉地块贴图——KayKit 六角贴图自带方向性
+			# 明暗渐变，随机 60° 旋转后拼出锯齿状明暗带；剥贴图后地
+			# 块只剩纯色，与连续路面同口径。
+			_place_model("res://assets/kaykit_tiles/roads/hex_road_A.gltf", world_root, p, rot, rsc, road_tile_tint, Color.BLACK, 0.0, -1.0, true)
+	_build_road_ribbons()
+
+
+func _build_road_ribbons() -> void:
+	# VISUAL_AUDIT P1-1: a continuous packed-earth surface laid over the
+	# tile seams along both lanes and the trunk, so the main roads read
+	# as one surface instead of a mosaic cut by dark bars. The ribbon is
+	# 8.8 wide (road band is ±4.3) so no road-tile edge peeks out; a
+	# lighter worn centre strip runs down each segment, and waypoint
+	# discs round off the joints. Aprons pave the flat road zones the
+	# ribbons do not reach (plaza, base courtyard, market row, training
+	# pen, small-boss room) so their diagonal road-tile stripes are
+	# covered too.
+	var road_mat := _mat(road_ribbon_color, 1.0)
+	var center_mat := _mat(road_center_color, 1.0)
+	for lane in [LANE_NORTH, LANE_SOUTH]:
+		var pts: Array = lane.duplicate()
+		pts.append(CORE_POS)
+		for i in range(pts.size() - 1):
+			var a: Vector3 = pts[i]
+			var b: Vector3 = pts[i + 1]
+			var mid := (a + b) * 0.5
+			mid.y = 0.028
+			var d := b - a
+			# Rev 5 (light a): the final segment ends at the seal core; the
+			# +9 overshoot poked a pale strip end out west of the pedestal.
+			var ext := 0.0 if i == pts.size() - 2 else 9.0
+			var seg := _add_box(world_root, "RoadRibbon", Vector3(d.length() + ext, 0.055, road_ribbon_width), mid, road_mat)
+			seg.rotation.y = atan2(-d.z, d.x)
+			seg.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+			var cen := _add_box(world_root, "RoadCenter", Vector3(d.length() + ext, 0.03, road_center_width), Vector3(mid.x, 0.045, mid.z), center_mat)
+			cen.rotation.y = atan2(-d.z, d.x)
+			cen.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		for wp in pts:
+			_add_cylinder(world_root, "RoadJoint", 4.5, 4.5, 0.055, Vector3(wp.x, 0.028, wp.z), road_mat, Vector3.ZERO, 14)
+	# Codex 复审 3（第四版）：扁石改成簇——每段 3 个石簇（每簇 3 颗
+	# 彼此邻接）+ 3 颗单石；土斑拉长为沿路的跨界椭圆斑（2 块/段）
+	# + 1 块圆斑；草丘 5 颗守边缘 + 2 颗侵入路内，另有 2 颗扁石
+	# 落在路外草地上（碎石侵入草地），双向打断连续硬边。
+	var stone_dark := _mat(Color.html("#7d6a4a"), 1.0)
+	var stone_light := _mat(Color.html("#97835f"), 1.0)
+	var stone_mid := _mat(Color.html("#83745d"), 1.0) # 全局色调 Rev 4: desat+bluegrey mix, lum kept
+	var blotch_mat := _mat(Color.html("#6d6244"), 1.0)
+	var tuft_mat := _mat(Color.html("#42502e"), 1.0)
+	for lane in [LANE_NORTH, LANE_SOUTH]:
+		var pts: Array = lane.duplicate()
+		pts.append(CORE_POS)
+		for i in range(pts.size() - 1):
+			var a: Vector3 = pts[i]
+			var b: Vector3 = pts[i + 1]
+			var d := b - a
+			var dir := d.normalized()
+			var perp := Vector3(-dir.z, 0.0, dir.x)
+			var seg_ang := atan2(-d.z, d.x)
+			# 碎石堆清除（2026-11-17 用户裁定）：路面石簇/单石/路外扁石
+			# 与全部 RoadStone/RoadPebble 碎石链已整组摘除；土斑/草丘保留。
+			var blotch_ts: Array = [0.3, 0.7]
+			for bi in range(blotch_ts.size()):
+				var t: float = blotch_ts[bi]
+				var pos := a.lerp(b, t)
+				var side := 1.0 if (i + bi) % 2 == 0 else -1.0
+				var br := 1.0 + 0.4 * absf(sin(float(i * 13) + t * 5.0))
+				var blotch := _add_cylinder(world_root, "RoadBlotch", br, br, 0.015, Vector3(pos.x + perp.x * side * road_ribbon_width * 0.5, 0.056, pos.z + perp.z * side * road_ribbon_width * 0.5), blotch_mat, Vector3.ZERO, 12)
+				blotch.rotation.y = seg_ang
+				blotch.scale = Vector3(2.2, 1.0, 1.0)
+				blotch.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+			var bpos := a.lerp(b, 0.5)
+			var bside := 1.0 if i % 2 == 0 else -1.0
+			var bbr := 1.2 + 0.8 * absf(sin(float(i * 17) + 2.0))
+			var blotch2 := _add_cylinder(world_root, "RoadBlotch", bbr, bbr, 0.015, Vector3(bpos.x + perp.x * bside * road_ribbon_width * 0.5, 0.056, bpos.z + perp.z * bside * road_ribbon_width * 0.5), blotch_mat, Vector3.ZERO, 12)
+			blotch2.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+			var tuft_ts: Array = [0.15, 0.35, 0.55, 0.75, 0.9]
+			for ti in range(tuft_ts.size()):
+				var t: float = tuft_ts[ti]
+				var pos := a.lerp(b, t)
+				var side := 1.0 if (i + ti) % 2 == 0 else -1.0
+				var tr := 0.6 + 0.6 * absf(sin(float(i * 11) + t * 7.0))
+				var tuft := _add_sphere(world_root, "RoadTuft", tr, Vector3(pos.x + perp.x * side * (road_ribbon_width * 0.5 + 0.1), 0.02, pos.z + perp.z * side * (road_ribbon_width * 0.5 + 0.1)), tuft_mat, Vector3(1.0, 0.28, 1.0), 8)
+				tuft.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+			var in_ts: Array = [0.25, 0.65]
+			for ii in range(in_ts.size()):
+				var t: float = in_ts[ii]
+				var pos := a.lerp(b, t)
+				var side := 1.0 if (i + ii) % 2 == 0 else -1.0
+				var tr := 0.6 + 0.5 * absf(sin(float(i * 19) + t * 6.0))
+				var tuft := _add_sphere(world_root, "RoadTuft", tr, Vector3(pos.x + perp.x * side * 2.0, 0.02, pos.z + perp.z * side * 2.0), tuft_mat, Vector3(1.0, 0.28, 1.0), 8)
+				tuft.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+			# Codex 复审 4：石簇之间补更小、更贴地的碎石（6 颗/段）与
+			# 浅土斑（2 块/段），连成疏密变化的连续路面，打散平色空区。
+			var patch_ts: Array = [0.35, 0.75]
+			for ei in range(patch_ts.size()):
+				var t: float = patch_ts[ei]
+				var pos := a.lerp(b, t)
+				var er := 1.5 + 1.0 * absf(sin(float(i * 31) + t * 4.0))
+				var eoff := 2.0 * sin(float(i * 7) + t * 6.0)
+				var emat := stone_dark if (i + ei) % 2 == 0 else stone_light
+				var patch := _add_cylinder(world_root, "RoadPatch", er, er, 0.01, Vector3(pos.x + perp.x * eoff, 0.056, pos.z + perp.z * eoff), emat, Vector3.ZERO, 12)
+				patch.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+			# Codex 复审 5：碎石与浅土斑错位串联成链（10 颗/段，左右
+			# 交错），填补石簇之间的空档；再加 3 块不等宽的跨界长斑
+			# （沿边界分段打断弧线）与 2 丛路外草丘（草地侵入路缘）。
+			var patch2_ts: Array = [0.2, 0.8]
+			for ei in range(patch2_ts.size()):
+				var t: float = patch2_ts[ei]
+				var pos := a.lerp(b, t)
+				var er := 1.0 + 0.8 * absf(sin(float(i * 41) + t * 6.0))
+				var eoff := 1.5 * sin(float(i * 9) + t * 7.0)
+				var emat := stone_light if (i + ei) % 2 == 0 else stone_dark
+				var patch := _add_cylinder(world_root, "RoadPatch", er, er, 0.01, Vector3(pos.x + perp.x * eoff, 0.056, pos.z + perp.z * eoff), emat, Vector3.ZERO, 12)
+				patch.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+			var xblotch_ts: Array = [0.25, 0.5, 0.75]
+			for xi in range(xblotch_ts.size()):
+				var t: float = xblotch_ts[xi]
+				var pos := a.lerp(b, t)
+				var side := 1.0 if (i + xi) % 2 == 0 else -1.0
+				var br := 0.9 + 0.4 * absf(sin(float(i * 43) + t * 5.0))
+				var blotch := _add_cylinder(world_root, "RoadBlotch", br, br, 0.015, Vector3(pos.x + perp.x * side * road_ribbon_width * 0.5, 0.056, pos.z + perp.z * side * road_ribbon_width * 0.5), blotch_mat, Vector3.ZERO, 12)
+				blotch.rotation.y = seg_ang
+				blotch.scale = Vector3(1.6 + 1.6 * absf(sin(float(i * 47) + t * 3.0)), 1.0, 1.0)
+				blotch.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+			var xtuft_ts: Array = [0.3, 0.7]
+			for xi in range(xtuft_ts.size()):
+				var t: float = xtuft_ts[xi]
+				var pos := a.lerp(b, t)
+				var side := 1.0 if (i + xi) % 2 == 1 else -1.0
+				var tr := 0.6 + 0.5 * absf(sin(float(i * 53) + t * 6.0))
+				var tuft := _add_sphere(world_root, "RoadTuft", tr, Vector3(pos.x + perp.x * side * (road_ribbon_width * 0.5 + 0.5), 0.02, pos.z + perp.z * side * (road_ribbon_width * 0.5 + 0.5)), tuft_mat, Vector3(1.0, 0.28, 1.0), 8)
+				tuft.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+			# Codex 复审 6（第七版）：东端弯道定点加密——通用按段铺装
+			# 在最右弯道仍留宽平色空档（外段 74→52 的弧线外缘长于
+			# 直线段，碎石显稀）且下缘弧线未断。只在外段（i==0）加：
+			# 12 颗更小碎石错位填空档、4 块更小浅土斑、4 块加长跨
+			# 界长斑（长轴横跨边界、向两侧延伸）与 4 丛更深入路
+			# 面的路外草丘（中心压进路缘内 1.2）。
+			if i == 0:
+				var bend_patch_ts: Array = [0.2, 0.45, 0.68, 0.9]
+				for pi in range(bend_patch_ts.size()):
+					var t: float = bend_patch_ts[pi]
+					var pos := a.lerp(b, t)
+					var pr := 0.7 + 0.5 * absf(sin(float(pi * 11) + t * 7.0))
+					var poff := (1.0 if pi % 2 == 0 else -1.0) * 1.5
+					var pmat := stone_light if pi % 2 == 0 else stone_dark
+					var bpatch := _add_cylinder(world_root, "RoadPatch", pr, pr, 0.01, Vector3(pos.x + perp.x * poff, 0.056, pos.z + perp.z * poff), pmat, Vector3.ZERO, 12)
+					bpatch.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+				var bend_x_ts: Array = [0.15, 0.4, 0.65, 0.88]
+				for xi in range(bend_x_ts.size()):
+					var t: float = bend_x_ts[xi]
+					var pos := a.lerp(b, t)
+					var side := 1.0 if xi % 2 == 0 else -1.0
+					var xr := 0.9 + 0.3 * absf(sin(float(xi * 13) + t * 5.0))
+					var xblotch := _add_cylinder(world_root, "RoadBlotch", xr, xr, 0.015, Vector3(pos.x + perp.x * side * road_ribbon_width * 0.5, 0.056, pos.z + perp.z * side * road_ribbon_width * 0.5), blotch_mat, Vector3.ZERO, 12)
+					xblotch.rotation.y = seg_ang
+					xblotch.scale = Vector3(1.0, 1.0, 2.6 + 0.8 * absf(sin(float(xi * 17) + t * 3.0)))
+					xblotch.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+				var bend_tuft_ts: Array = [0.25, 0.5, 0.75, 0.92]
+				for ti in range(bend_tuft_ts.size()):
+					var t: float = bend_tuft_ts[ti]
+					var pos := a.lerp(b, t)
+					var side := 1.0 if ti % 2 == 1 else -1.0
+					var tr := 0.6 + 0.5 * absf(sin(float(ti * 19) + t * 6.0))
+					var btuft := _add_sphere(world_root, "RoadTuft", tr, Vector3(pos.x + perp.x * side * (road_ribbon_width * 0.5 - 1.2), 0.02, pos.z + perp.z * side * (road_ribbon_width * 0.5 - 1.2)), tuft_mat, Vector3(1.0, 0.28, 1.0), 8)
+					btuft.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	# Aprons: one continuous surface per flat road zone. Aprons sit a
+	# hair lower (top 0.04) than the ribbons (top 0.0555) so overlapping
+	# ribbon/apron faces never z-fight.
+	_add_cylinder(world_root, "RoadApronPlaza", 9.6, 9.6, 0.04, Vector3(PLAZA_POS.x, 0.020, PLAZA_POS.z), road_mat, Vector3.ZERO, 24)
+	var court := _add_cylinder(world_root, "RoadApronCourtyard", 14.5, 14.5, 0.04, Vector3(-65.0, 0.020, 0.0), road_mat, Vector3.ZERO, 28)
+	court.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	var court_disc0 := _add_cylinder(world_root, "CourtyardPaveDisc0", 4.0, 4.0, 0.04, Vector3(-76.5, 0.020, -11.8), road_mat, Vector3.ZERO, 16)
+	court_disc0.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	var court_disc1 := _add_cylinder(world_root, "CourtyardPaveDisc1", 4.0, 4.0, 0.04, Vector3(-76.5, 0.020, 11.8), road_mat, Vector3.ZERO, 16)
+	court_disc1.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	var court_disc2 := _add_cylinder(world_root, "CourtyardPaveDisc2", 4.0, 4.0, 0.04, Vector3(-53.5, 0.020, -11.8), road_mat, Vector3.ZERO, 16)
+	court_disc2.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	var court_disc3 := _add_cylinder(world_root, "CourtyardPaveDisc3", 4.0, 4.0, 0.04, Vector3(-53.5, 0.020, 11.8), road_mat, Vector3.ZERO, 16)
+	court_disc3.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	var market := _add_box(world_root, "RoadApronMarket", Vector3(28.0, 0.04, 11.0), Vector3(-63.0, 0.020, -16.0), road_mat)
+	market.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	var tz := TRAIN_ZONE.grow(2.0)
+	var train := _add_box(world_root, "RoadApronTraining", Vector3(tz.size.x, 0.04, tz.size.y), Vector3(tz.get_center().x, 0.020, tz.get_center().y), road_mat)
+	train.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	var boss_room := _add_box(world_root, "RoadApronBossRoom", Vector3(32.0, 0.04, 18.0), Vector3(-50.0, 0.020, -33.0), road_mat)
+	boss_room.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+func _rock_noise(a: float, b: float) -> float:
+	return sin(a * 0.37 + b * 0.21) * 0.46 + sin(a * 0.91 - b * 0.47) * 0.31 + sin((a + b) * 1.73) * 0.23
+
+
+func _cliff_height(x: float, z: float, side: int) -> float:
+	var t := 0.0
+	match side:
+		0: # north — rises only beyond the playable field (z < -44), so
+			# the north training room and market backdrop stay on flat land
+			t = clampf((-44.0 - z) / 26.0, 0.0, 1.0)
+			return 0.15 + 13.2 * t + _rock_noise(x, z) * 2.0 * t # 边缘 Rev 4: 北崖降峰 (16.5->13.2), 给中/远景让位
+		1: # south (lower, behind camera) — same, beyond z > 44 (the
+			# south training pen reaches z=41). 边缘 Rev 4: 三段软台阶
+			# (与 side 8 同族曲线), 顶端 8.30 与外坡接缝同高同噪
+			t = clampf((z - 44.0) / 26.0, 0.0, 1.0)
+			var stepped1: float = (floor(t * 3.0) + smoothstep(0.55, 1.0, fposmod(t * 3.0, 1.0))) / 3.0
+			return 0.15 + 8.15 * stepped1 + _rock_noise(x + 9.0, z) * 1.5 * t
+		2: # east, with notches at both rifts
+			t = clampf((x - 86.0) / 26.0, 0.0, 1.0)
+			var notch := clampf(minf(absf(z + 26.0), absf(z - 26.0)) / 11.0, 0.30, 1.0)
+			return 0.15 + 17.0 * t * notch + _rock_noise(z, x) * 2.2 * t
+		3: # west
+			t = clampf((-86.0 - x) / 26.0, 0.0, 1.0)
+			return 0.15 + 15.5 * t + _rock_noise(z + 4.0, x) * 2.1 * t
+		4: # north talus （边缘与远景 Rev 2): a rocky ramp on the FIELD
+			# side of the rim, lapping from flat grass up to the cliff
+			# foot so the rim rocks sit in a slope, not on a lawn edge
+			t = clampf((-40.0 - z) / 7.0, 0.0, 1.0)
+			return 0.03 + 1.5 * t + _rock_noise(x, z) * 0.4 * t
+		5: # south talus (lower — foreground ledge)
+			t = clampf((z - 40.0) / 7.0, 0.0, 1.0)
+			return 0.03 + 1.0 * t + _rock_noise(x + 9.0, z) * 0.3 * t
+		6: # east talus, rift notches kept open like side 2
+			t = clampf((x - 79.4) / 6.6, 0.0, 1.0)
+			var notch6 := clampf(minf(absf(z + 26.0), absf(z - 26.0)) / 11.0, 0.30, 1.0)
+			return 0.03 + 1.5 * t * notch6 + _rock_noise(z, x) * 0.4 * t
+		7: # west talus
+			t = clampf((-79.4 - x) / 6.6, 0.0, 1.0)
+			return 0.03 + 1.5 * t + _rock_noise(z + 4.0, x) * 0.4 * t
+		8: # south outer slope — 边缘 Rev 4: 共享边界连续地形: 起点与 side 1
+			# 顶端同高同噪 (8.30 + 1.5n); 不等距三段 (落差 2.6/3.05/2.95,
+			# 边界 0.30/0.66) + 台阶边界随 x 摆动, 消除等分棋盘感
+			t = clampf((z - 74.0) / 42.0, 0.0, 1.0)
+			var tw := pow(t, 1.15) + 0.05 * _rock_noise(x * 0.5, 3.0)
+			var s1 := smoothstep(0.26, 0.34, tw)
+			var s2 := smoothstep(0.62, 0.70, tw)
+			var s3 := smoothstep(0.94, 1.0, tw)
+			return 8.30 - 2.6 * s1 - 3.05 * s2 - 2.95 * s3 + _rock_noise(x + 9.0, z) * (1.5 - 0.3 * t) * (1.0 - t)
+		_: # unreachable for the bands in use; keeps the match exhaustive
+			return 0.15
+
+
+func _add_heightfield(band_name: String, rect: Rect2, seg_x: int, seg_z: int, side: int, material: Material) -> void:
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	st.set_material(material)
+	for iz in range(seg_z):
+		for ix in range(seg_x):
+			var x0 := rect.position.x + rect.size.x * float(ix) / float(seg_x)
+			var x1 := rect.position.x + rect.size.x * float(ix + 1) / float(seg_x)
+			var z0 := rect.position.y + rect.size.y * float(iz) / float(seg_z)
+			var z1 := rect.position.y + rect.size.y * float(iz + 1) / float(seg_z)
+			var a := Vector3(x0, _cliff_height(x0, z0, side), z0)
+			var b := Vector3(x1, _cliff_height(x1, z0, side), z0)
+			var c := Vector3(x0, _cliff_height(x0, z1, side), z1)
+			var d := Vector3(x1, _cliff_height(x1, z1, side), z1)
+			st.add_vertex(a)
+			st.add_vertex(c)
+			st.add_vertex(b)
+			st.add_vertex(c)
+			st.add_vertex(d)
+			st.add_vertex(b)
+	st.generate_normals()
+	var mi := MeshInstance3D.new()
+	mi.name = band_name
+	mi.mesh = st.commit()
+	mi.material_override = material
+	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
+	world_root.add_child(mi)
+
+
+const SWAP_MTN_NATIVE: Dictionary = {
+	"res://assets/kaykit_hex/decoration/nature/mountain_A.gltf": Vector3(1.8, 1.43, 1.88),
+	"res://assets/kaykit_hex/decoration/nature/mountain_B.gltf": Vector3(1.8, 1.77, 1.88),
+	"res://assets/kaykit_hex/decoration/nature/mountain_C.gltf": Vector3(1.76, 1.51, 2.02),
+	"res://assets/kaykit_hex/decoration/nature/hills_A.gltf": Vector3(1.76, 0.79, 1.74),
+}
+
+func _place_far_model(model_path: String, node_name: String, pos: Vector3, target: Vector3, tint: Color, yaw: float) -> Node3D:
+	var root := Node3D.new()
+	root.name = node_name
+	root.position = pos
+	root.rotation.y = yaw
+	world_root.add_child(root)
+	var native: Vector3 = SWAP_MTN_NATIVE[model_path]
+	var inst := _place_model(model_path, root, Vector3.ZERO, 0.0, 1.0, tint)
+	if inst != null:
+		inst.scale = Vector3(target.x / native.x, target.y / native.y, target.z / native.z)
+		for mi in inst.find_children("*", "MeshInstance3D", true, false):
+			(mi as MeshInstance3D).cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	return root
+
+func _far_tint(mat: Material, seed: float, amt: float, boost: float) -> Color:
+	var c := (_jitter_mat(mat, seed, amt) as StandardMaterial3D).albedo_color
+	return Color(clampf(c.r * boost, 0.0, 1.0), clampf(c.g * boost, 0.0, 1.0), clampf(c.b * boost, 0.0, 1.0))
+
+func _build_far_mountains() -> void:
+	# Swap (0.1.66): the procedural _add_peak silhouettes are retired;
+	# all three backdrop layers are KayKit mountain models now. Ring
+	# placement, grouping, height profiles and palette materials are
+	# unchanged from the peak era; tint = jittered palette color x a
+	# texture-compensation boost (the atlas texture multiplies in).
+	var mat_near := _mat(Color.html("#5c4f42").lerp(Color.html("#35496e"), 0.24), 1.0)
+	var mat_far := _mat(Color.html("#4d5f83").lerp(Color.html("#35496e"), 0.36), 1.0)
+	var near_groups := PackedInt32Array([4, 3, 5, 2, 4, 4])
+	var near_heights := PackedFloat32Array([1.08, 0.86, 1.20, 0.78, 1.02, 0.92])
+	var near_widths := PackedFloat32Array([1.12, 0.84, 1.04, 0.78, 1.20, 0.94])
+	for i in range(22):
+		var ang := TAU * float(i) / 22.0 + 0.13 * sin(float(i) * 2.3)
+		var px := cos(ang) * 148.0
+		var pz := sin(ang) * 104.0
+		var group_id: int = 0
+		var group_t: int = i
+		while group_t >= near_groups[group_id]:
+			group_t -= near_groups[group_id]
+			group_id += 1
+		var group_len: int = near_groups[group_id]
+		var profile: float = sin(PI * (float(group_t) + 0.5) / float(group_len))
+		var h: float = (8.0 + 20.0 * profile) * near_heights[group_id]
+		var w: float = (25.0 + 17.0 * profile) * near_widths[group_id]
+		if group_t == 0 or group_t == group_len - 1:
+			h *= 0.55
+		if pz < -70.0:
+			h *= 1.05
+			w *= 1.15
+			pz -= 8.0
+			if i == 15 or i == 16:
+				h += 4.0
+			if i == 16:
+				px -= 10.0
+			elif i == 17:
+				px += 10.0
+		# Mountain pull-in reverted (user 2026-11-17 22:30, after a
+		# close-up showed the in-frame range reading as stacked dark
+		# slabs): the composition round's front-range override is
+		# dropped - deep-north members keep their swap-round rim
+		# placement (|pz| 81..104, out of the default frame).
+		var model_n: String = SWAP_ROCK_MODELS[int(_swap_hash(float(i), 21.0) * 3.0) % 3]
+		_place_far_model(model_n, "FarMountainNear%d" % i, Vector3(px, -h * 0.12, pz), Vector3(w, h, 20.0), _far_tint(mat_near, float(i) + 0.5, 0.10, 1.50), ang + 0.4 * sin(float(i) * 1.3))
+		if i % 3 == 1:
+			_place_far_model("res://assets/kaykit_hex/decoration/nature/hills_A.gltf", "FarStepNear%d" % i, Vector3(px - sin(ang) * w * 0.24, -h * 0.05, pz + cos(ang) * w * 0.24), Vector3(w * 0.45, h * 0.52, 16.0), _far_tint(mat_near, float(i) + 31.0, 0.10, 1.35), ang + 0.3)
+	var far_groups := PackedInt32Array([3, 4, 3, 3, 3])
+	var far_heights := PackedFloat32Array([1.12, 0.88, 1.04, 0.82, 1.16])
+	var far_widths := PackedFloat32Array([0.92, 1.18, 0.84, 1.06, 0.96])
+	for i in range(16):
+		var ang := TAU * float(i) / 16.0 + 0.31 + 0.10 * cos(float(i) * 1.9)
+		var px := cos(ang) * 218.0
+		var pz := sin(ang) * 158.0
+		var group_id: int = 0
+		var group_t: int = i
+		while group_t >= far_groups[group_id]:
+			group_t -= far_groups[group_id]
+			group_id += 1
+		var group_len: int = far_groups[group_id]
+		var profile: float = sin(PI * (float(group_t) + 0.5) / float(group_len))
+		var h: float = (25.0 + 32.0 * profile) * far_heights[group_id]
+		var w: float = (56.0 + 22.0 * profile) * far_widths[group_id]
+		if group_t == 0 or group_t == group_len - 1:
+			h *= 0.58
+		if pz < -110.0:
+			w *= 1.3
+		if i == 13:
+			continue
+		if i in [10, 11, 12]:
+			w *= 1.4
+			h *= 0.92
+		# Mountain pull-in reverted (user 2026-11-17 22:30): the
+		# composition round's back-massif override for members 11/12
+		# is dropped - all far members keep the wide ring.
+		var model_f: String = SWAP_ROCK_MODELS[int(_swap_hash(float(i), 23.0) * 3.0) % 3]
+		_place_far_model(model_f, "FarMountainFar%d" % i, Vector3(px, -h * 0.12, pz), Vector3(w, h, 30.0), _far_tint(mat_far, float(i) + 11.0, 0.02, 1.40), ang + 0.5 * cos(float(i) * 1.1))
+		if i % 4 == 2:
+			_place_far_model("res://assets/kaykit_hex/decoration/nature/hills_A.gltf", "FarStepFar%d" % i, Vector3(px - sin(ang) * w * 0.22, -h * 0.05, pz + cos(ang) * w * 0.22), Vector3(w * 0.4, h * 0.45, 24.0), _far_tint(mat_far, float(i) + 51.0, 0.02, 1.26), ang + 0.3)
+	var mat_ridge := _mat(Color.html("#4c4136").lerp(Color.html("#35496e"), 0.48), 1.0)
+	for k in range(3):
+		var mang := 4.25 + 0.525 * float(k)
+		var mpx := cos(mang) * 143.0
+		# Edge Rev 6 （间隔带）: ridge pushed north + depth narrowed +
+		# main-arc/low-shoulder profile; near ring north sector is
+		# pushed out in step below so the layer order cannot invert.
+		var mpz := sin(mang) * 110.0
+		var mh: float = [18.0, 23.0, 18.0][k]
+		# Mountain pull-in reverted (user 2026-11-17 22:30): the
+		# composition round's west-pocket override for ridge member 1
+		# is dropped - all three ridge members keep the wide ring.
+		_place_far_model(SWAP_ROCK_MODELS[k % 3], "FarRidgeN%d" % k, Vector3(mpx, -mh * 0.12, mpz), Vector3(112.0, mh, 14.0), _far_tint(mat_ridge, 91.0 + float(k) * 3.0, 0.05, 1.45), mang + PI / 2.0 + 0.10 * sin(float(k) * 2.3))
+	for i in range(20):
+		var ang := TAU * float(i) / 20.0 + 0.21 * sin(float(i) * 1.7)
+		var px := cos(ang) * 140.0
+		var pz := sin(ang) * 98.0
+		var h := 8.0 + 11.0 * (0.5 + 0.5 * sin(float(i) * 2.31))
+		var w := 30.0 + 8.0 * sin(float(i) * 2.9)
+		if pz < -60.0:
+			continue
+		elif i % 5 == 3:
+			h *= 0.45
+		_place_far_model(SWAP_ROCK_MODELS[int(_swap_hash(float(i), 29.0) * 3.0) % 3], "FarRidge%d" % i, Vector3(px, -h * 0.12, pz), Vector3(w, h, 15.0), _far_tint(mat_ridge, float(i) + 71.0, 0.05, 1.45), ang + 0.35 * sin(float(i) * 1.9))
+
+
+func _build_cliffs() -> void:
+	# 边缘与远景 Rev 1: an outer apron of dark rocky earth under and
+	# beyond everything, so any residual gap between rim pieces shows
+	# ground instead of the near-black background void (the "tray on
+	# a black table" read). Top sits at y=-0.35, below the field.
+	var apron := _add_box(world_root, "OuterApron", Vector3(640.0, 1.0, 480.0), Vector3(0, -0.85, 0), _mat(Color.html("#453a2d"), 1.0))
+	apron.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	var rock_mat := _mat(Color.html("#6b5f52"), 0.97)
+	var rock_mat2 := _mat(Color.html("#544a41"), 0.95)
+	_add_heightfield("NorthCliff", Rect2(-124, -74, 248, 30), 56, 14, 0, rock_mat)
+	_add_heightfield("SouthCliff", Rect2(-124, 44, 248, 30), 56, 14, 1, rock_mat2)
+	_add_heightfield("EastCliff", Rect2(86, -74, 30, 148), 16, 40, 2, rock_mat)
+	_add_heightfield("WestCliff", Rect2(-116, -74, 30, 148), 16, 40, 3, rock_mat2)
+	# 边缘与远景 Rev 2 (Codex 首审 3.5/10): talus ramps on the field
+	# side of every rim + the south outer descent + rolling outer
+	# slabs, so the field's ground runs continuously into the rim
+	# and out of frame instead of ending at a stone frame on a tray.
+	var talus_mat := _mat(Color.html("#5c4d3d"), 1.0)
+	_add_heightfield("NorthTalus", Rect2(-124, -47, 248, 7), 56, 4, 4, talus_mat)
+	_add_heightfield("SouthTalus", Rect2(-124, 40, 248, 7), 56, 4, 5, talus_mat)
+	_add_heightfield("EastTalus", Rect2(79.4, -74, 6.6, 148), 4, 40, 6, talus_mat)
+	_add_heightfield("WestTalus", Rect2(-86, -74, 6.6, 148), 4, 40, 7, talus_mat)
+	_add_heightfield("SouthOuterSlope", Rect2(-124, 74, 248, 42), 56, 10, 8, rock_mat2)
+	# 边缘 Rev 4: 外坡露岩 (露出约 1/3-1/2, 方向各异) + 台面土 patch, 破无特征坡板。
+	# 名字避开 RockWallMass*/FarRidge* 计数口径; 不挂接触阴影 (全场普查 34 不变)。
+	var outcrop_mat := _mat(Color.html("#4a3a2e"), 1.0) # 边缘 Rev 4: 深暖岩, 与浅坡面拉开对比
+	var soil_mat := _mat(Color.html("#7a6547"), 1.0) # 边缘 Rev 4: 亮土色, 贴坡面读作土包
+	for k in range(9):
+		var ox := -96.0 + float(k) * 24.0 + 9.0 * sin(float(k) * 2.7)
+		var oz := 79.0 + 16.0 * (0.5 + 0.5 * sin(float(k) * 1.93 + 0.8))
+		var osz := Vector3(4.2 + 2.4 * (0.5 + 0.5 * sin(float(k) * 3.4)), 3.0 + 1.7 * (0.5 + 0.5 * cos(float(k) * 2.2)), 3.4 + 2.0 * (0.5 + 0.5 * sin(float(k) * 1.6)))
+		var oc := _add_box(world_root, "SouthOutcrop%d" % k, osz, Vector3(ox, _cliff_height(ox, oz, 8) - osz.y * 0.02, oz), _jitter_mat(outcrop_mat, 131.0 + float(k) * 1.7, 0.12), Vector3(0.10 * sin(float(k) * 2.9), 0.5 * sin(float(k) * 1.3), 0.08 * cos(float(k) * 2.4)))
+		oc.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	for k in range(7):
+		var spx := -84.0 + float(k) * 27.0 + 7.0 * cos(float(k) * 2.1)
+		var spz := 80.0 + 16.0 * (0.5 + 0.5 * sin(float(k) * 2.6 + 1.9))
+		var spw := 6.0 + 5.0 * (0.5 + 0.5 * sin(float(k) * 1.8))
+		var patch := _add_box(world_root, "SouthSoilPatch%d" % k, Vector3(spw, 0.12, spw * 0.62), Vector3(spx, _cliff_height(spx, spz, 8) + 0.02, spz), _jitter_mat(soil_mat, 151.0 + float(k) * 2.3, 0.06), Vector3(0.0, 0.4 * sin(float(k) * 3.1), 0.0))
+		patch.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	# 边缘 Rev 4 补强: s 机位可见走廊 (|x|<=45) 内的大尺度露岩+土 patch —
+	# 原散布 ±96 大多落在该机位画外, 坡面近景仍显空。
+	var foc_x := [-26.0, -6.0, 16.0, 36.0]
+	var foc_z := [77.5, 79.0, 76.5, 79.5] # 相机 FOV 34 实测: s 机位可见坡面仅 z<~80 的第一级台面, 原 z 84-93 全落在画外下方
+	for k in range(4):
+		var fx: float = foc_x[k]
+		var fz: float = foc_z[k]
+		var fsz := Vector3(5.2 + 1.3 * sin(float(k) * 2.2), 3.6 + 1.1 * cos(float(k) * 1.7), 4.0 + 1.2 * sin(float(k) * 2.9 + 0.5))
+		var foc := _add_box(world_root, "SouthOutcrop%d" % (9 + k), fsz, Vector3(fx, _cliff_height(fx, fz, 8) - fsz.y * 0.02, fz), _jitter_mat(outcrop_mat, 141.0 + float(k) * 2.9, 0.12), Vector3(0.09 * sin(float(k) * 3.3), 0.45 * sin(float(k) * 1.9 + 0.4), 0.07 * cos(float(k) * 2.6)))
+		foc.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	var fp_x := [-16.0, 26.0]
+	var fp_z := [78.5, 77.0]
+	for k in range(2):
+		var gx: float = fp_x[k]
+		var gz: float = fp_z[k]
+		var gpatch := _add_box(world_root, "SouthSoilPatch%d" % (7 + k), Vector3(9.0 + 2.0 * float(k), 0.12, 6.0 + 1.2 * float(k)), Vector3(gx, _cliff_height(gx, gz, 8) + 0.02, gz), _jitter_mat(soil_mat, 161.0 + float(k) * 3.1, 0.06), Vector3(0.0, 0.35 * sin(float(k) * 2.7 + 0.8), 0.0))
+		gpatch.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	var slab_mat := _mat(Color.html("#584a38"), 1.0) # 边缘 Rev 4: 基色提亮向崖面色靠 (was #4b3d2f), 消除南侧桌面感
+	for i in range(12):
+		var ang := TAU * float(i) / 12.0 + 0.4 * sin(float(i) * 1.3)
+		var px := cos(ang) * (185.0 + 30.0 * sin(float(i) * 2.1))
+		var pz := sin(ang) * (135.0 + 22.0 * cos(float(i) * 1.7))
+		# 边缘 Rev 4: 板色改低频连续 (随 ang 缓变), 消除相邻板间明度跳变 (was 每块独立 0.10 抖动)
+		var slab_i := slab_mat.duplicate() as StandardMaterial3D
+		slab_i.albedo_color = slab_mat.albedo_color * (0.97 + 0.05 * sin(ang * 2.0 + 1.3) + 0.03 * sin(ang * 3.0 - 0.6))
+		var slab := _add_box(world_root, "OuterSlab%d" % i, Vector3(55.0 + 45.0 * (0.5 + 0.5 * sin(float(i) * 3.3)), 1.0 + 0.7 * (0.5 + 0.5 * cos(float(i) * 2.6)), 34.0 + 22.0 * (0.5 + 0.5 * sin(float(i) * 1.9))) * 1.15, Vector3(px, -0.80 - (0.55 if pz > 60.0 else 0.0), pz), slab_i, Vector3(0.03 * sin(float(i)), float(i) * 0.83, 0.02 * cos(float(i))))
+		slab.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_build_far_mountains()
+	# Jagged boulders along the cliff feet.
+	for i in range(52):
+		var side_pick := i % 4
+		var pos := Vector3.ZERO
+		match side_pick:
+			0:
+				pos = Vector3(-88.0 + float(i) * 3.4, 0.4, -46.0 + sin(float(i) * 2.1) * 1.6)
+			1:
+				pos = Vector3(-86.0 + float(i) * 3.6, 0.35, 46.5 + cos(float(i) * 1.7) * 1.4)
+			2:
+				pos = Vector3(88.5 + sin(float(i)) * 1.2, 0.45, -44.0 + float(i) * 1.8)
+			_:
+				pos = Vector3(-88.5 + cos(float(i)) * 1.1, 0.4, -42.0 + float(i) * 1.75)
+		if side_pick == 2 and (absf(pos.z + 26.0) < 5.0 or absf(pos.z - 26.0) < 5.0):
+			continue
+		if side_pick == 0 and ((pos.x > -53.0 and pos.x < -34.0) or (pos.x > 16.0 and pos.x < 36.0)):
+			continue # 边缘 Rev 4: 北缘缺口须同时断岩脚线, 缺口 x 段内碎石跳过
+		var rock := _add_sphere(world_root, "Boulder", 1.0, pos, rock_mat if i % 2 == 0 else rock_mat2, Vector3(1.1 + 0.3 * sin(float(i) * 3.0), 0.65 + 0.2 * cos(float(i)), 0.95), 7)
+		rock.rotation = Vector3(0.2 * sin(float(i)), float(i) * 0.7, 0.15 * cos(float(i) * 2.0))
+
+
+func _jitter_mat(base: Material, seed: float, amt: float = 0.12) -> Material:
+	# 破损件清零 Rev 1: duplicate a shared flat material with a small
+	# deterministic brightness jitter, so repeated boxes stop reading
+	# as one uncolored slab.
+	var m := base as StandardMaterial3D
+	if m == null:
+		return base
+	var dup := m.duplicate() as StandardMaterial3D
+	var j := 1.0 + amt * sin(seed * 7.13) + amt * 0.5 * sin(seed * 3.7)
+	var c := dup.albedo_color
+	dup.albedo_color = Color(clampf(c.r * j, 0.0, 1.0), clampf(c.g * j, 0.0, 1.0), clampf(c.b * j, 0.0, 1.0), c.a)
+	return dup
+
+
+func _shade_mat(base: Material, shade: float, seed: float) -> Material:
+	# 破损件清零 Rev 2: jittered copy darkened by `shade` — for fracture
+	# plates and mountain notches that must read clearly darker than
+	# the face they sit on.
+	var m := _jitter_mat(base, seed, 0.10)
+	var sm := m as StandardMaterial3D
+	if sm == null:
+		return m
+	var c := sm.albedo_color
+	sm.albedo_color = Color(clampf(c.r * shade, 0.0, 1.0), clampf(c.g * shade, 0.0, 1.0), clampf(c.b * shade, 0.0, 1.0), c.a)
+	return sm
+
+
+const SWAP_ROCK_MODELS: Array = [
+	"res://assets/kaykit_hex/decoration/nature/mountain_A.gltf",
+	"res://assets/kaykit_hex/decoration/nature/mountain_B.gltf",
+	"res://assets/kaykit_hex/decoration/nature/mountain_C.gltf",
+]
+const SWAP_ROCK_NATIVE: Array = [Vector3(1.8, 1.43, 1.88), Vector3(1.8, 1.77, 1.88), Vector3(1.76, 1.51, 2.02)]
+const SWAP_ROCK_SINGLE_MODELS: Array = [
+	"res://assets/kaykit_hex/decoration/nature/rock_single_A.gltf",
+	"res://assets/kaykit_hex/decoration/nature/rock_single_B.gltf",
+	"res://assets/kaykit_hex/decoration/nature/rock_single_C.gltf",
+	"res://assets/kaykit_hex/decoration/nature/rock_single_D.gltf",
+	"res://assets/kaykit_hex/decoration/nature/rock_single_E.gltf",
+]
+
+func _swap_hash(seed: float, salt: float) -> float:
+	return fposmod(sin(seed * 12.9898 + salt * 78.233) * 43758.5453, 1.0)
+
+func _add_rock_mass(pos: Vector3, rock_scale: Vector3, material: Material, seed: float) -> void:
+	# Swap (0.1.66): the procedural prism body + cap + facet/wedge/spall
+	# stack is retired. Each rim mass is now a KayKit mountain piece
+	# (bare rock, atlas-textured) plus one modeled companion boulder on
+	# the field-facing side. Tint comes from the caller's palette
+	# material, shaded from a 3-step set so merge signatures stay few.
+	_rock_mass_seq += 1
+	var mid := _rock_mass_seq
+	var root := Node3D.new()
+	root.name = "RockWallMass%d" % mid
+	root.position = pos
+	root.rotation.y = seed * 0.63 + 0.25 * (2.0 * _swap_hash(seed, 3.0) - 1.0)
+	world_root.add_child(root)
+	var base_col := (material as StandardMaterial3D).albedo_color
+	var shade: float = [0.74, 1.0, 1.26][int(_swap_hash(seed, 5.0) * 3.0) % 3]
+	var tint := Color(clampf(base_col.r * shade * 1.24, 0.0, 1.0), clampf(base_col.g * shade * 1.35, 0.0, 1.0), clampf(base_col.b * shade * 1.67, 0.0, 1.0))
+	# Primary-mass widening survives from the structural round (one
+	# primary in each group of four).
+	var group_hash: int = int(floor(_swap_hash(float((mid - 1) / 4), 19.7) * 4.0))
+	var mass_width: float = 1.35 if (mid - 1) % 4 == group_hash else 0.85
+	var target_w: float = rock_scale.x * 2.01 * mass_width
+	var target_h: float = rock_scale.y * 1.65
+	var target_d: float = rock_scale.z * 2.01 * mass_width
+	var model_idx: int = int(_swap_hash(seed, 7.0) * 3.0) % 3
+	var native: Vector3 = SWAP_ROCK_NATIVE[model_idx]
+	var body := _place_model(SWAP_ROCK_MODELS[model_idx], root, Vector3(0.0, -target_h * 0.46, 0.0), 0.0, 1.0, tint)
+	if body != null:
+		body.scale = Vector3(target_w / native.x, target_h / native.y, target_d / native.z)
+	var face_dir := Vector3(-signf(pos.x), 0.0, 0.0) if absf(pos.x) >= absf(pos.z) else Vector3(0.0, 0.0, -signf(pos.z))
+	var tangent := Vector3(face_dir.z, 0.0, -face_dir.x)
+	var face_scale: float = rock_scale.x if face_dir.x != 0.0 else rock_scale.z
+	var single_idx: int = int(_swap_hash(seed, 11.0) * 5.0) % 5
+	var comp_pos: Vector3 = face_dir * face_scale * 0.62 + tangent * rock_scale.x * 0.30 * (2.0 * _swap_hash(seed, 13.0) - 1.0) + Vector3(0.0, -target_h * 0.46, 0.0)
+	_place_model(SWAP_ROCK_SINGLE_MODELS[single_idx], root, comp_pos, seed * 1.7, rock_scale.x * 2.1, Color(tint.r * 0.82, tint.g * 0.82, tint.b * 0.82))
+
+
+func _build_rock_walls() -> void:
+	var rock_mats: Array = [
+		_mat(Color.html("#6a5c4e"), 0.97),
+		_mat(Color.html("#55483c"), 0.97),
+		_mat(Color.html("#71634f"), 0.96),
+	]
+	# North rim Rev 4 (was Rev 3): gaps widened and aligned in BOTH rows, peaks lowered.
+	for i in range(30):
+		var x := -84.0 + float(i) * 5.8
+		var lift := 2.6 + 1.1 * (0.5 + 0.5 * sin(float(i) * 1.93))
+		if i not in [6, 7, 8, 18, 19, 20]:
+			_add_rock_mass(Vector3(x, lift * (0.5 if i % 3 == 1 else 0.8), -46.6 + sin(float(i) * 2.4) * 0.9), Vector3(4.3 + 0.8 * sin(float(i) * 3.1), (4.6 + 1.2 * cos(float(i) * 1.4)) * (0.85 if i % 3 == 1 else 1.0), 3.2), rock_mats[i % rock_mats.size()], float(i) + 0.4)
+		if i not in [6, 7, 8, 18, 19, 20]:
+			_add_rock_mass(Vector3(x + 2.4, lift * 0.8 + 1.9, -48.4), Vector3(3.2, 3.4 + 0.7 * sin(float(i) * 2.0), 2.7), rock_mats[(i + 1) % rock_mats.size()], float(i) + 4.1)
+	# South rim: lower foreground rocks that frame rather than block
+	# the field. 边缘与远景 Rev 1: sunk lower, pushed slightly
+	# farther out and flattened, so at the classic camera they read
+	# as a rocky ledge lip instead of cropped model parts.
+	for i in range(30):
+		var x := -84.0 + float(i) * 5.8
+		if i in [5, 6, 14, 15, 23, 24]:
+			continue
+		var spos := Vector3(x, 0.10 + 0.25 * sin(float(i) * 2.2) - (0.65 if i % 3 == 0 else 0.0), 48.4 + cos(float(i) * 1.8) * 0.7)
+		var sscale := Vector3(4.1, (1.8 + 0.45 * cos(float(i) * 1.5)) * (0.8 if i % 3 == 0 else 1.0), 3.4)
+		var smat: Material = rock_mats[(i + 2) % rock_mats.size()]
+		# Full rock removal (user 2026-11-17 20:27, after the comp +
+		# thinning rounds): the composition round's south foreground
+		# arc overrides are all dropped - every south mass stays on
+		# the south rim (default above, behind the default camera),
+		# so no formed rock mass sits inside the default frame.
+		_add_rock_mass(spos, sscale, smat, float(i) + 8.7)
+	# East rim behind the rifts, leaving both portal notches open.
+	for i in range(18):
+		var z := -46.0 + float(i) * 5.2
+		if absf(z + 26.0) < 4.6 or absf(z - 26.0) < 4.6:
+			continue
+		var lift := 2.5 + 1.0 * (0.5 + 0.5 * cos(float(i) * 1.7))
+		_add_rock_mass(Vector3(89.8 + sin(float(i) * 2.0) * 0.8, lift, z), Vector3(3.4, 4.8 + 1.1 * sin(float(i) * 1.3), 4.2), rock_mats[i % rock_mats.size()], float(i) + 13.2)
+		var epos := Vector3(91.6, lift + 2.2, z + 2.0)
+		var escale := Vector3(2.8, 3.5, 3.1)
+		var emat: Material = rock_mats[(i + 1) % rock_mats.size()]
+		# Full rock removal (user 2026-11-17 20:27): the composition
+		# round's east pocket overrides are all dropped - every east
+		# back-row mass stays on the east rim row (default above).
+		_add_rock_mass(epos, escale, emat, float(i) + 17.9)
+	# West rim directly behind the fortress and seal core.
+	for i in range(18):
+		var z := -46.0 + float(i) * 5.2
+		var lift := 2.7 + 1.1 * (0.5 + 0.5 * sin(float(i) * 1.8))
+		_add_rock_mass(Vector3(-89.2 + cos(float(i) * 1.9) * 0.8, lift, z), Vector3(3.5, 5.0 + 1.0 * cos(float(i) * 1.2), 4.3), rock_mats[(i + 1) % rock_mats.size()], float(i) + 22.4)
+		var wpos := Vector3(-91.0, lift + 2.3, z + 2.1)
+		var wscale := Vector3(2.9, 3.6, 3.2)
+		var wmat: Material = rock_mats[(i + 2) % rock_mats.size()]
+		# Full rock removal (user 2026-11-17 20:27): the composition
+		# round's SW foreground anchor override is dropped - the west
+		# back-row mass stays on the west rim row (default above).
+		_add_rock_mass(wpos, wscale, wmat, float(i) + 27.6)
+	# 边缘与远景 Rev 1: corner seals — the four junctions where the
+	# N/S rows meet the E/W rows were the last see-through gaps.
+	var corner_index := 0
+	for corner: Vector2 in [Vector2(1, 1), Vector2(1, -1), Vector2(-1, 1), Vector2(-1, -1)]:
+		var cx: float = corner.x * 88.6
+		var cz: float = corner.y * 47.2
+		_add_rock_mass(Vector3(cx, 2.9, cz), Vector3(4.6, 5.4, 4.6), rock_mats[0], 40.0 + cx)
+		_add_rock_mass(Vector3(cx + corner.x * 3.4, 0.2, cz + corner.y * 3.0), Vector3(3.8, 2.6, 3.8), rock_mats[1], 60.0 + cz)
+		var shoulder := _add_box(world_root, "CornerShoulder%d" % corner_index, Vector3(11.0, 2.4, 11.0), Vector3(cx * 0.96, 0.2, cz * 0.96), rock_mats[2], Vector3(0, PI / 4, 0))
+		shoulder.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		corner_index += 1
+
+
+func _build_wall_run(z_pos: float, x_from: float, x_to: float, material: Material, trim_mat: Material) -> void:
+	var x := x_from
+	while x <= x_to:
+		_add_box(world_root, "Wall", Vector3(4.3, 3.1, 1.25), Vector3(x, 1.55, z_pos), material)
+		_add_box(world_root, "WallCap", Vector3(4.4, 0.42, 1.5), Vector3(x, 3.30, z_pos), trim_mat)
+		_add_box(world_root, "Merlon", Vector3(0.85, 0.75, 1.35), Vector3(x - 1.2, 3.85, z_pos), material)
+		_add_box(world_root, "Merlon", Vector3(0.85, 0.75, 1.35), Vector3(x + 1.2, 3.85, z_pos), material)
+		x += 4.25
+
+
+func _add_ballista_fittings(inst: Node3D) -> void:
+	# 破损件清零 Rev 3 (Codex 复审处方): the ballista read as one brown
+	# wooden lump — add the machine's actual ironwork as separate parts
+	# in model space: a through-axle with hub caps at the wheels, iron
+	# caps on the bow-arm tips, and the rear winch drum with side discs,
+	# so wood and iron separate at a glance.
+	var iron := _mat(Color(0.32, 0.35, 0.40), 0.38, 0.55)
+	_add_cylinder(inst, "BallistaAxle", 0.09, 0.09, 1.06, Vector3(0.438, 0.201, 0), iron, Vector3(PI / 2.0, 0, 0), 10)
+	_add_cylinder(inst, "BallistaHubL", 0.13, 0.13, 0.10, Vector3(0.438, 0.201, 0.485), iron, Vector3(PI / 2.0, 0, 0), 10)
+	_add_cylinder(inst, "BallistaHubR", 0.13, 0.13, 0.10, Vector3(0.438, 0.201, -0.485), iron, Vector3(PI / 2.0, 0, 0), 10)
+	_add_box(inst, "BallistaTipL", Vector3(0.27, 0.29, 0.20), Vector3(0.36, 0.52, 0.56), iron, Vector3(0, 0, -0.5))
+	_add_box(inst, "BallistaTipR", Vector3(0.27, 0.29, 0.20), Vector3(0.36, 0.52, -0.56), iron, Vector3(0, 0, 0.5))
+	_add_cylinder(inst, "BallistaWinch", 0.12, 0.12, 0.46, Vector3(-0.42, 0.38, 0), iron, Vector3(PI / 2.0, 0, 0), 10)
+	_add_cylinder(inst, "BallistaWinchDiscL", 0.19, 0.19, 0.07, Vector3(-0.42, 0.38, 0.25), iron, Vector3(PI / 2.0, 0, 0), 10)
+	_add_cylinder(inst, "BallistaWinchDiscR", 0.19, 0.19, 0.07, Vector3(-0.42, 0.38, -0.25), iron, Vector3(PI / 2.0, 0, 0), 10)
+
+	# Continuous iron straps tie the bow tips into the frame and winch.
+	_add_box(inst, "BallistaStrapL", Vector3(0.10, 0.09, 0.55), Vector3(0.36, 0.52, 0.28), iron, Vector3(0, 0, -0.5))
+	_add_box(inst, "BallistaStrapR", Vector3(0.10, 0.09, 0.55), Vector3(0.36, 0.52, -0.28), iron, Vector3(0, 0, 0.5))
+	_add_box(inst, "BallistaFrameRailL", Vector3(0.95, 0.09, 0.09), Vector3(0.0, 0.30, 0.20), iron)
+	_add_box(inst, "BallistaFrameRailR", Vector3(0.95, 0.09, 0.09), Vector3(0.0, 0.30, -0.20), iron)
+	_add_box(inst, "BallistaSpineRail", Vector3(0.92, 0.07, 0.10), Vector3(-0.03, 0.47, 0), iron, Vector3(0, 0, 0.10))
+	_add_box(inst, "BallistaBraceL", Vector3(0.62, 0.06, 0.06), Vector3(0.10, 0.40, 0.24), iron, Vector3(0.35, 0, -0.35))
+	_add_box(inst, "BallistaBraceR", Vector3(0.62, 0.06, 0.06), Vector3(0.10, 0.40, -0.24), iron, Vector3(-0.35, 0, -0.35))
+	_add_box(inst, "BallistaCrankArm", Vector3(0.05, 0.30, 0.05), Vector3(-0.42, 0.50, 0.33), iron)
+	_add_cylinder(inst, "BallistaCrankKnob", 0.045, 0.045, 0.14, Vector3(-0.42, 0.63, 0.33), iron, Vector3(PI / 2.0, 0, 0), 8)
+
+func _build_watchtower(pos: Vector3, tower_name: String) -> Dictionary:
+	var root := Node3D.new()
+	root.name = tower_name
+	root.position = pos
+	world_root.add_child(root)
+	# Stone step plinth under the tower (VISUAL_AUDIT P1-4 ground contact).
+	_add_cylinder(root, "TowerStep", 3.30, 3.60, 0.26, Vector3(0, 0.13, 0), _mat(Color.html("#5d574e"), 0.97), Vector3.ZERO, 10)
+	# Contact shadow: grounds the plinth on the grass (Rev 1, tight
+	# profile + deeper alpha in Rev 2).
+	_add_ground_disc(root, "ContactShadow", Vector3(0, 0.05, 0), 2.2, Color(0, 0, 0), 0.48, true)
+	# Kenney modular castle tower (base + mid + parapet) at 3x module scale.
+	# 破损件清零 Rev 1: stone tint deepened (was 0.94,0.88,0.78 — the
+	# tower read as a near-white monolith in sun-facing views).
+	var stone_tint := watchtower_stone_tint
+	# 破损件清零 Rev 3 (Codex 复审处方): per-module gray-brown deltas so
+	# the three lifts read as different stone courses, not one extruded
+	# slab — base darker and grayer, mid as pinned, crown warmer.
+	_place_model("res://assets/kenney_castle/tower-square-base.glb", root, Vector3(0, 0, 0), 0.0, 3.0, stone_tint * Color(0.90, 0.89, 0.88))
+	_place_model("res://assets/kenney_castle/tower-square-mid.glb", root, Vector3(0, 3.03, 0), 0.0, 3.0, stone_tint)
+	_place_model("res://assets/kenney_castle/tower-square-top.glb", root, Vector3(0, 6.06, 0), 0.0, 3.0, stone_tint * Color(1.03, 0.99, 0.93))
+	# Staggered quoin stones on the four corners: structural masonry
+	# articulation, catching light differently at each lift.
+	var quoin_mat := _mat(Color(0.42, 0.40, 0.37), 0.97)
+	for qi in range(12):
+		var qy: float = [1.5, 4.5, 7.6][qi / 4]
+		var qc: Vector2 = [Vector2(1, 1), Vector2(1, -1), Vector2(-1, 1), Vector2(-1, -1)][qi % 4]
+		_add_box(root, "TowerQuoin%d" % qi, Vector3(0.50, 0.90, 0.50), Vector3(qc.x * 1.44, qy, qc.y * 1.44), _jitter_mat(quoin_mat, float(qi) + pos.x, 0.05), Vector3(0, 0.10 * sin(float(qi) * 2.3), 0))
+	var head := Node3D.new()
+	head.name = "ShooterHead"
+	head.position = Vector3(0, 6.30, 0)
+	root.add_child(head)
+	# 破损件清零 Rev 2 (Codex 首审): the tower read as one continuous
+	# cream slab — a darker plinth course at the foot and string
+	# courses at the module seams split the face, and the ballista
+	# gets a dark wooden cradle so it stops reading as pale sticks.
+	var course_mat := _mat(Color.html("#4a4238"), 0.97)
+	_add_box(root, "TowerPlinth", Vector3(3.8, 1.0, 3.8), Vector3(0, 0.5, 0), course_mat)
+	_add_box(root, "TowerCourseLow", Vector3(3.5, 0.35, 3.5), Vector3(0, 3.03, 0), course_mat)
+	_add_box(root, "TowerCourseHigh", Vector3(3.5, 0.3, 3.5), Vector3(0, 6.06, 0), course_mat)
+	# Masonry joints hug the stone faces with only 0.02-0.04 relief;
+	# these are shallow course lines, with staggered south-face joints.
+	var seam_mat := _mat(Color(0.45, 0.43, 0.40), 0.97)
+	# Rev 4 fix (coordinator): the first cut used full 3.54-wide plates
+	# whose top faces roofed over the crown at the 55-degree camera and
+	# hid the ballista — face strips only, never a cross-section plate.
+	for hi in range(6):
+		var sy: float = [1.0, 2.0, 4.0, 5.0, 7.0, 8.0][hi]
+		var seg_a := 2.00
+		var seg_b := 1.02
+		var gap := 0.28
+		var off := 0.34 if hi % 2 == 0 else -0.34
+		var c_a := off - (gap / 2.0 + seg_a / 2.0)
+		var c_b := off + (gap / 2.0 + seg_b / 2.0)
+		for fi in range(4):
+			for seg in range(2):
+				var sidx := hi * 8 + fi * 2 + seg
+				var seg_len := seg_a if seg == 0 else seg_b
+				var c := c_a if seg == 0 else c_b
+				if fi == 0:
+					_add_box(root, "TowerSeamH%d" % sidx, Vector3(seg_len, 0.06, 0.06), Vector3(c, sy, 1.73), seam_mat)
+				elif fi == 1:
+					_add_box(root, "TowerSeamH%d" % sidx, Vector3(seg_len, 0.06, 0.06), Vector3(c, sy, -1.73), seam_mat)
+				elif fi == 2:
+					_add_box(root, "TowerSeamH%d" % sidx, Vector3(0.06, 0.06, seg_len), Vector3(1.73, sy, c), seam_mat)
+				else:
+					_add_box(root, "TowerSeamH%d" % sidx, Vector3(0.06, 0.06, seg_len), Vector3(-1.73, sy, c), seam_mat)
+	for si in range(6):
+		var seam_y: float = [1.5, 1.5, 4.5, 4.5, 7.6, 7.6][si]
+		var seam_x: float = [-0.8, 0.85, 0.8, -0.85, -0.8, 0.85][si]
+		_add_box(root, "TowerSeamV%d" % si, Vector3(0.07, 0.90, 0.06), Vector3(seam_x, seam_y, 1.78), seam_mat)
+	_add_box(root, "BallistaCradle", Vector3(1.6, 0.45, 1.1), Vector3(0, 6.0, 0), _mat(Color.html("#3a2a1a"), 0.95))
+	var head_ballista := _place_model("res://assets/kenney_castle/siege-ballista.glb", head, Vector3(0, 0, 0), -PI / 2.0, 1.35, ballista_tint)
+	if head_ballista != null:
+		_add_ballista_fittings(head_ballista)
+	# 三国身份强化 Rev 1: the long banner was mounted 90 degrees off —
+	# its sheet stood edge-on to the classic camera (a thin red fin
+	# above the parapet, see identity_before_tower.png). Rotated to face
+	# south and hung from just under the parapet (y 3.2..6.9, proud of
+	# the string courses at z 1.74), with a gold 「蜀」 on its face.
+	_place_model("res://assets/kenney_castle/flag-banner-long.glb", root, Vector3(0, 3.2, 1.78), PI / 2.0, 1.7, banner_red_tint)
+	# Rev 3: same attachment treatment — the 48px billboard glyph was
+	# wider than the banner cloth and spilled past both edges.
+	var banner_glyph := _add_gold_glyph(root, "BannerGlyph", "蜀", Vector3(0, 5.35, 1.93), 48)
+	banner_glyph.billboard = BaseMaterial3D.BILLBOARD_DISABLED
+	banner_glyph.pixel_size = 0.0125
+	banner_glyph.outline_size = 6
+	_add_omni_light(root, "Lantern", Vector3(1.65, 4.45, 1.15), Color(1.0, 0.58, 0.22), 2.4, 10.0)
+	_add_lantern(root, "LanternBody", Vector3(1.65, 4.45, 1.15), 0.35)
+	# Bracket arm from the tower face to the lantern cord, so the lamp
+	# reads as mounted instead of floating (see identity_before_tower).
+	_add_box(root, "LanternBracket", Vector3(0.5, 0.12, 0.12), Vector3(1.55, 4.98, 1.15), _mat(Color.html("#4a2f1d"), 0.9))
+	return {"type": "arrow", "position": pos, "muzzle": pos + Vector3(0, 6.25, 0), "cooldown": randf() * 0.4, "head": head, "fixed": true}
+func _build_fortress() -> void:
+	var wood := _mat(Color.html("#4a2f1d"), 0.9)
+	# Back walls of the base courtyard (stage-1): KayKit wall runs along
+	# the north and south edges of the courtyard, core behind them.
+	for run_z in [-13.5, 13.5]:
+		for i in range(4):
+			var wseg := _place_model("res://assets/kaykit_hex/buildings/neutral/wall_straight.gltf", world_root, Vector3(-80.0 + 6.0 * float(i), 0, run_z), 0.0, 3.0, wall_stone_tint)
+			if wseg != null:
+				wseg.name = ("CourtyardWallN" if run_z < 0.0 else "CourtyardWallS") + str(i)
+		# 三国身份强化 Rev 1: sloped-tile caps on the courtyard merlons
+		# (25 per run after dedup of the shared segment ends; N/S runs
+		# need distinct prefixes — same-name caps under world_root get
+		# auto-renamed off-pattern, see Test 37 first run n=45).
+		_add_merlon_caps_along_wall(true, run_z, [-80.0, -74.0, -68.0, -62.0], [], "MerlonCapCN" if run_z < 0.0 else "MerlonCapCS")
+	# Watchtowers flanking the approach to the gate.
+	towers.append(_build_watchtower(Vector3(-50, 0, -13), "WatchtowerNorth"))
+	towers.append(_build_watchtower(Vector3(-50, 0, 13), "WatchtowerSouth"))
+	# Command tent in the courtyard's north-west corner.
+	var tent := Node3D.new()
+	tent.name = "CommandTent"
+	tent.position = Vector3(-74, 0, -18)
+	world_root.add_child(tent)
+	_add_box(tent, "TentFloor", Vector3(8.4, 0.22, 6.2), Vector3(0, 0.11, 0), wood)
+	_place_model("res://assets/kaykit_hex/decoration/props/tent.gltf", tent, Vector3(0, 0.2, 0), 0.4, 11.0, PACK_WARM)
+	_add_omni_light(tent, "TentLantern", Vector3(0, 2.1, 2.9), Color(1.0, 0.60, 0.24), 2.2, 9.0)
+	_add_lantern(tent, "LanternBodyTent", Vector3(0, 2.1, 2.9), 0.5)
+	# Supply crates and barrels inside the gate.
+	_place_model("res://assets/kaykit_hex/decoration/props/crate_A_big.gltf", world_root, Vector3(-60.5, 0, 10.5), 0.4, 6.5)
+	_place_model("res://assets/kaykit_hex/decoration/props/crate_A_small.gltf", world_root, Vector3(-60.4, 1.37, 10.4), 0.9, 7.0)
+	_place_model("res://assets/kaykit_hex/decoration/props/barrel.gltf", world_root, Vector3(-61.8, 0, 9.0), 0.0, 6.0)
+	_place_model("res://assets/kaykit_hex/decoration/props/barrel.gltf", world_root, Vector3(-59.4, 0, 11.8), 0.0, 6.0)
+
+
+func _build_base_gate() -> void:
+	# The base's east wall line at x=-56 (stage-1): two gate towers, a
+	# wooden lintel over the gate gap (|z| < 3.4), wall segments filling
+	# out to the courtyard edges, lanterns and war flags.
+	var wood := _mat(Color.html("#4a2f1d"), 0.9)
+	for pz in [-3.4, 3.4]:
+		# Swap (0.1.66): KayKit blue tower B models replace the red
+		# towers (whose red tops pierced the old slab roof). The Kenney
+		# stack tried first read chalk-white -- its colormap texture is
+		# not in this project, while the KayKit atlas is fully textured.
+		var gt := _place_model("res://assets/kaykit_hex/buildings/blue/building_tower_B_blue.gltf", world_root, Vector3(-56, 0, pz), -PI / 2.0, 3.6, Color(0.84, 0.86, 0.94))
+		if gt != null:
+			gt.name = "GateTowerNorth" if pz < 0.0 else "GateTowerSouth"
+		# Contact shadow under each gate tower (Rev 1, tight profile +
+		# deeper alpha in Rev 2).
+		_add_ground_disc(world_root, "ContactShadowGateN" if pz < 0.0 else "ContactShadowGateS", Vector3(-56, 0.05, pz), 2.35, Color(0, 0, 0), 0.46, true)
+	# Swap (0.1.66): modeled KayKit castle keep as the gatehouse centre,
+	# rising over the gate gap where the slab roof used to span.
+	_place_model("res://assets/kaykit_hex/buildings/blue/building_castle_blue.gltf", world_root, Vector3(-56, 0, 0), -PI / 2.0, 2.35, Color(0.84, 0.86, 0.94)).name = "GateCastle"
+	var gsi := 0
+	for seg_z in [-6.4, -11.0, 6.4, 11.0]:
+		var gs := _place_model("res://assets/kaykit_hex/buildings/neutral/wall_straight.gltf", world_root, Vector3(-56, 0, seg_z), PI / 2.0, 3.0, wall_stone_tint)
+		if gs != null:
+			gs.name = "GateWallSeg" + str(gsi)
+		gsi += 1
+	# 程序化残件替换 Rev 3: lower, wider brackets project past the
+	# beam faces; cap blocks bridge each bracket top to the beam base.
+	_add_box(world_root, "GateLintelBeam", Vector3(1.6, 0.45, 9.6), Vector3(-56, 7.05, 0), wood)
+	var sill_mat := _mat(Color.html("#6b4a2c"), 0.9)
+	_add_box(world_root, "GateLintelSill", Vector3(2.7, 0.20, 9.6), Vector3(-56, 6.725, 0), sill_mat)
+	var bracket_mat := _mat(Color.html("#5d3d24"), 0.9)
+	for bi in range(3):
+		var bz: float = [-3.4, 0.0, 3.4][bi]
+		_add_box(world_root, "GateLintelBracket%d" % bi, Vector3(2.3, 0.34, 0.66), Vector3(-56, 6.25, bz), bracket_mat)
+		_add_box(world_root, "GateLintelBracketCap%d" % bi, Vector3(1.6, 0.24, 1.05), Vector3(-56, 6.505, bz), bracket_mat)
+	for pi in range(2):
+		var pz: float = [-3.4, 3.4][pi]
+		_add_box(world_root, "GateLintelPost%d" % pi, Vector3(1.15, 0.78, 1.15), Vector3(-56, 5.69, pz), bracket_mat)
+	# Swap (0.1.66): the procedural slab roof (ridge / tile slopes /
+	# eave teeth / upturned tips) is retired; each modeled tower now
+	# carries its own Kenney top-roof piece, so nothing pierces a roof.
+	# Rev 2 (2026-11-14, Codex 首审点 3): gate lanterns' warm pools
+	# washed the gate road orange and fought the purple crystal —
+	# energy 2.6->1.8, range 11->8 so the orange stays by the lamps.
+	var gate_lantern_l := _add_omni_light(world_root, "GateLanternL", Vector3(-54.7, 3.5, -1.8), Color(1.0, 0.58, 0.22), 2.6, 5.2)
+	gate_lantern_l.omni_attenuation = 1.8 # 全局色调 Rev 4: warm pool must die within ~one door width
+	var gate_lantern_r := _add_omni_light(world_root, "GateLanternR", Vector3(-54.7, 3.5, 1.8), Color(1.0, 0.58, 0.22), 2.6, 5.2)
+	gate_lantern_r.omni_attenuation = 1.8 # 全局色调 Rev 4: warm pool must die within ~one door width
+	# 门灯 Rev 6: hanging lanterns lowered from y 5.35 to 3.5;
+	# rods lengthened from 2.9 to 4.75, keeping their tops at y 8.44.
+	_add_lantern(world_root, "LanternBodyGateL", Vector3(-54.7, 3.5, -1.8), 4.75)
+	_add_lantern(world_root, "LanternBodyGateR", Vector3(-54.7, 3.5, 1.8), 4.75)
+	# 门灯 Rev 5 (item 5, option 2): small warm foot-lamps flanking the
+	# passage mouth, inside the doorway (|z| < 3.4). The hanging lanterns'
+	# light now lands on the modeled tower roofs (0.1.66 gate swap), so the
+	# doorway foot gets its own small emissive shades — same paper-lantern
+	# language as _add_lantern, ground level, small area, no flat board.
+	var shade_mat:= _mat(Color(1.0, 0.55, 0.20), 0.6, 0.0, Color(1.0, 0.45, 0.12), 2.0)
+	var shade_post_mat:= _mat(Color.html("#3a2a1a"), 0.9)
+	var shade_cap_mat:= _mat(Color.html("#c9a227"), 0.5, 0.4)
+	for sgn in [-1.0, 1.0]:
+		var sp:= Vector3(-53.2, 0, 3.0 * sgn)
+		var side:= "L" if sgn < 0.0 else "R"
+		_add_cylinder(world_root, "GateShadePost" + side, 0.09, 0.11, 0.55, sp + Vector3(0, 0.275, 0), shade_post_mat, Vector3.ZERO, 8)
+		_add_sphere(world_root, "GateShade" + side, 0.30, sp + Vector3(0, 0.85, 0), shade_mat, Vector3(1.0, 0.8, 1.0), 16)
+		_add_cylinder(world_root, "GateShadeTop" + side, 0.10, 0.30, 0.05, sp + Vector3(0, 1.06, 0), shade_cap_mat, Vector3.ZERO, 16)
+	for pz in [-7.5, 7.5]:
+		_place_model("res://assets/kenney_castle/flag.glb", world_root, Vector3(-53.5, 0, pz), -PI / 2.0, 5.2, banner_red_tint)
+		_add_flag_glyph(Vector3(-53.5, 0, pz), -PI / 2.0)
+	# 三国身份强化 Rev 1: gate plaque 「劍閣」 hung from the ridge end
+	# on the camera-facing (south) gable — dark wood board, gold trim,
+	# gold Bold characters; two hangers tie it to the ridge roll.
+	var plaque_wood := _mat(Color.html("#2e1c10"), 0.85)
+	_add_box(world_root, "GatePlaque", Vector3(3.3, 0.82, 0.14), Vector3(-56, 5.45, 5.70), plaque_wood)
+	var plaque_gold := _mat(Color.html("#c9a227"), 0.5, 0.4)
+	_add_box(world_root, "GatePlaqueTrimTop", Vector3(3.5, 0.09, 0.16), Vector3(-56, 5.905, 5.70), plaque_gold)
+	_add_box(world_root, "GatePlaqueTrimBottom", Vector3(3.5, 0.09, 0.16), Vector3(-56, 4.995, 5.70), plaque_gold)
+	_add_box(world_root, "GatePlaqueHanger0", Vector3(0.12, 1.12, 0.12), Vector3(-57.2, 6.42, 5.68), plaque_wood)
+	_add_box(world_root, "GatePlaqueHanger1", Vector3(0.12, 1.12, 0.12), Vector3(-54.8, 6.42, 5.68), plaque_wood)
+	var plaque_text := _add_gold_glyph(world_root, "GatePlaqueText", "劍閣", Vector3(-56, 5.45, 5.82), 56)
+	plaque_text.billboard = BaseMaterial3D.BILLBOARD_DISABLED # Rev 3: carved on the board, not floating in front of it
+	# 三国身份强化 Rev 1: sloped-tile caps on the gate-wall merlons
+	# (20 after dedup of the overlapping segments and the two gate
+	# towers, whose footprints swallow the merlons at |z| 3.4/4.4).
+	_add_merlon_caps_along_wall(false, -56.0, [-11.0, -6.4, 6.4, 11.0], [-3.4, 3.4], "MerlonCapG")
+	# -0.5 map marker: the wall + 2 arrow towers are stage-1 geometry
+	# (TEARDOWN §6); the label gives the defence line its map identity.
+	_add_label3d(world_root, "城墙 · 箭塔防线", Vector3(-56, 12.9, 1.0), 64, Color(1.0, 0.95, 0.82))
+func _add_banner_prop(pos: Vector3, seed: float) -> void:
+	# 破损件清零 Rev 1: deep red (was pale 1.0,0.45,0.45 — washed to
+	# salmon-pink in sun-facing views).
+	var tint := banner_red_tint if int(seed) % 2 == 0 else Color(0.547, 0.207, 0.207) # 全局色调 Rev 4: desat+bluegrey mix, lum kept
+	var rot_y := -PI / 2.0 + 0.08 * sin(seed)
+	_place_model("res://assets/kenney_castle/flag.glb", world_root, pos, rot_y, 5.2, tint)
+	# 三国身份强化 Rev 1: gold 「蜀」 on the cloth.
+	_add_flag_glyph(pos, rot_y)
+func _add_supply_cluster(pos: Vector3, seed: float) -> void:
+	_place_model("res://assets/kaykit_hex/decoration/props/crate_A_big.gltf", world_root, pos, seed * 0.37, 6.5)
+	_place_model("res://assets/kaykit_hex/decoration/props/crate_A_small.gltf", world_root, pos + Vector3(0.25, 1.37, 0.1), seed * 0.61, 7.0)
+	_place_model("res://assets/kaykit_hex/decoration/props/barrel.gltf", world_root, pos + Vector3(1.25, 0, 0.55), 0.0, 6.0)
+	_place_model("res://assets/kaykit_hex/decoration/props/barrel.gltf", world_root, pos + Vector3(-1.15, 0, 0.72), 0.0, 6.0)
+	_place_model("res://assets/kaykit_hex/decoration/props/sack.gltf", world_root, pos + Vector3(0.7, 0, -0.55), seed, 8.0)
+func _add_rubble_patch(pos: Vector3, seed: float) -> void:
+	# VISUAL_AUDIT P1-5: gray-brown local rock (was near-white), sunk a
+	# touch so every piece sits ON the ground instead of on it.
+	# 破损件清零 Rev 1: tints deepened (0.60/0.55 still read pale gray
+	# in sun-facing views) and sunk a touch further.
+	_place_model("res://assets/kenney_castle/rocks-small.glb", world_root, pos + Vector3(0, -0.10, 0), seed, 2.6, rubble_tint_a)
+	_place_model("res://assets/kenney_castle/rocks-small.glb", world_root, pos + Vector3(0.85, -0.10, 0.45), seed * 1.7, 1.9, rubble_tint_b)
+func _build_set_dressing() -> void:
+	var supply_positions: Array = [
+		Vector3(-58.0, 0, -8.0), Vector3(-34.0, 0, -12.0), Vector3(-6.0, 0, 12.0), Vector3(14.0, 0, -13.0),
+		Vector3(40.0, 0, -18.0), Vector3(42.0, 0, 18.0), Vector3(62.0, 0, -32.0), Vector3(62.0, 0, 32.0),
+		Vector3(-70.0, 0, 8.0), Vector3(30.0, 0, 12.0), Vector3(-16.0, 0, -16.0), Vector3(52.0, 0, 8.0),
+	]
+	for i in range(supply_positions.size()):
+		_add_supply_cluster(supply_positions[i], float(i) + 1.3)
+	var banner_positions: Array = [
+		Vector3(-48.0, 0, -6.0), Vector3(-48.0, 0, 6.0), Vector3(-24.0, 0, -7.0), Vector3(-24.0, 0, 7.0),
+		Vector3(2.0, 0, -8.0), Vector3(2.0, 0, 8.0), Vector3(44.0, 0, -20.0), Vector3(44.0, 0, 20.0),
+		Vector3(64.0, 0, -30.0), Vector3(64.0, 0, 30.0), Vector3(-66.0, 0, -6.0), Vector3(-66.0, 0, 6.0),
+	]
+	for i in range(banner_positions.size()):
+		_add_banner_prop(banner_positions[i], float(i) + 2.0)
+	# 碎石堆清除（2026-11-17 用户裁定「把碎石堆也去掉」）：固定点位
+	# 碎石堆（原 rubble_positions 12 处）整组摘除，不再生成。
+	# Rock clusters removed (user 2026-11-17 22:30, "stones out of
+	# frame" final form): the rocks-large set-dressing clusters
+	# (former rock_cluster_positions, 18 along the lanes and field
+	# edges) are removed as a group and no longer placed. The rift
+	# mouth/frame rocks are a separate system and stay.
+	# VISUAL_AUDIT P1-3: gravel seal along all four cliff feet, closing
+	# the black seam between the playable field and the rock slopes.
+	var gravel_seed := 40.0
+	for gx in range(-80, 81, 13):
+		# 碎石堆清除（2026-11-17）：北缘 seal 在默认机位可见带内
+		# （z=-43.5 处 x<=约 +71）的段落摘除，只保留带外尾段。
+		if gx > 70:
+			_add_rubble_patch(Vector3(float(gx), 0, -43.5), gravel_seed)
+		gravel_seed += 1.7
+		_add_rubble_patch(Vector3(float(gx + 6), 0, 43.5), gravel_seed)
+		gravel_seed += 1.7
+	for gz in range(-39, 40, 13):
+		if absf(float(gz) + 26.0) > 6.0 and absf(float(gz) - 26.0) > 6.0:
+			_add_rubble_patch(Vector3(84.5, 0, float(gz)), gravel_seed)
+			gravel_seed += 1.7
+		# 碎石堆清除（2026-11-17）：西缘 seal 在可见带内（z<-6.9）
+		# 的段落摘除，带外（z>=0）保留。
+		if float(gz + 5) >= 0.0:
+			_add_rubble_patch(Vector3(-84.5, 0, float(gz + 5)), gravel_seed)
+		gravel_seed += 1.7
+
+
+func _build_pads() -> void:
+	# Rev 3 build pads: stacked stone terraces and a gold band held in a stone groove.
+	# The ring pulses during intermission while the pad is empty.
+	var pad_positions: Array = [
+		Vector3(34, 0, -13), Vector3(34, 0, 13), Vector3(8, 0, -16), Vector3(8, 0, 16),
+		Vector3(-20, 0, -9), Vector3(-20, 0, 9), Vector3(-44, 0, -11), Vector3(-44, 0, 11),
+		Vector3(-52, 0, -22), Vector3(-52, 0, 22),
+	]
+	# 程序化残件替换 Rev 3: three non-overlapping stone tiers end at
+	# y 0.58. Corner piers bear on the low terrace and meet the base top;
+	# inner and outer stone lips overlap the gold edges by 0.02.
+	var step_mat := _mat(Color.html("#7a7264"), 0.97)
+	var step_mat_high := _mat(Color.html("#6b6357"), 0.97)
+	var base_mat := _mat(Color.html("#7a7264"), 0.95)
+	for i in range(pad_positions.size()):
+		var pos: Vector3 = pad_positions[i]
+		var root := Node3D.new()
+		root.name = "BuildPad%d" % i
+		root.position = pos
+		world_root.add_child(root)
+		_add_cylinder(root, "PadStepLow", 3.05, 3.30, 0.24, Vector3(0, 0.12, 0), step_mat, Vector3.ZERO, 10)
+		_add_cylinder(root, "PadStepHigh", 2.48, 2.70, 0.20, Vector3(0, 0.34, 0), step_mat_high, Vector3.ZERO, 10)
+		_add_cylinder(root, "PadBase", 1.85, 2.60, 0.14, Vector3(0, 0.51, 0), base_mat, Vector3.ZERO, 8)
+		for k in range(4):
+			var ang := TAU * float(k) / 4.0 + PI / 4.0
+			# Rev 3: piers span y 0.24..0.58, against the high terrace.
+			_add_box(root, "PadPier%d" % k, Vector3(0.58, 0.20, 0.58), Vector3(cos(ang) * 2.52, 0.34, sin(ang) * 2.52), step_mat)
+		var ring_mat := _mat(Color(0.85, 0.62, 0.22), 0.4, 0.0, Color(1.0, 0.75, 0.30), 0.22)
+		var ring := MeshInstance3D.new()
+		ring.name = "PadRing"
+		var torus := TorusMesh.new()
+		torus.inner_radius = 1.18
+		torus.outer_radius = 1.62
+		torus.rings = 24
+		torus.ring_segments = 8
+		ring.mesh = torus
+		ring.rotation.x = PI / 2.0
+		# Flattened vertically (local Z is world Y after the x-rotation)
+		# so the ring reads as a gold band inlaid in the plinth top,
+		# not a wire arc floating above a dark disc. Rev 2: flatter
+		# (0.30) and sunk to y 0.57 so only a thin band shows above the
+		# plinth top (0.58); dimmer gold kills the glowing-marker read.
+		ring.scale = Vector3(1.0, 1.0, 0.22)
+		ring.position = Vector3(0, 0.55, 0)
+		ring.material_override = ring_mat
+		ring.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		root.add_child(ring)
+		# Rev 3: retain the groove floor shadow beneath/outside the outer lip.
+		var groove := MeshInstance3D.new()
+		groove.name = "PadGroove"
+		var gtorus := TorusMesh.new()
+		gtorus.inner_radius = 1.62
+		gtorus.outer_radius = 1.80
+		gtorus.rings = 24
+		gtorus.ring_segments = 8
+		groove.mesh = gtorus
+		groove.rotation.x = PI / 2.0
+		groove.scale = Vector3(1.0, 1.0, 0.22)
+		groove.position = Vector3(0, 0.578, 0)
+		groove.material_override = _mat(Color.html("#453f36"), 0.95)
+		groove.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		root.add_child(groove)
+		for lip_index in range(2):
+			var lip := MeshInstance3D.new()
+			lip.name = "PadGrooveLipIn" if lip_index == 0 else "PadGrooveLipOut"
+			var lip_torus := TorusMesh.new()
+			lip_torus.inner_radius = 1.00 if lip_index == 0 else 1.56
+			lip_torus.outer_radius = 1.24 if lip_index == 0 else 1.84
+			lip_torus.rings = 24
+			lip_torus.ring_segments = 8
+			lip.mesh = lip_torus
+			lip.rotation.x = PI / 2.0
+			lip.scale = Vector3(1.0, 1.0, 0.55)
+			lip.position = Vector3(0, 0.575, 0)
+			lip.material_override = groove.material_override
+			lip.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+			root.add_child(lip)
+		pads.append({"index": i, "pos": pos, "root": root, "ring_mat": ring_mat, "tower": null})
+
+
+func tower_cost(tower_type: String) -> int:
+	var def: Dictionary = TOWER_DEFS.get(tower_type, {})
+	return int(def.get("cost", FLAME_COST))
+
+
+func tower_display_name(tower_type: String) -> String:
+	var def: Dictionary = TOWER_DEFS.get(tower_type, {})
+	return String(def.get("name", "防御塔"))
+
+
+func build_tower(pad_index: int, tower_type: String) -> bool:
+	if pad_index < 0 or pad_index >= pads.size():
+		return false
+	var pad: Dictionary = pads[pad_index]
+	if pad.get("tower") != null:
+		_update_ui("该基座已经建有防御塔。")
+		return false
+	if pop_used() + 1 > pop_cap():
+		_update_ui("人口不足（%d/%d）——防御塔占人口 1。" % [pop_used(), pop_cap()])
+		return false
+	var cost := tower_cost(tower_type)
+	if gold < cost:
+		_update_ui("金币不足！%s 需要 %d 金，现有 %d 金。" % [tower_display_name(tower_type), cost, gold])
+		return false
+	gold -= cost
+	var tower := _create_built_tower(pad_index, tower_type, pad["pos"])
+	pad["tower"] = tower
+	pads[pad_index] = pad
+	towers.append(tower)
+	_spawn_burst(pad["pos"] + Vector3(0, 1.2, 0), Color(1.0, 0.78, 0.35), 10)
+	_update_ui("建成%s！花费 %d 金。" % [tower_display_name(tower_type), cost])
+	return true
+
+
+func _create_built_tower(pad_index: int, tower_type: String, pos: Vector3) -> Dictionary:
+	var root := Node3D.new()
+	root.name = tower_type.capitalize() + "Tower" + str(pad_index)
+	root.position = pos
+	world_root.add_child(root)
+	var stone_tint := watchtower_stone_tint # 破损件清零 Rev 1: same deepened stone as the watchtowers.
+	# Kenney modular tower at 1.8x: parapet rim lands at y=4.18, the head
+	# anchor height (4.20) of the original cylinder build.
+	# 破损件清零 Rev 2: darker plinth + seam courses, same recipe as
+	# the watchtowers (local coords — root is scaled 0.25).
+	var course_mat := _mat(Color.html("#4a4238"), 0.97)
+	_add_box(root, "TowerPlinth", Vector3(2.3, 0.6, 2.3), Vector3(0, 0.3, 0), course_mat)
+	_add_box(root, "TowerCourseLow", Vector3(2.1, 0.22, 2.1), Vector3(0, 1.82, 0), course_mat)
+	_add_box(root, "TowerCourseHigh", Vector3(2.1, 0.2, 2.1), Vector3(0, 3.64, 0), course_mat)
+	_place_model("res://assets/kenney_castle/tower-square-base.glb", root, Vector3(0, 0, 0), 0.0, 1.8, stone_tint)
+	_place_model("res://assets/kenney_castle/tower-square-mid.glb", root, Vector3(0, 1.82, 0), 0.0, 1.8, stone_tint)
+	_place_model("res://assets/kenney_castle/tower-square-top.glb", root, Vector3(0, 3.64, 0), 0.0, 1.8, stone_tint)
+	var head := Node3D.new()
+	head.name = "TowerHead"
+	head.position = Vector3(0, 4.20, 0)
+	root.add_child(head)
+	match tower_type:
+		"thunder":
+			# Glowing blue crystal replaces the pronged orb.
+			_place_model("res://assets/kenney_td/detail-crystal.glb", head, Vector3(0, 0.05, 0), 0.0, 2.6, Color(0.45, 0.68, 1.0), Color(0.40, 0.58, 1.0), 1.25)
+			_add_omni_light(head, "ThunderGlow", Vector3(0, 0.55, 0), Color(0.45, 0.60, 1.0), 1.7, 9.0)
+		"frost":
+			# Pale ice crystal + cold light.
+			_place_model("res://assets/kenney_td/detail-crystal.glb", head, Vector3(0, 0.05, 0), 0.3, 2.6, Color(0.62, 0.85, 1.0), Color(0.45, 0.75, 1.0), 1.25)
+			_add_omni_light(head, "FrostGlow", Vector3(0, 0.55, 0), Color(0.55, 0.80, 1.0), 1.5, 8.0)
+		"stone":
+			# A boulder on the parapet: the catapult's ammo, no crystal.
+			var boulder := MeshInstance3D.new()
+			boulder.name = "Boulder"
+			var bsphere := SphereMesh.new()
+			bsphere.radius = 0.62
+			bsphere.height = 1.24
+			bsphere.radial_segments = 10
+			bsphere.rings = 6
+			boulder.mesh = bsphere
+			boulder.material_override = _mat(Color(0.45, 0.40, 0.34), 0.95)
+			boulder.position = Vector3(0, 0.45, 0)
+			head.add_child(boulder)
+		"crossbow":
+			# Red crystal + crossed bow arms.
+			_place_model("res://assets/kenney_td/detail-crystal.glb", head, Vector3(0, 0.05, 0), 0.0, 2.2, Color(1.0, 0.45, 0.38), Color(0.95, 0.35, 0.25), 1.1)
+			var arm_mat := _mat(Color.html("#5a4028"), 0.8)
+			var arm_a := _add_box(head, "BowArm", Vector3(2.6, 0.16, 0.16), Vector3(0, 0.55, 0), arm_mat)
+			arm_a.rotation.y = 0.5
+			var arm_b := _add_box(head, "BowArm", Vector3(2.6, 0.16, 0.16), Vector3(0, 0.55, 0), arm_mat)
+			arm_b.rotation.y = -0.5
+		"arrow":
+			# Small gold crystal, no light (the cheap tower).
+			_place_model("res://assets/kenney_td/detail-crystal.glb", head, Vector3(0, 0.05, 0), 0.0, 1.9, Color(0.95, 0.80, 0.45), Color(0.85, 0.65, 0.30), 0.8)
+		_:
+			# Ember crystal replaces the brazier (palette texture stripped so
+			# the tint can actually reach orange).
+			_place_model("res://assets/kenney_td/detail-crystal.glb", head, Vector3(0, 0.05, 0), 0.7, 2.6, Color(1.0, 0.42, 0.08), Color(1.0, 0.38, 0.05), 1.35, -1.0, true)
+			_add_omni_light(head, "FlameGlow", Vector3(0, 0.8, 0), Color(1.0, 0.52, 0.16), 1.9, 10.0)
+	_add_tower_pip(head, 0)
+	root.scale = Vector3.ONE * 0.25
+	# Contact shadow: world_root child (NOT under root — root is scaled
+	# 0.25, a child disc would shrink with it). Freed with the tower in
+	# _clear_units via the "shadow" dict entry (Rev 1).
+	var tower_disc := _add_ground_disc(world_root, "ContactShadowTower%d" % pad_index, pos + Vector3(0, 0.05, 0), 2.0, Color(0, 0, 0), 0.46, true)
+	var tdef: Dictionary = TOWER_DEFS.get(tower_type, TOWER_DEFS["flame"])
+	return {"type": tower_type, "position": pos, "muzzle": pos + Vector3(0, 4.75, 0), "cooldown": 0.8, "head": head, "node": root, "pad": pad_index, "build_t": 0.0, "shadow": tower_disc, "level": 1, "hp": TOWER_BASE_HP, "max_hp": TOWER_BASE_HP, "base_dmg": float(tdef.get("dmg", 26.0)), "dmg": float(tdef.get("dmg", 26.0))}
+
+
+func _add_tower_pip(head: Node3D, pip_index: int) -> void:
+	# Gold pips on the tower head show its level (the 2D game draws one
+	# gold square per level under the tower sprite).
+	var pip_mat := _mat(Color(1.0, 0.78, 0.30), 0.35, 0.0, Color(1.0, 0.72, 0.25), 0.8)
+	_add_box(head, "LevelPip", Vector3(0.30, 0.13, 0.30), Vector3((float(pip_index) - 1.0) * 0.5, 0.95, 0), pip_mat)
+
+
+func tower_damage_mult(level: int) -> float:
+	return 1.0 + 0.55 * float(level - 1) # the 2D upgrade formula
+
+
+func upgrade_tower(pad_index: int) -> bool:
+	if pad_index < 0 or pad_index >= pads.size():
+		return false
+	var pad: Dictionary = pads[pad_index]
+	var t = pad.get("tower")
+	if t == null:
+		return false
+	var lvl := int(t.get("level", 1))
+	if lvl >= 3:
+		_update_ui("%s 已满级（Lv3）。" % tower_display_name(String(t.get("type", ""))))
+		return false
+	var cost := int(TOWER_UP_COSTS[lvl - 1])
+	if gold < cost:
+		_update_ui("金币不足！升级需要 %d 金，现有 %d 金。" % [cost, gold])
+		return false
+	gold -= cost
+	t["level"] = lvl + 1
+	t["max_hp"] = float(t["max_hp"]) + TOWER_UP_HP
+	t["hp"] = float(t["hp"]) + TOWER_UP_HP
+	t["dmg"] = float(t["base_dmg"]) * tower_damage_mult(lvl + 1)
+	var head: Node3D = t.get("head")
+	if is_instance_valid(head):
+		_add_tower_pip(head, lvl)
+	_spawn_burst(t["position"] + Vector3(0, 1.2, 0), Color(1.0, 0.78, 0.35), 8)
+	_update_ui("%s 升至 Lv%d！花费 %d 金。" % [tower_display_name(String(t.get("type", ""))), lvl + 1, cost])
+	return true
+
+
+func damage_tower(t: Dictionary, amount: float) -> void:
+	if t.is_empty() or bool(t.get("dead", false)) or bool(t.get("fixed", false)):
+		return # wall watchtowers are fixtures, not damageable
+	t["hp"] = float(t.get("hp", 0.0)) - amount
+	if float(t["hp"]) <= 0.0:
+		_destroy_tower(t)
+
+
+func _destroy_tower(t: Dictionary) -> void:
+	t["dead"] = true
+	t["hp"] = 0.0
+	var node: Node = t.get("node")
+	if is_instance_valid(node):
+		node.free()
+	var shadow: Node = t.get("shadow")
+	if is_instance_valid(shadow):
+		shadow.free()
+	var pad_index := int(t.get("pad", -1))
+	if pad_index >= 0 and pad_index < pads.size():
+		var pad: Dictionary = pads[pad_index]
+		if pad.get("tower") != null:
+			pad["tower"] = null
+			pads[pad_index] = pad
+	towers.erase(t)
+	_spawn_burst(t["position"] + Vector3(0, 1.0, 0), Color(0.95, 0.55, 0.30), 14, 0.3, 0.5)
+	_update_ui("%s 被摧毁了！" % tower_display_name(String(t.get("type", ""))))
+
+
+func _nearest_damaged_tower(pos: Vector3) -> Dictionary:
+	var best: Dictionary = {}
+	var best_d := 1.0e9
+	for t in towers:
+		if bool(t.get("dead", false)) or bool(t.get("fixed", false)) or float(t.get("hp", 0.0)) >= float(t.get("max_hp", 1.0)):
+			continue
+		var tp: Vector3 = t["position"]
+		var d := Vector2(tp.x - pos.x, tp.z - pos.z).length()
+		if d < best_d:
+			best_d = d
+			best = t
+	return best
+
+
+func repair_core() -> bool:
+	if game_state != "intermission":
+		return false
+	if core_hp >= CORE_MAX_HP:
+		_update_ui("封印核耐久已满，无需修复。")
+		return false
+	if gold < REPAIR_COST:
+		_update_ui("金币不足！修复需要 %d 金，现有 %d 金。" % [REPAIR_COST, gold])
+		return false
+	gold -= REPAIR_COST
+	core_hp = minf(core_hp + REPAIR_AMOUNT, CORE_MAX_HP)
+	_spawn_burst(CORE_POS + Vector3(0, 2.4, 0), Color(0.45, 1.0, 0.55), 10)
+	_update_ui("封印核修复 +%d 耐久，花费 %d 金。" % [int(REPAIR_AMOUNT), REPAIR_COST])
+	return true
+
+
+func _build_core() -> void:
+	var root := Node3D.new()
+	root.name = "SealCore"
+	root.position = CORE_POS
+	world_root.add_child(root)
+	var bronze := _mat(Color.html("#866a38"), 0.5, 0.55) # 全局色调 Rev 4: desat+bluegrey mix, lum kept
+	var stone := _mat(Color.html("#494248"), 0.9)
+	_add_cylinder(root, "PedestalBase", 2.6, 3.1, 0.8, Vector3(0, 0.4, 0), stone, Vector3.ZERO, 8)
+	_add_cylinder(root, "PedestalRing", 1.8, 2.2, 0.8, Vector3(0, 1.15, 0), bronze, Vector3.ZERO, 8)
+	_add_box(root, "PedestalTrim", Vector3(4.4, 0.35, 4.4), Vector3(0, 0.88, 0), bronze)
+	crystal_group = Node3D.new()
+	crystal_group.name = "CrystalGroup"
+	crystal_group.position = Vector3(0, 1.55, 0)
+	root.add_child(crystal_group)
+	var crys_tint := Color(0.24, 0.07, 0.75)
+	var crys_emission := Color(0.36, 0.10, 1.0)
+	# Kenney TD crystals tinted violet (the seal core's identity color).
+	# Rev 5 (light c): emission compensation — Rev 4 spill tightening
+	# halved the crystal's glow read (crysA L 123 -> 55); emission does
+	# not light the ground, so this restores focal glow without
+	# touching the spill ratios.
+	_place_model("res://assets/kenney_td/detail-crystal.glb", crystal_group, Vector3(0, 0, 0), 0.0, 12.0, crys_tint, crys_emission, 1.00, 0.94, true)
+	var c_left := _place_model("res://assets/kenney_td/detail-crystal.glb", crystal_group, Vector3(-1.05, 0, 0.35), 0.0, 7.5, crys_tint, crys_emission, 0.90, 0.92, true)
+	if c_left != null:
+		c_left.rotation.z = 0.30
+	var c_right := _place_model("res://assets/kenney_td/detail-crystal.glb", crystal_group, Vector3(1.0, 0, -0.30), 0.0, 6.5, crys_tint, crys_emission, 0.90, 0.92, true)
+	if c_right != null:
+		c_right.rotation.z = -0.34
+	var c_back := _place_model("res://assets/kenney_td/detail-crystal.glb", crystal_group, Vector3(0.15, 0, -0.95), 0.0, 5.5, crys_tint, crys_emission, 0.90, 0.92, true)
+	if c_back != null:
+		c_back.rotation.x = 0.28
+	_place_model("res://assets/kenney_td/detail-crystal.glb", crystal_group, Vector3(0, 1.55, 0), 0.0, 2.6, crys_tint, crys_emission, 1.00, 0.92, true)
+	crystal_light = _add_omni_light(root, "CoreLight", Vector3(0, 3.4, 0), Color(0.66, 0.36, 1.0), 3.4, 12.0, false)
+	# Rev 1 (光影丰富度): contact shadow under the pedestal so the
+	# core reads as standing on the courtyard; a second, wider + dimmer
+	# violet fill (range 30, no shadow) so the purple actually reaches
+	# the walls and ground around the core; and a violet light pool on
+	# the ground — the glow's falloff, not just a bright crystal.
+	# Rev 2: the single pool read as one flat pink wash (Codex 首审),
+	# so it is now two concentric discs — a bright near-source core
+	# (r3.5) inside a faint wide fade (r8.5) — for a stepped gradient;
+	# fill energy 1.1->1.25 so the pedestal sides and nearby walls pick
+	# up matching violet.
+	_add_ground_disc(root, "ContactShadow", Vector3(0, 0.05, 0), 3.4, Color(0, 0, 0), 0.44, true)
+	core_fill_light = _add_omni_light(root, "CoreFillLight", Vector3(0, 4.5, 0), Color(0.66, 0.36, 1.0), 1.05, 10.0, false)
+	core_fill_light.omni_attenuation = 1.4
+	# Rev 3: three-step gradient (tight bright core, clear mid step,
+	# faint outer) + a low wash light so the wall roots and pedestal
+	# faces facing the crystal pick up distance-matched violet
+	# instead of the pool ending flat at the crystal.
+	_add_ground_disc(root, "CoreLightPool", Vector3(0, 0.09, 0), 2.6, Color(0.45, 0.20, 0.90), 0.52)
+	_add_ground_disc(root, "CoreLightPoolMid", Vector3(0, 0.095, 0), 5.0, Color(0.45, 0.20, 0.90), 0.09)
+	_add_ground_disc(root, "CoreLightPoolOuter", Vector3(0, 0.10, 0), 7.5, Color(0.45, 0.20, 0.90), 0.03)
+	core_wash_light = _add_omni_light(root, "CoreWallWash", Vector3(7.5, 2.0, 0), Color(0.60, 0.32, 1.0), 0.8, 11.0, false)
+	# Orbiting rune stones -> small crystals on the same orbit.
+	for i in range(5):
+		var angle := TAU * float(i) / 5.0
+		var rs := _place_model("res://assets/kenney_td/detail-crystal.glb", crystal_group, Vector3(cos(angle) * 2.15, 1.5 + 0.35 * sin(float(i) * 2.4), sin(angle) * 2.15), angle, 1.8, crys_tint, crys_emission, 0.42, 0.92, true)
+		if rs != null:
+			rs.rotation.x = 0.3
+
+func _build_rift() -> void:
+	# Two rifts (stage-1): north-east and south-east, one per lane.
+	for lane_start in [LANE_NORTH[0], LANE_SOUTH[0]]:
+		_build_one_rift(lane_start)
+
+
+func _make_arc_torus_mesh(center_radius: float, tube_radius: float, arc_start: float, arc_len: float, radial_segs: int, tube_segs: int, tube_end_scale: float) -> ArrayMesh:
+	# Rev 3: local XY arc, with an independently tapered tube and open gaps.
+	var vertices := PackedVector3Array()
+	var normals := PackedVector3Array()
+	var indices := PackedInt32Array()
+	var radius_slope := tube_radius * (tube_end_scale - 1.0) / arc_len
+	for ri in range(radial_segs + 1):
+		var t := float(ri) / float(radial_segs)
+		var angle := arc_start + arc_len * t
+		var radial := Vector3(cos(angle), sin(angle), 0.0)
+		var tangent := Vector3(-sin(angle), cos(angle), 0.0)
+		var radius := tube_radius * lerpf(1.0, tube_end_scale, t)
+		for ti in range(tube_segs + 1):
+			var tube_angle := TAU * float(ti) / float(tube_segs)
+			var outward := radial * cos(tube_angle) + Vector3.FORWARD * sin(tube_angle)
+			vertices.append(radial * center_radius + outward * radius)
+			normals.append((outward - tangent * radius_slope / (center_radius + radius * cos(tube_angle))).normalized())
+	for ri in range(radial_segs):
+		for ti in range(tube_segs):
+			var a := ri * (tube_segs + 1) + ti
+			var b := a + tube_segs + 1
+			# Godot front faces use clockwise winding.
+			indices.append_array(PackedInt32Array([a, b, a + 1, a + 1, b, b + 1]))
+	var arrays := []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = vertices
+	arrays[Mesh.ARRAY_NORMAL] = normals
+	arrays[Mesh.ARRAY_INDEX] = indices
+	var mesh := ArrayMesh.new()
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	return mesh
+
+
+func _build_one_rift(lane_start: Vector3) -> void:
+	var group := Node3D.new()
+	group.name = "RiftPortal"
+	group.position = Vector3(lane_start.x + 2.8, 4.35, lane_start.z)
+	group.rotation.y = -PI / 2.0 + 0.38
+	world_root.add_child(group)
+	rift_groups.append(group)
+	var void_mat := _mat(Color.html("#0d0218"), 0.35, 0.0, Color.html("#330a61"), 0.9)
+	_add_sphere(group, "RiftVoid", 1.0, Vector3.ZERO, void_mat, Vector3(3.45, 4.30, 0.34), 18)
+	var void_b := _add_sphere(group, "RiftVoidB", 1.0, Vector3(0.70, -0.55, -0.06), void_mat, Vector3(2.60, 3.35, 0.32), 18)
+	void_b.rotation.z = 0.5
+	# 程序化残件替换 Rev 3: four unequal arcs, irregular overlapping
+	# shadows, and three energy faces receding into a stone doorway.
+	var vortex_mat := _mat(Color(0.38, 0.12, 0.95), 0.35, 0.0, Color(0.38, 0.12, 0.95), 1.4)
+	var vortex := MeshInstance3D.new()
+	vortex.name = "RiftVortexRing"
+	# start degrees, length degrees, tube radius, end radius multiplier, local z offset.
+	# 280 degrees total; all four gaps are 20 degrees.
+	var arc_specs: Array = [[0.0, 76.0, 0.46, 1.0, 0.10], [96.0, 64.0, 0.37, 0.55, -0.10], [180.0, 74.0, 0.30, 1.0, -0.22], [274.0, 66.0, 0.42, 0.85, 0.03]]
+	var arc_vertices := PackedVector3Array()
+	var arc_normals := PackedVector3Array()
+	var arc_indices := PackedInt32Array()
+	for spec in arc_specs:
+		var arc := _make_arc_torus_mesh(3.30, spec[2], deg_to_rad(spec[0]), deg_to_rad(spec[1]), 18, 12, spec[3])
+		var part := arc.surface_get_arrays(0)
+		var offset := arc_vertices.size()
+		for vertex in part[Mesh.ARRAY_VERTEX]:
+			arc_vertices.append(vertex + Vector3(0, 0, spec[4]))
+		arc_normals.append_array(part[Mesh.ARRAY_NORMAL])
+		for index in part[Mesh.ARRAY_INDEX]:
+			arc_indices.append(index + offset)
+	var arc_arrays := []
+	arc_arrays.resize(Mesh.ARRAY_MAX)
+	arc_arrays[Mesh.ARRAY_VERTEX] = arc_vertices
+	arc_arrays[Mesh.ARRAY_NORMAL] = arc_normals
+	arc_arrays[Mesh.ARRAY_INDEX] = arc_indices
+	var arc_mesh := ArrayMesh.new()
+	arc_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arc_arrays)
+	vortex.mesh = arc_mesh
+	vortex.position = Vector3(0, 0, 0.20)
+	vortex.material_override = vortex_mat
+	vortex.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	# Rev 2: lean the ring plane slightly so the perfect circle stops
+	# reading as a flat symbol face-on; the _process spin is around
+	# the torus axis, so the lean stays stable while it swirls.
+	vortex.rotation.x = 0.12
+	group.add_child(vortex)
+	rift_rings.append(vortex)
+	var core_mat := _mat(Color.html("#7a2cff"), 0.3, 0.0, Color.html("#9a4dff"), 1.6)
+	var core := _add_sphere(group, "RiftCore", 1.0, Vector3(0.10, -0.60, 0.09), core_mat, Vector3(2.55, 4.05, 0.26), 18)
+	core.rotation.z = 0.30
+	core.rotation.x = -0.15
+	# Rev 4: offset energy faces at z 0.05 / -0.30 / -0.55.
+	var funnel_mat := _mat(Color.html("#b45cff"), 0.3, 0.0, Color.html("#c98aff"), 2.0)
+	_add_sphere(group, "RiftFunnel", 1.0, Vector3(0, -0.12, -0.30), funnel_mat, Vector3(1.30, 1.85, 0.18), 18)
+	var inner_glow_mat := _mat(Color.html("#d0a0ff"), 0.3, 0.0, Color.html("#d0a0ff"), 2.4)
+	_add_sphere(group, "RiftInnerGlow", 1.0, Vector3(-0.10, 0.10, -0.55), inner_glow_mat, Vector3(0.72, 1.10, 0.14), 18)
+	var shard_mat := _mat(Color.html("#c98aff"), 0.35, 0.0, Color.html("#d9b3ff"), 2.2)
+	shard_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+	var rift_shard := MeshInstance3D.new()
+	rift_shard.name = "RiftShard"
+	var shard_mesh := ArrayMesh.new()
+	var sverts := PackedVector3Array()
+	var snorms := PackedVector3Array()
+	var sind := PackedInt32Array()
+	# Rev 5 round 3: lower tip reaches into the light pool (world y ~-0.15) and the
+	# lower third widens monotonically toward the core's lower-edge width, so the
+	# blade reads as the core's own tongue instead of a separate folded sliver.
+	var shard_steps := 12
+	for si in range(shard_steps + 1):
+		var t := float(si) / float(shard_steps)
+		var cy := lerpf(-4.50, 2.95, t)
+		var tn := (cy + 4.50) / 7.45
+		var ss := sin(PI * pow(tn, 1.22))
+		var width_factor: float = ss
+		if tn < 0.38:
+			width_factor = max(ss, lerpf(0.62, 1.0, tn / 0.38))
+		var hw := 1.50 * pow(width_factor, 0.7)
+		var cz := 0.34 + 0.50 * ss
+		var cx := 0.25 * sin(TAU * tn - 0.6)
+		sverts.append(Vector3(cx - hw, cy, cz))
+		sverts.append(Vector3(cx + hw, cy, cz))
+		snorms.append(Vector3(0, 0, 1))
+		snorms.append(Vector3(0, 0, 1))
+		if si < shard_steps:
+			var a0 := si * 2
+			sind.append_array([a0, a0 + 1, a0 + 2, a0 + 1, a0 + 3, a0 + 2])
+	var shard_arrays := []
+	shard_arrays.resize(Mesh.ARRAY_MAX)
+	shard_arrays[Mesh.ARRAY_VERTEX] = sverts
+	shard_arrays[Mesh.ARRAY_NORMAL] = snorms
+	shard_arrays[Mesh.ARRAY_INDEX] = sind
+	shard_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, shard_arrays)
+	rift_shard.mesh = shard_mesh
+	rift_shard.material_override = shard_mat
+	rift_shard.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	group.add_child(rift_shard)
+	# Rock mouth: broken kenney rocks behind the portal (the cliff it
+	# tears out of) and flanking its base arc, off the road centreline
+	# so spawning units are not blocked.
+	# Rev 2: the three behind-rocks were separate boulders — the kenney
+	# rocks are flat slabs (0.5 tall at scale 1), so a rock face has to
+	# be STACKED: three columns of 2 layers + a third layer on the
+	# centre column, each layer embedded in the one below, forming one
+	# continuous piled face; the flanking rocks move in to touch the
+	# rim; three front rocks stand west of the portal plane and occlude
+	# the ring's lower edges, so the energy no longer floats in front
+	# of the rock.
+	var mouth_side := "N" if lane_start.z < 0.0 else "S"
+	var mouth_rocks: Array = [
+		# Behind the portal (east): stacked columns = the rock face.
+		[Vector3(80.5, -0.6, -2.5), 3.4, "large"], [Vector3(81.2, 0.7, -2.5), 2.8, "large"],
+		[Vector3(81.2, -0.8, 1.15), 3.8, "large"], [Vector3(81.9, 0.6, 1.15), 2.6, "large"], [Vector3(82.4, 1.30, 1.15), 1.3, "large"],
+		[Vector3(80.2, -0.6, 2.8), 3.2, "large"], [Vector3(80.9, 0.7, 2.8), 2.6, "large"],
+		# Flanking the base arc. Rev 5 round 3: pulled outward and sunk so the
+		# energy lower tip and its landing boundary stay unobstructed.
+		[Vector3(74.4, -1.05, -4.4), 2.4, "large"], [Vector3(74.8, -1.00, -3.6), 1.8, "small"], [Vector3(74.6, -1.00, 3.6), 1.8, "small"], [Vector3(74.4, -1.05, 4.4), 2.4, "large"],
+		# Lower-edge side occluders and recessed central rubble (Rev 4).
+		[Vector3(73.6, -1.10, -4.4), 2.6, "small"], [Vector3(78.6, -1.3, 0.0), 2.2, "small"], [Vector3(73.6, -1.10, 4.4), 2.6, "small"],
+	]
+	for mi in range(mouth_rocks.size()):
+		var spec: Array = mouth_rocks[mi]
+		var mpos: Vector3 = spec[0]
+		var mscale: float = spec[1]
+		var mpath := "res://assets/kenney_castle/rocks-large.glb" if spec[2] == "large" else "res://assets/kenney_castle/rocks-small.glb"
+		var mrock := _place_model(mpath, world_root, Vector3(mpos.x, mpos.y, lane_start.z + mpos.z), float(mi) * 1.3, mscale, rubble_tint_a if spec[2] == "large" else rubble_tint_b)
+		if mrock != null:
+			mrock.name = "RiftMouthRock%s%d" % [mouth_side, mi]
+			mrock.rotation.x = 0.18 * sin(float(mi) * 2.1)
+			mrock.rotation.z = 0.22 * cos(float(mi) * 1.7)
+	# Rev 3: four stacked jamb rocks, a broad lintel, and a west lip
+	# occluder; world positions keep the energy behind the stone frame.
+	# Rev 4: open the mouth by moving central rubble back and down
+	# and raising and shrinking the lintel.
+	# Rev 5 round 2: jamb columns and side walls retreat east and sink so the south jamb stops cutting the energy face's lower tip from the standard camera.
+	var frame_rocks: Array = [
+		[Vector3(4.35, 0.75, -4.95), 3.5], [Vector3(4.25, 3.30, -4.90), 3.2],
+		[Vector3(4.35, 0.75, 4.95), 3.6], [Vector3(4.25, 3.30, 4.90), 3.3],
+		[Vector3(4.6, 10.9, 0.0), 3.1], [Vector3(1.2, 0.8, -3.5), 2.8],
+		[Vector3(4.20, 2.95, -5.05), 2.7], [Vector3(4.20, 2.95, 5.05), 2.7],
+	]
+	for fi in range(frame_rocks.size()):
+		var frame_spec: Array = frame_rocks[fi]
+		var frame_pos: Vector3 = frame_spec[0]
+		# Clear the north camera's lower-tip sightline; settle the two
+		# foreground upper mouth rocks on the outer ground flank.
+		if mouth_side == "N" and fi in [3, 7]:
+			frame_pos.z += 3.0
+			frame_pos.y -= 3.3
+		var frame_rock := _place_model("res://assets/kenney_castle/rocks-large.glb", world_root, Vector3(lane_start.x + frame_pos.x, frame_pos.y, lane_start.z + frame_pos.z), 0.12 * sin(float(fi) * 1.9), frame_spec[1], rubble_tint_a)
+		if frame_rock != null:
+			frame_rock.name = "RiftFrameRock%s%d" % [mouth_side, fi]
+			frame_rock.rotation.x = 0.10 * sin(float(fi) * 2.1 + 0.4)
+			frame_rock.rotation.z = 0.12 * cos(float(fi) * 1.7)
+			if fi == 4:
+				frame_rock.scale.z *= 1.3
+	var rift_light := _add_omni_light(world_root, "RiftLight", Vector3(lane_start.x + 1.5, 4.2, lane_start.z), Color(0.72, 0.30, 1.0), 3.0, 21.0, true)
+	rift_light.omni_attenuation = 2.6
+	rift_lights.append(rift_light)
+	# Rev 1 (光影丰富度): same layering as the seal core — a wide dim
+	# violet fill so the rift light reaches the road and rocks, and a
+	# violet pool on the ground at the rift mouth.
+	# Rev 2: two concentric pool discs per rift (bright near-source
+	# core + faint wide fade) for the stepped falloff the首审 asked
+	# for, instead of one flat wash.
+	var rift_fill_light := _add_omni_light(world_root, "RiftFillLightN" if lane_start.z < 0.0 else "RiftFillLightS", Vector3(lane_start.x + 1.5, 5.2, lane_start.z), Color(0.72, 0.30, 1.0), 1.25, 13.0, false)
+	rift_fill_light.omni_attenuation = 2.0
+	rift_fill_lights.append(rift_fill_light)
+	# Rev 3: three-step pool (near brighter, mid step, outer fainter)
+	# + two ground-hugging mist veils confined to the mouth.
+	_add_ground_disc(world_root, "RiftLightPoolN" if lane_start.z < 0.0 else "RiftLightPoolS", Vector3(lane_start.x + 1.5, 0.09, lane_start.z), 3.1, Color(0.50, 0.22, 0.95), 0.42)
+	_add_ground_disc(world_root, "RiftLightPoolMidN" if lane_start.z < 0.0 else "RiftLightPoolMidS", Vector3(lane_start.x + 1.5, 0.095, lane_start.z), 4.9, Color(0.50, 0.22, 0.95), 0.08)
+	_add_ground_disc(world_root, "RiftLightPoolOuterN" if lane_start.z < 0.0 else "RiftLightPoolOuterS", Vector3(lane_start.x + 1.5, 0.10, lane_start.z), 6.4, Color(0.50, 0.22, 0.95), 0.02)
+	_add_ground_disc(world_root, "RiftMistN" if lane_start.z < 0.0 else "RiftMistS", Vector3(lane_start.x + 1.5, 0.16, lane_start.z), 4.2, Color(0.50, 0.24, 0.95), 0.045)
+	_add_ground_disc(world_root, "RiftMistCoreN" if lane_start.z < 0.0 else "RiftMistCoreS", Vector3(lane_start.x + 1.5, 0.30, lane_start.z), 4.0, Color(0.50, 0.24, 0.95), 0.035)
+	# Cracked glow stones at the rift mouth.
+	# 破损件清零 Rev 1: dark violet tint + stripped texture, matching
+	# the seal-core crystal recipe — the old light tint (0.85,0.38,1.0)
+	# blew out to pale pink-white blobs under ACES+bloom. Shards live
+	# under a named group so the harness can verify their color.
+	var shard_group := Node3D.new()
+	shard_group.name = "RiftShardsN" if lane_start.z < 0.0 else "RiftShardsS"
+	world_root.add_child(shard_group)
+	for i in range(6):
+		var a := -0.9 + float(i) * 0.36
+		var shard := _place_model("res://assets/kenney_td/detail-crystal.glb", shard_group, Vector3(lane_start.x + 2.6 + sin(a) * 1.2, 0, lane_start.z + cos(a) * 3.4), a, 2.6 + 0.35 * float(i % 3), rift_shard_tint, rift_shard_emission, 0.9, -1.0, true)
+		if shard != null:
+			shard.rotation.x = 0.3 * sin(a)
+			shard.rotation.z = 0.25 * cos(a)
+
+
+func _add_label3d(parent_node: Node, label_text: String, pos: Vector3, font_size: int = 48, color: Color = Color(1.0, 0.92, 0.70)) -> Label3D:
+	var label := Label3D.new()
+	label.text = label_text
+	label.font = CJK_FONT
+	label.font_size = font_size
+	label.pixel_size = 0.02
+	label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+	label.modulate = color
+	label.outline_size = 10
+	label.outline_modulate = Color(0.05, 0.04, 0.02, 0.9)
+	label.position = pos
+	parent_node.add_child(label)
+	return label
+
+
+func _add_gold_glyph(parent_node: Node, glyph_name: String, glyph_text: String, pos: Vector3, font_size: int = 48) -> Label3D:
+	# 三国身份强化 Rev 1: a gold character on a banner / plaque, set in
+	# the embedded Bold CJK face (no system-font dependency). Billboard
+	# so it reads from the classic south camera; dark outline keeps it
+	# legible on red cloth and dark wood.
+	var label := Label3D.new()
+	label.name = glyph_name
+	label.text = glyph_text
+	label.font = CJK_FONT_BOLD
+	label.font_size = font_size
+	label.pixel_size = 0.02
+	label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+	label.modulate = Color(1.0, 0.85, 0.45)
+	label.outline_size = 8
+	label.outline_modulate = Color(0.10, 0.05, 0.02, 0.9)
+	label.position = pos
+	parent_node.add_child(label)
+	return label
+
+
+func _add_flag_glyph(flag_pos: Vector3, rot_y: float) -> void:
+	# 三国身份强化 Rev 1: gold 「蜀」 on a kenney field flag. The cloth
+	# (GLB AABB: model y 0.5..0.75, z -0.38..-0.14, scale 5.2) hangs at
+	# world y 2.6..3.9 and extends ~2.0 from the pole along the flag's
+	# facing (model -z in world); the glyph sits at the cloth centre,
+	# 0.4 proud of the cloth face so the wave undulation never swallows
+	# it. Index runs so the harness can count all 20 field glyphs.
+	var dir := Vector3(-sin(rot_y), 0.0, -cos(rot_y))
+	# Rev 1 fix: the cloth's visual mass sits toward the pole (the wavy
+	# far tip reads thin), so the glyph sits at 0.95 along the facing —
+	# 1.35 put it over the cloth's right edge (see identity_after_flag).
+	# Rev 2 (Codex 首审点 1): the glyph still hung below the cloth —
+	# its visual centre sat ~0.3 under the cloth's centre and the
+	# 56px glyph (plus outline) is taller than the cloth's full-height
+	# band. Centre it on the cloth (y 3.55), shrink to 44px, pull it
+	# closer to the cloth face (0.35 -> 0.22 proud) so it reads as
+	# printed on the banner, not pasted in front of it.
+	# Rev 3 (Codex 复审遗留改法 1): the billboard glyph still floated
+	# in front of the cloth and, at 44px x 0.02 + outline, stood taller
+	# than the cloth band itself. Attach it to the cloth instead: no
+	# billboard, plane parallel to the cloth face (label +Z aligned to
+	# the cloth normal), sized to the band (44px x 0.0125 = 0.55 core),
+	# centred on the band (origin y 3.53 = band centre 3.25 + half the
+	# text height) and only 0.10 proud so it foreshortens WITH the
+	# cloth like print, not like a pasted sign.
+	var cloth_normal := Vector3(cos(rot_y), 0.0, -sin(rot_y))
+	var glyph_pos := flag_pos + dir * 1.05 + Vector3(0.0, 3.53, 0.0) + cloth_normal * 0.10
+	var glyph := _add_gold_glyph(world_root, "FlagGlyph%d" % flag_glyph_index, "蜀", glyph_pos, 44)
+	glyph.billboard = BaseMaterial3D.BILLBOARD_DISABLED
+	glyph.rotation.y = rot_y + PI / 2.0
+	glyph.pixel_size = 0.0125
+	glyph.outline_size = 6
+	flag_glyph_index += 1
+
+
+func _add_lantern(parent_node: Node, body_name: String, pos: Vector3, rod_len: float) -> void:
+	# 三国身份强化 Rev 1: a real paper lantern instead of the glowing
+	# box — squashed-sphere red body (emissive), gold caps top/bottom,
+	# a cord/rod up to whatever it hangs from. The OmniLight stays
+	# where it was; only the visible fixture changes.
+	# Rev 2 (Codex 首审点 3): the Rev 1 body glowed so hot it read as
+	# a yellow ball — deepen the red shell, cut the emissive energy
+	# and redden the emissive colour so the shell stays red; widen
+	# the gold caps and thicken the rod so the fixture's parts read
+	# at near-shot distance.
+	var red_mat := _mat(Color(0.80, 0.13, 0.10), 0.6, 0.0, Color(1.0, 0.14, 0.04), 0.8)
+	var gold_mat := _mat(Color.html("#c9a227"), 0.5, 0.4)
+	_add_sphere(parent_node, body_name, 0.235, pos, red_mat, Vector3(1.0, 0.8, 1.0), 16)
+	# Rev 4: a shallow gold dish with a separate thin outer rim.
+	_add_cylinder(parent_node, body_name + "CapTop", 0.12, 0.31, 0.06, pos + Vector3(0, 0.205, 0), gold_mat, Vector3.ZERO, 16)
+	_add_cylinder(parent_node, body_name + "CapTopRim", 0.31, 0.31, 0.03, pos + Vector3(0, 0.180, 0), gold_mat, Vector3.ZERO, 16)
+	_add_cylinder(parent_node, body_name + "CapBottom", 0.28, 0.12, 0.06, pos + Vector3(0, -0.205, 0), gold_mat, Vector3.ZERO, 16)
+	_add_cylinder(parent_node, body_name + "Rod", 0.045, 0.045, rod_len, pos + Vector3(0, 0.19 + rod_len * 0.5, 0), _mat(Color.html("#3a2a1a"), 0.9), Vector3.ZERO, 8)
+
+
+func _add_wedge_cap(parent: Node, cap_name: String, pos: Vector3, across_is_x: bool, high_sign: float, material: Material) -> MeshInstance3D:
+	# Rev 4: a closed prism with slope and thin low edge built into the mesh.
+	var section: Array[Vector2] = [Vector2(-0.75, 0.11), Vector2(0.75, -0.11), Vector2(0.75, -0.145), Vector2(-0.75, -0.13)]
+	var vertices: Array[Vector3] = []
+	var center := Vector3.ZERO
+	for end_i in range(2):
+		var along := -0.38 if end_i == 0 else 0.38
+		for point in section:
+			var across: float = point.x * high_sign
+			var vertex := Vector3(across, point.y, along) if across_is_x else Vector3(along, point.y, across)
+			vertices.append(vertex)
+			center += vertex
+	center /= float(vertices.size())
+	var faces: Array = [[0, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7], [0, 3, 2, 1], [4, 5, 6, 7]]
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	st.set_smooth_group(-1)
+	for face in faces:
+		var a: Vector3 = vertices[face[0]]
+		var b: Vector3 = vertices[face[1]]
+		var c: Vector3 = vertices[face[2]]
+		var d: Vector3 = vertices[face[3]]
+		var outward := (a + b + c + d) * 0.25 - center
+		# Godot front faces wind clockwise, including mirrored axis mappings.
+		if (b - a).cross(c - a).dot(outward) > 0.0:
+			var swap := b
+			b = d
+			d = swap
+		for vertex in [a, b, c, a, c, d]:
+			st.add_vertex(vertex)
+	st.generate_normals()
+	var cap := MeshInstance3D.new()
+	cap.name = cap_name
+	cap.mesh = st.commit()
+	cap.material_override = material
+	cap.position = pos
+	parent.add_child(cap)
+	return cap
+
+
+func _add_merlon_caps_along_wall(axis_x: bool, fixed: float, centers: Array, skip_near: Array, cap_name: String) -> int:
+	# 三国身份强化 Rev 1: sloped-tile caps on the kaykit wall merlons —
+	# one cap per merlon (merlons every 1.0 world unit, tops y 3.0..3.3,
+	# from the wall_straight.gltf vertex profile), tilted down toward
+	# the enemy side so the parapet reads as a Chinese tiled wall cap
+	# instead of flat castle crenellation. `centers` holds the
+	# wall-segment centres along the running axis; overlapping segments
+	# share merlons, so positions are deduped within 0.6.
+	var cap_mat := _mat(Color.html("#3a4a63"), 0.85)
+	var placed: Array = []
+	var n := 0
+	for c in centers:
+		for m in [-1.0, -0.67, -0.33, 0.0, 0.33, 0.67, 1.0]:
+			var along: float = float(c) + 3.0 * m
+			var skip := false
+			for s in skip_near:
+				if absf(along - float(s)) < 1.8:
+					skip = true
+			if not skip:
+				for p in placed:
+					if absf(along - float(p)) < 0.6:
+						skip = true
+			if skip:
+				continue
+			placed.append(along)
+			var pos := Vector3(fixed, 3.38, along) if not axis_x else Vector3(along, 3.38, fixed)
+			# Rev 4: geometry supplies the slope; all cap nodes stay unrotated.
+			var sgn := 1.0 if fixed < 0.0 else -1.0
+			_add_wedge_cap(world_root, "%s%d" % [cap_name, n], pos, not axis_x, 1.0 if not axis_x else sgn, cap_mat)
+			var sb := Basis.IDENTITY
+			if not axis_x:
+				_add_cylinder(world_root, "CapRoll%s%d" % [cap_name, n], 0.045, 0.045, 0.78, pos + sb * Vector3(-0.70, 0.125, 0), cap_mat, Vector3(PI / 2.0, 0, 0), 10)
+				_add_box(world_root, "CapLip%s%d" % [cap_name, n], Vector3(0.20, 0.04, 0.76), pos + Vector3(0.77, -0.115, 0), cap_mat, Vector3(0, 0, -0.146))
+			else:
+				_add_cylinder(world_root, "CapRoll%s%d" % [cap_name, n], 0.045, 0.045, 0.78, pos + sb * Vector3(0, 0.125, -0.70 * sgn), cap_mat, Vector3(0, 0, PI / 2.0), 10)
+				_add_box(world_root, "CapLip%s%d" % [cap_name, n], Vector3(0.76, 0.04, 0.20), pos + Vector3(0, -0.115, 0.77 * sgn), cap_mat, Vector3(sgn * 0.146, 0, 0))
+			n += 1
+	return n
+
+
+func _spawn_static_npc(pos: Vector3, visual: String, tint: Color, npc_name: String) -> ArticulatedUnit:
+	# Purely decorative standing figure (shopkeepers, the training
+	# officer): hp 0 means the unit logic never treats it as a combatant;
+	# it is not registered in enemies/trainees.
+	var u := _make_unit("strategist", "npc", npc_name, pos, 0.0, 0.0, 0.0, 0.0, 1.0, visual, tint)
+	u.name = npc_name # _make_unit never sets the node name (only
+		# display_name); static NPCs keep unique names so the harness
+		# and probes can find them (Test 30: 孟达).
+	u.rotation.y = PI / 2.0 # face east, toward the lanes / the hero
+	return u
+
+
+func _build_market() -> void:
+	# Market row inside the base's north edge. Six shops matching the
+	# original's market functions (TEARDOWN §5 市肆). -0.4: the first
+	# four sell (equip / fine / grocery / book); the casino opened in
+	# stage 2 (free chips only); the mercenary stays stage-2 and
+	# answers with a "not yet open" message.
+	var shops: Array = [
+		{"file": "building_blacksmith_red.gltf", "name": "一级装备店", "x": -72.0, "npc": "general", "tint": Color(0.95, 0.80, 0.66), "kind": "equip"},
+		{"file": "building_home_A_red.gltf", "name": "精品店", "x": -67.0, "npc": "strategist", "tint": Color(0.92, 0.88, 0.80), "kind": "fine"},
+		{"file": "building_market_red.gltf", "name": "杂货店", "x": -62.0, "npc": "rogue", "tint": Color(0.88, 0.84, 0.78), "kind": "grocery"},
+		{"file": "building_church_red.gltf", "name": "书店", "x": -57.0, "npc": "strategist", "tint": Color(0.85, 0.88, 0.95), "kind": "book"},
+		{"file": "building_tavern_red.gltf", "name": "赌场", "x": -70.0, "npc": "rogue", "tint": Color(0.95, 0.78, 0.60), "kind": "casino"},
+		{"file": "building_barracks_red.gltf", "name": "军需官", "x": -60.0, "npc": "general", "tint": Color(0.72, 1.0, 0.78), "kind": "mercenary"},
+	]
+	var row_z := -16.5
+	for i in range(shops.size()):
+		var s: Dictionary = shops[i]
+		var z := row_z if i < 4 else row_z + 5.5
+		var pos := Vector3(float(s["x"]), 0, z)
+		var node := _place_model("res://assets/kaykit_hex/buildings/red/" + String(s["file"]), world_root, pos, PI, 2.6, Color(0.94, 0.88, 0.78))
+		_add_label3d(world_root, String(s["name"]), pos + Vector3(0, 4.6, 0), 44)
+		var npc := _spawn_static_npc(pos + Vector3(0, 0, 2.6), String(s["npc"]), s["tint"], String(s["name"]) + "掌柜")
+		shop_nodes.append(node)
+		shop_nodes.append(npc)
+		shop_defs.append({"name": String(s["name"]), "kind": String(s["kind"]), "pos": pos, "npc": npc})
+
+
+func _build_training_zone() -> void:
+	# Training grounds: fenced pens + officer. Stage 2 (fees, room
+	# sessions, growth gear, officer level) lives in the training
+	# system block below (trainer_enter / _update_training / growth).
+	# Pen A (brush-soldiers room) — fenced, entrance gap on the east side.
+	var fence := "res://assets/kaykit_hex/buildings/neutral/fence_wood_straight.gltf"
+	for fx in range(-62, -40, 6):
+		_place_model(fence, world_root, Vector3(float(fx), 0, 24.6), 0.0, 3.0)
+		_place_model(fence, world_root, Vector3(float(fx), 0, 41.4), 0.0, 3.0)
+	for fz in [29.0, 35.0, 41.0]:
+		_place_model(fence, world_root, Vector3(-63.4, 0, float(fz)), PI / 2.0, 3.0)
+	for fz in [29.0, 41.0]:
+		_place_model(fence, world_root, Vector3(-40.6, 0, float(fz)), PI / 2.0, 3.0)
+	_add_label3d(world_root, "训练场 · 刷兵房", Vector3(-52, 5.2, 33), 52)
+	training_officer = _spawn_static_npc(Vector3(-58, 0, 33), "general", Color(0.95, 0.88, 0.70), "训练长官")
+	# Pen B (small-boss room) — fenced and signed; spawns arrive in stage 2.
+	for fx in range(-62, -30, 6):
+		_place_model(fence, world_root, Vector3(float(fx), 0, -41.4), 0.0, 3.0)
+		_place_model(fence, world_root, Vector3(float(fx), 0, -24.6), 0.0, 3.0)
+	for fz in [-35.0, -29.0]:
+		_place_model(fence, world_root, Vector3(-63.4, 0, float(fz)), PI / 2.0, 3.0)
+		_place_model(fence, world_root, Vector3(-33.6, 0, float(fz)), PI / 2.0, 3.0)
+	_add_label3d(world_root, "训练场 · 小Boss房 · 掉成长紫装", Vector3(-48, 5.2, -33), 44, Color(0.85, 0.85, 0.90))
+	# Stage 2: the officer runs the paid rooms — registered as a panel
+	# NPC (shop_defs[6], kind "trainer"; the refiner sits behind it).
+	shop_defs.append({"name": "训练长官", "kind": "trainer", "pos": Vector3(-58, 0, 33), "npc": training_officer})
+
+
+func _build_plaza() -> void:
+	# Boss approach plaza where the two lanes converge (stage-1 visual
+	# anchor): stone disc, war flags, two ballista props.
+	var stone := _mat(Color.html("#6a6257"), 0.95)
+	_add_cylinder(world_root, "PlazaDisc", 8.5, 9.0, 0.22, Vector3(PLAZA_POS.x, 0.11, PLAZA_POS.z), stone, Vector3.ZERO, 24)
+	for fp in [Vector3(18, 0, -8), Vector3(18, 0, 8), Vector3(31, 0, -8), Vector3(31, 0, 8)]:
+		_add_banner_prop(fp, fp.x)
+	var plaza_ballista_a := _place_model("res://assets/kenney_castle/siege-ballista.glb", world_root, Vector3(16, 0, -5), PI / 2.0, 1.6, ballista_tint)
+	if plaza_ballista_a != null:
+		_add_ballista_fittings(plaza_ballista_a)
+	var plaza_ballista_b := _place_model("res://assets/kenney_castle/siege-ballista.glb", world_root, Vector3(16, 0, 5), PI / 2.0, 1.6, ballista_tint)
+	if plaza_ballista_b != null:
+		_add_ballista_fittings(plaza_ballista_b)
+	_add_label3d(world_root, "上方谷 · 决战广场", Vector3(PLAZA_POS.x, 6.4, PLAZA_POS.z), 44, Color(0.95, 0.85, 0.75))
+
+
+func _build_forest_zone() -> void:
+	# Forest (TEARDOWN §2: 青龙's ground, the hide-scorching clearing and
+	# the poison-spider nest). Stage 1.5 scope: terrain, points and signs
+	# only — the saint / wilds systems are stage 2.
+	var zone := Node3D.new()
+	zone.name = "ForestZone"
+	world_root.add_child(zone)
+	# Floor: the deep moss-earth is baked into the continuous ground
+	# surface (_ground_color_at blends forest_floor_color across
+	# FOREST_ZONE with a feathered edge) — no separate apron box since
+	# the -0.6 ground rebuild.
+	# Dirt connector from the north lane's south edge into the forest,
+	# so the zone is walkable straight off the road.
+	var path := _add_box(zone, "ForestPath", Vector3(6.0, 0.04, 6.5), Vector3(59, 0.020, -29.2), _mat(road_ribbon_color, 1.0))
+	path.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_add_banner_prop(Vector3(55.5, 0, -31.2), 3.1)
+	_add_banner_prop(Vector3(62.5, 0, -31.2), 4.2)
+	# Zone sign: large and high so it clears the north tree line and
+	# the ridge at full zoom-out (review round 13: 60pt at y 5.8 was
+	# unreadable and half-hidden behind the rocks).
+	_add_label3d(zone, "森林", Vector3(59, 10.0, -28.0), 120, Color(0.82, 1.0, 0.78))
+	# Dense dark canopy. Forest trees join the shared vegetation list,
+	# so the quality tiers thin them together with the field trees.
+	var forest_trees: Array = [
+		Vector3(46, 0, -41.5), Vector3(49, 0, -33.5), Vector3(53, 0, -41.8), Vector3(56, 0, -34.5),
+		Vector3(58, 0, -38.5), Vector3(60, 0, -33.2), Vector3(62, 0, -36.8), Vector3(65, 0, -34.0),
+		Vector3(66, 0, -41.8), Vector3(68, 0, -38.0), Vector3(70, 0, -33.5), Vector3(71, 0, -41.5),
+		Vector3(74, 0, -33.0), Vector3(80, 0, -41.8), Vector3(81, 0, -34.5), Vector3(47.5, 0, -33.2),
+	]
+	for i in range(forest_trees.size()):
+		var pos: Vector3 = forest_trees[i]
+		var h := 1.05 + 0.22 * sin(float(i) * 2.3)
+		var tree_node := _place_model("res://assets/kenney_castle/tree-large.glb", vegetation_root, pos, float(i) * 0.9 + 0.4, 3.3 * h, forest_tree_tint)
+		if tree_node != null:
+			vegetation_nodes.append(tree_node)
+	# 青龙之位 (east clearing): stone dais, four pillars, a ward-crystal
+	# cluster (the saint beast itself arrives in stage 2). Faceted
+	# kenney crystal with a green tint — the previous emissive sphere
+	# blew out to a white ball under ACES+bloom and read as a
+	# placeholder (review round 13, P1-5); a sphere is not used here.
+	var stone_mat := _mat(Color.html("#6f6a5e"), 0.95)
+	_add_cylinder(zone, "QinglongDais", 3.0, 3.3, 0.3, Vector3(77, 0.15, -37), stone_mat, Vector3.ZERO, 18)
+	for a in [0.0, PI / 2.0, PI, 3.0 * PI / 2.0]:
+		_add_cylinder(zone, "QinglongPillar", 0.32, 0.38, 2.6, Vector3(77 + 2.2 * cos(a), 1.3, -37 + 2.2 * sin(a)), stone_mat, Vector3.ZERO, 8)
+	var qcrys := Node3D.new()
+	qcrys.name = "QinglongCrystal"
+	zone.add_child(qcrys)
+	# 破损件清零 Rev 1: crystal tint deepened (was 0.30,0.85,0.45 — blew
+	# out to pale green-white in sun-facing views, same ACES+bloom
+	# blowout as the old rift shards).
+	_place_model("res://assets/kenney_td/detail-crystal.glb", qcrys, Vector3(77, 0.3, -37), 0.0, 5.0, qinglong_crystal_tint, Color(0.20, 0.80, 0.45), 0.45, 0.95, true)
+	_place_model("res://assets/kenney_td/detail-crystal.glb", qcrys, Vector3(75.6, 0.3, -35.6), 0.7, 3.0, qinglong_crystal_tint, Color(0.20, 0.80, 0.45), 0.45, 0.95, true)
+	_place_model("res://assets/kenney_td/detail-crystal.glb", qcrys, Vector3(78.4, 0.3, -35.8), 2.2, 2.6, qinglong_crystal_tint, Color(0.20, 0.80, 0.45), 0.45, 0.95, true)
+	_add_omni_light(zone, "QinglongGlow", Vector3(77, 2.4, -37), Color(0.35, 0.95, 0.6), 1.0, 10.0)
+	_add_label3d(zone, "青龙之位 · 圣兽", Vector3(77, 7.4, -37), 64, Color(0.78, 1.0, 0.86))
+	# 烧皮点 (west clearing): scorched earth disc and charred trunks —
+	# the original's hide-scorching spot, kept as a named landmark.
+	var scorch := _add_cylinder(zone, "ScorchDisc", 3.4, 3.4, 0.03, Vector3(51, 0.045, -37), _mat(Color.html("#241d16"), 1.0), Vector3.ZERO, 18)
+	scorch.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	var char_mat := _mat(Color.html("#1f1a14"), 1.0)
+	for i in range(3):
+		_add_cylinder(zone, "CharredTrunk", 0.16, 0.30, 2.1, Vector3(49.5 + float(i) * 1.6, 1.0, -38.5 + float(i % 2) * 2.6), char_mat, Vector3(0.14 * sin(float(i) * 2.0), 0.0, 0.18 * cos(float(i) * 1.3)), 7)
+	_add_label3d(zone, "烧皮点", Vector3(51, 6.0, -37), 64, Color(1.0, 0.85, 0.66))
+	# 毒蜘蛛巢 (north clearing): a dark burrow mound with its opening.
+	_add_sphere(zone, "SpiderMound", 2.3, Vector3(63, 0.1, -40.3), _mat(Color.html("#3a3128"), 1.0), Vector3(1.0, 0.42, 1.0), 12)
+	_add_cylinder(zone, "SpiderHole", 0.85, 0.85, 0.06, Vector3(63, 1.02, -40.3), _mat(Color.html("#0d0b09"), 1.0), Vector3.ZERO, 12)
+	_add_label3d(zone, "毒蜘蛛巢", Vector3(63, 6.2, -40.3), 64, Color(0.92, 0.88, 0.80))
+
+
+func _build_grave_zone() -> void:
+	# Graveyard (TEARDOWN §2/§8: 项羽之魂 challenge point, 白虎's side).
+	# Terrain, points and signs only — the challenge itself is stage 2.
+	var zone := Node3D.new()
+	zone.name = "GraveZone"
+	world_root.add_child(zone)
+	# Floor: the ash-grey earth is baked into the continuous ground
+	# surface (_ground_color_at blends grave_floor_color across
+	# GRAVE_ZONE with a feathered edge) — no separate apron box since
+	# the -0.6 ground rebuild.
+	# Dirt connector running south to the trunk road by the plaza lanes.
+	var path := _add_box(zone, "GravePath", Vector3(5.0, 0.04, 26.0), Vector3(-19, 0.020, -17), _mat(Color.html("#6d675c"), 1.0))
+	path.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	# Broken stone fence along the south edge, with a gap at the path.
+	var fence := "res://assets/kaykit_hex/buildings/neutral/fence_stone_straight.gltf"
+	for fx in range(-33, -5, 6):
+		if absf(float(fx) + 19.0) < 4.0:
+			continue
+		_place_model(fence, zone, Vector3(float(fx), 0, -29.9), 0.0, 3.0)
+	# Zone sign: large and high so it clears the fence line and the
+	# north ridge at full zoom-out (review round 13).
+	_add_label3d(zone, "墓地", Vector3(-19, 10.0, -26.5), 120, Color(0.88, 0.88, 0.94))
+	# 项羽之魂 challenge point (west end): dais and a great stele.
+	var stone_mat := _mat(Color.html("#76726a"), 0.95)
+	_add_cylinder(zone, "XiangyuDais", 3.2, 3.5, 0.3, Vector3(-26, 0.15, -36.5), stone_mat, Vector3.ZERO, 18)
+	_add_box(zone, "XiangyuStele", Vector3(1.7, 3.6, 0.5), Vector3(-26, 2.1, -36.5), stone_mat)
+	_add_box(zone, "XiangyuSteleCap", Vector3(2.1, 0.4, 0.7), Vector3(-26, 4.1, -36.5), stone_mat)
+	for sx in [-29.6, -22.4]:
+		_add_cylinder(zone, "GravePillar", 0.3, 0.36, 2.2, Vector3(sx, 1.1, -36.5), stone_mat, Vector3.ZERO, 8)
+	_add_label3d(zone, "项羽之魂 · 挑战点", Vector3(-26, 7.2, -33.5), 64, Color(0.92, 0.92, 0.97))
+	# Burial mounds with small tilted steles (east half).
+	var mound_mat := _mat(Color.html("#4c463c"), 1.0)
+	var stele_mat := _mat(Color.html("#847f74"), 0.95)
+	var graves: Array = [Vector3(-15.5, 0, -39.5), Vector3(-12.0, 0, -34.0), Vector3(-16.5, 0, -33.0), Vector3(-13.0, 0, -40.5), Vector3(-13.5, 0, -37.0), Vector3(-9.5, 0, -41.0)]
+	for i in range(graves.size()):
+		var gp: Vector3 = graves[i]
+		_add_sphere(zone, "GraveMound", 1.15, Vector3(gp.x, 0.05, gp.z), mound_mat, Vector3(1.0, 0.38, 0.8), 10)
+		var st := _add_box(zone, "GraveStele", Vector3(0.85, 1.25, 0.26), Vector3(gp.x, 0.62, gp.z - 1.15), stele_mat)
+		st.rotation = Vector3(0.06 * sin(float(i) * 2.7), 0.15 * sin(float(i) * 1.9), 0.09 * cos(float(i) * 2.2))
+	# 白虎之位 (east end): pale stone dais and a golden ward-crystal
+	# cluster (the saint beast itself arrives in stage 2); carved pale
+	# stone, not a placeholder white (P1-5). The previous pale pearl
+	# sphere rendered as a plain white ball (review round 13) and is
+	# replaced by the same faceted-crystal treatment as 青龙之位.
+	var pale_mat := _mat(Color.html("#8f8b82"), 0.9)
+	_add_cylinder(zone, "BaihuDais", 2.6, 2.9, 0.3, Vector3(-8, 0.15, -36.5), pale_mat, Vector3.ZERO, 18)
+	for sx in [-10.6, -5.4]:
+		_add_cylinder(zone, "BaihuPillar", 0.28, 0.34, 2.0, Vector3(sx, 1.0, -36.5), pale_mat, Vector3.ZERO, 8)
+	var bcrys := Node3D.new()
+	bcrys.name = "BaihuCrystal"
+	zone.add_child(bcrys)
+	_place_model("res://assets/kenney_td/detail-crystal.glb", bcrys, Vector3(-8, 0.3, -36.5), 0.0, 4.2, Color(0.95, 0.72, 0.25), Color(0.95, 0.65, 0.20), 0.5, 0.95, true)
+	_place_model("res://assets/kenney_td/detail-crystal.glb", bcrys, Vector3(-9.2, 0.3, -35.3), 0.8, 2.6, Color(0.95, 0.72, 0.25), Color(0.95, 0.65, 0.20), 0.45, 0.95, true)
+	_place_model("res://assets/kenney_td/detail-crystal.glb", bcrys, Vector3(-6.8, 0.3, -35.4), 2.4, 2.2, Color(0.95, 0.72, 0.25), Color(0.95, 0.65, 0.20), 0.45, 0.95, true)
+	_add_omni_light(zone, "BaihuGlow", Vector3(-8, 2.0, -36.5), Color(1.0, 0.75, 0.35), 0.8, 8.0)
+	_add_label3d(zone, "白虎之位 · 圣兽", Vector3(-8, 6.8, -33.5), 64, Color(0.90, 0.93, 1.0))
+	# Bare dead trees: dark trunks with a single branch each.
+	var dead_mat := _mat(Color.html("#2e2620"), 1.0)
+	for dp in [Vector3(-31.5, 0, -41.5), Vector3(-18.5, 0, -41.8), Vector3(-5.2, 0, -31.6)]:
+		_add_cylinder(zone, "DeadTrunk", 0.14, 0.26, 2.8, dp + Vector3(0, 1.4, 0), dead_mat, Vector3(0.05, 0.0, 0.07), 7)
+		_add_cylinder(zone, "DeadBranch", 0.05, 0.09, 1.5, dp + Vector3(0.5, 2.3, 0.2), dead_mat, Vector3(0.0, 0.0, 1.05), 6)
+
+
+func _build_water_zone() -> void:
+	# Water (TEARDOWN §2: 玄武's ground — the south-east mirror of the
+	# forest zone). Terrain, points and signs only — the saint beast /
+	# 玉玺 quest are stage 2.
+	var zone := Node3D.new()
+	zone.name = "WaterZone"
+	world_root.add_child(zone)
+	# Floor: damp shore earth is baked into the continuous ground
+	# surface (_ground_color_at blends water_floor_color across
+	# WATER_ZONE with a feathered edge) — no separate apron box since
+	# the -0.6 ground rebuild.
+	# Dirt connector from the south lane's south edge into the shore.
+	var path := _add_box(zone, "WaterPath", Vector3(5.0, 0.04, 5.0), Vector3(59, 0.020, 28.5), _mat(road_ribbon_color, 1.0))
+	path.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	# Zone sign: large and high, on the camera side of the shore so it
+	# reads at full zoom-out (same 120pt rule as forest/grave). The
+	# pond's south edge (z 42) faces the default camera; the north edge
+	# (z 29.5) projected the sign into the top message bar in the
+	# close-up probe, so the sign sits on the south edge instead.
+	_add_label3d(zone, "水域", Vector3(63, 10.0, 42.0), 120, Color(0.75, 0.88, 1.0))
+	# Pond: a worn-earth shore ring with the water disc set into it.
+	var shore_mat := _mat(Color.html("#6d6244"), 1.0)
+	var shore := _add_cylinder(zone, "PondShore", 7.0, 7.0, 0.03, Vector3(63, 0.020, 36.5), shore_mat, Vector3.ZERO, 24)
+	shore.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	var water_mat := _mat(Color.html("#2f5064"), 0.25, 0.0, Color.html("#0e2a3d"), 0.4)
+	var pond := _add_cylinder(zone, "WaterPond", 6.0, 6.0, 0.03, Vector3(63, 0.045, 36.5), water_mat, Vector3.ZERO, 24)
+	pond.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	# 玄武之位: island dais in the pond with a dark-blue ward-crystal
+	# cluster (the saint beast itself arrives in stage 2). Faceted
+	# kenney crystal — never an emissive sphere (review round 13, P1-5).
+	var stone_mat := _mat(Color.html("#5d6a72"), 0.95)
+	_add_cylinder(zone, "XuanwuDais", 2.2, 2.5, 0.3, Vector3(63, 0.15, 36.5), stone_mat, Vector3.ZERO, 18)
+	var xcrys := Node3D.new()
+	xcrys.name = "XuanwuCrystal"
+	zone.add_child(xcrys)
+	_place_model("res://assets/kenney_td/detail-crystal.glb", xcrys, Vector3(63, 0.3, 36.5), 0.0, 4.6, Color(0.12, 0.22, 0.75), Color(0.10, 0.18, 0.85), 0.5, 0.95, true)
+	_place_model("res://assets/kenney_td/detail-crystal.glb", xcrys, Vector3(61.8, 0.3, 35.4), 0.8, 2.8, Color(0.12, 0.22, 0.75), Color(0.10, 0.18, 0.85), 0.45, 0.95, true)
+	_place_model("res://assets/kenney_td/detail-crystal.glb", xcrys, Vector3(64.2, 0.3, 35.5), 2.4, 2.4, Color(0.12, 0.22, 0.75), Color(0.10, 0.18, 0.85), 0.45, 0.95, true)
+	_add_omni_light(zone, "XuanwuGlow", Vector3(63, 2.2, 36.5), Color(0.35, 0.55, 1.0), 0.9, 9.0)
+	_add_label3d(zone, "玄武之位 · 圣兽", Vector3(63, 7.0, 36.5), 64, Color(0.72, 0.82, 1.0))
+	# Reeds around the pond edge and a few shore rocks.
+	var reed_mat := _mat(Color.html("#2e4426"), 1.0)
+	for i in range(8):
+		var a := TAU * float(i) / 8.0 + 0.35
+		var rp := Vector3(63 + cos(a) * 6.8, 0, 36.5 + sin(a) * 6.8)
+		_add_cylinder(zone, "Reed", 0.05, 0.09, 1.1 + 0.35 * sin(float(i) * 2.1), rp + Vector3(0, 0.6, 0), reed_mat, Vector3(0.08 * sin(float(i) * 1.7), 0.0, 0.06 * cos(float(i) * 2.3)), 5)
+	var rock_mat := _mat(Color.html("#5a5348"), 0.97)
+	for rp in [Vector3(55.5, 0, 40.5), Vector3(70.5, 0, 33.5), Vector3(71.5, 0, 41.0)]:
+		var rock := _add_sphere(zone, "ShoreRock", 0.9, rp + Vector3(0, 0.15, 0), rock_mat, Vector3(1.2, 0.55, 1.0), 7)
+		rock.rotation = Vector3(0.1, float(rp.x) * 0.3, 0.12)
+
+
+func _build_newcity_zone() -> void:
+	# 新城 (TEARDOWN §2: 左上, 孟达 — the town the 新城 quest chain
+	# opens in stage 2). Terrain, points and signs only: a compact
+	# walled town in the free north-west strip west of the small-boss
+	# pen (Pen B fences run x -63..-34; the town keeps clear of them).
+	var zone := Node3D.new()
+	zone.name = "NewcityZone"
+	world_root.add_child(zone)
+	# Floor: packed town earth baked into the continuous ground
+	# surface (_ground_color_at blends newcity_floor_color across
+	# NEWCITY_ZONE) — no apron box since the -0.6 ground rebuild.
+	# Dirt connector from the market row's north edge to the town gate.
+	var path := _add_box(zone, "NewcityPath", Vector3(5.0, 0.04, 5.0), Vector3(-75, 0.020, -23.8), _mat(road_ribbon_color, 1.0))
+	path.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	# Zone sign: large and high, on the gate side so it reads at full
+	# zoom-out (same 120pt rule as forest/grave).
+	# 默认机位下牌面恒落在左上状态板内：vp1600 实测牌面 (273.8,80.6)-(330.9,113.4)，
+	# 状态板 (16,14)-(336,277)；新城区内任何位置都出不了其右界，故移到新城东向土径口，仍指向新城。
+	# Rev 4 改引线标注：牌放 (-46,10.5,-9)、金线指向城门。
+	var nc_sign := _add_label3d(zone, "新城", Vector3(-46.0, 10.5, -9.0), 108, Color(1.0, 0.95, 0.82))
+	nc_sign.outline_size = 14
+	var leader_a := Vector3(-47.5, 8.6, -10.2)
+	var leader_b := Vector3(-74.0, 4.4, -25.6)
+	var leader_mid := (leader_a + leader_b) * 0.5
+	var leader_mat := _mat(Color(0.82, 0.64, 0.28), 0.55, 0.0, Color(0.78, 0.60, 0.22), 0.5)
+	var line := MeshInstance3D.new()
+	line.name = "NewcityLeaderLine"
+	var line_mesh := BoxMesh.new()
+	line_mesh.size = Vector3(0.07, 0.07, 1.0)
+	line.mesh = line_mesh
+	line.position = leader_mid
+	line.scale.z = leader_a.distance_to(leader_b)
+	line.material_override = leader_mat
+	line.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	zone.add_child(line)
+	line.look_at_from_position(leader_mid, leader_b, Vector3.UP)
+	var leader_tip := MeshInstance3D.new()
+	leader_tip.name = "NewcityLeaderTip"
+	var tip_mesh := CylinderMesh.new()
+	tip_mesh.top_radius = 0.0
+	tip_mesh.bottom_radius = 0.34
+	tip_mesh.height = 1.0
+	tip_mesh.radial_segments = 10
+	leader_tip.mesh = tip_mesh
+	leader_tip.position = Vector3(-74.0, 5.4, -25.6)
+	leader_tip.rotation.x = PI
+	leader_tip.material_override = leader_mat
+	leader_tip.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	zone.add_child(leader_tip)
+	# South wall: broken stone fence with a gap at the gate.
+	var fence := "res://assets/kaykit_hex/buildings/neutral/fence_stone_straight.gltf"
+	for fx in range(-83, -66, 5):
+		if absf(float(fx) + 75.0) < 3.5:
+			continue
+		_place_model(fence, zone, Vector3(float(fx), 0, -26.2), 0.0, 3.0)
+	# Town gate: two stone pillars and a wooden lintel over the gap.
+	var gate_mat := _mat(Color.html("#76726a"), 0.95)
+	for gx in [-77.6, -72.4]:
+		_add_cylinder(zone, "NewcityGatePillar", 0.42, 0.5, 3.4, Vector3(gx, 1.7, -26.2), gate_mat, Vector3.ZERO, 8)
+	_add_box(zone, "NewcityGateLintel", Vector3(6.4, 0.5, 0.7), Vector3(-75, 3.6, -26.2), _mat(Color.html("#4a2f1d"), 0.9))
+	# Three town houses (kaykit red set, muted tints so they read as a
+	# civilian town, not a second market row).
+	var ha := _place_model("res://assets/kaykit_hex/buildings/red/building_home_A_red.gltf", zone, Vector3(-80, 0, -38), 0.5, 2.6, Color(0.92, 0.86, 0.76))
+	if ha != null:
+		ha.name = "NewcityHouseA"
+	var hb := _place_model("res://assets/kaykit_hex/buildings/red/building_home_B_red.gltf", zone, Vector3(-69.5, 0, -38.5), -0.5, 2.6, Color(0.90, 0.85, 0.78))
+	if hb != null:
+		hb.name = "NewcityHouseB"
+	var hc := _place_model("res://assets/kaykit_hex/buildings/red/building_market_red.gltf", zone, Vector3(-69.5, 0, -29.5), PI, 2.6, Color(0.88, 0.84, 0.76))
+	if hc != null:
+		hc.name = "NewcityHouseC"
+	# Town well: stone rim, two posts and a small gable roof.
+	var well_mat := _mat(Color.html("#6a6257"), 0.95)
+	_add_cylinder(zone, "NewcityWell", 1.0, 1.1, 0.9, Vector3(-75.5, 0.45, -34), well_mat, Vector3.ZERO, 12)
+	var post_mat := _mat(Color.html("#4a2f1d"), 0.9)
+	for wx in [-76.6, -74.4]:
+		_add_cylinder(zone, "NewcityWellPost", 0.09, 0.09, 1.6, Vector3(wx, 1.6, -34), post_mat, Vector3.ZERO, 6)
+	_add_box(zone, "NewcityWellRoof", Vector3(2.6, 0.18, 1.6), Vector3(-75.5, 2.5, -34), _mat(Color.html("#7a4a30"), 0.9))
+	# 孟达, the town's warden (stage-2 quest giver; stands by the gate).
+	var mengda := _spawn_static_npc(Vector3(-75, 0, -28.5), "general", Color(0.95, 0.88, 0.70), "孟达")
+	mengda.rotation.y = PI # face south, toward the gate
+	# Point sign sits north of the well so it does not collide with the
+	# zone sign in the close-up camera (first cut at z -28.5 stacked
+	# directly under 「新城」 and read as one jumbled block).
+	_add_label3d(zone, "孟达 · 新城守将", Vector3(-75, 6.4, -32.5), 64, Color(1.0, 0.92, 0.78))
+
+
+func _build_zhuque_marker() -> void:
+	# 朱雀之位 (TEARDOWN §2: 四圣兽方位点 — 朱雀·出生点). A small
+	# vermilion ward-crystal shrine on the open field between the two
+	# rift portals; the saint beast itself arrives in stage 2.
+	# Faceted kenney crystal — never an emissive sphere (review
+	# round 13, P1-5).
+	var zone := Node3D.new()
+	zone.name = "ZhuqueMarker"
+	world_root.add_child(zone)
+	var stone_mat := _mat(Color.html("#6f6a5e"), 0.95)
+	_add_cylinder(zone, "ZhuqueDais", 2.0, 2.3, 0.25, Vector3(80, 0.125, 0), stone_mat, Vector3.ZERO, 18)
+	var zcrys := Node3D.new()
+	zcrys.name = "ZhuqueCrystal"
+	zone.add_child(zcrys)
+	_place_model("res://assets/kenney_td/detail-crystal.glb", zcrys, Vector3(80, 0.25, 0), 0.0, 4.4, Color(0.95, 0.25, 0.15), Color(1.0, 0.25, 0.10), 0.55, 0.95, true)
+	_place_model("res://assets/kenney_td/detail-crystal.glb", zcrys, Vector3(78.8, 0.25, 1.0), 0.8, 2.7, Color(0.95, 0.25, 0.15), Color(1.0, 0.25, 0.10), 0.5, 0.95, true)
+	_place_model("res://assets/kenney_td/detail-crystal.glb", zcrys, Vector3(81.2, 0.25, 0.9), 2.4, 2.3, Color(0.95, 0.25, 0.15), Color(1.0, 0.25, 0.10), 0.5, 0.95, true)
+	_add_omni_light(zone, "ZhuqueGlow", Vector3(80, 2.0, 0), Color(1.0, 0.45, 0.25), 0.9, 9.0)
+	_add_label3d(zone, "朱雀之位 · 圣兽", Vector3(80, 6.8, 0), 64, Color(1.0, 0.78, 0.66))
+
+
+func _build_valley_zone() -> void:
+	# 葫芦谷 · 上方谷 (TEARDOWN §2: 终局剧情地形, 右上). A blind gorge
+	# in the north-east corner: terrain, points and signs only — the
+	# 上方谷 fire-trap event and the Three Simas finale are stage 2.
+	# SITE (verified against the layout code, 2026-11-14): the suggested
+	# band x 82..97, z -50..-30 is NOT free flat ground — the EastCliff
+	# heightfield starts at x=86 (0.15 high at the foot, ~7.3 at x=97),
+	# the east rim rock line runs at x~89.8 (z -46/-40.8/-35.6) and the
+	# north rim rock line at z~-46.6, so floor props placed east of x~86
+	# or north of z~-44 would be buried in the slope. The build uses
+	# the band's flat foot (x 82..86, z -44..-30) as the valley floor,
+	# and treats the existing east cliff slope + rim rock masses as the
+	# valley's east wall and the north cliff slope as its closed north
+	# end; the mouth opens south toward the north rift.
+	var zone := Node3D.new()
+	zone.name = "ValleyZone"
+	world_root.add_child(zone)
+	# Floor: scorched dry-grass earth baked into the continuous ground
+	# surface (_ground_color_at blends valley_floor_color across
+	# VALLEY_ZONE with a tight feather, so it does not bleed into the
+	# forest moss at the 青龙 dais) — no apron box since -0.6.
+	# Dirt connector from the valley mouth south toward the north rift.
+	var path := _add_box(zone, "ValleyPath", Vector3(5.0, 0.04, 4.0), Vector3(83.5, 0.020, -28.8), _mat(road_ribbon_color, 1.0))
+	path.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	# Zone sign at the mouth, on the camera side so it reads at full
+	# zoom-out (same 120pt rule as forest/grave/water/newcity). Sits at
+	# the mouth's west lip (x 81.5): the first cut at x 84 was clipped
+	# by the right frame edge in the dist-150 overview.
+	_add_label3d(zone, "葫芦谷", Vector3(81.5, 10.0, -28.5), 120, Color(1.0, 0.88, 0.66))
+	# West wall: a line of boulders along the forest edge — the forest
+	# trees behind them close the west side; the east side is the
+	# existing east rim rock line + the EastCliff slope itself.
+	var boulder_mat := _mat(Color.html("#6a5c4e"), 0.97)
+	for bz in [-42.0, -38.5, -35.8, -31.5]:
+		var b := _add_sphere(zone, "ValleyWallRock", 1.0, Vector3(82.6, 0.35, bz), boulder_mat, Vector3(1.15, 0.7, 1.0), 7)
+		b.rotation = Vector3(0.12 * sin(bz), bz * 0.7, 0.1 * cos(bz))
+	# Scorched discs on the valley floor (the fire-attack ground —
+	# decoration only, no event logic).
+	var scorch_mat := _mat(Color.html("#241d16"), 1.0)
+	var sc1 := _add_cylinder(zone, "ValleyScorch", 1.8, 1.8, 0.03, Vector3(85, 0.045, -36.8), scorch_mat, Vector3.ZERO, 18)
+	sc1.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	var sc2 := _add_cylinder(zone, "ValleyScorch", 1.4, 1.4, 0.03, Vector3(84.5, 0.045, -40.5), scorch_mat, Vector3.ZERO, 18)
+	sc2.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	# Charred firewood piles (柴堆/焦木): leaning trunks beside the
+	# scorch discs — the 上方谷 fire-trap hint, terrain only.
+	var char_mat := _mat(Color.html("#1f1a14"), 1.0)
+	var firewood: Array = [Vector3(84.2, 0, -39.6), Vector3(85.2, 0, -41.0), Vector3(84.6, 0, -34.6)]
+	for i in range(firewood.size()):
+		var fp: Vector3 = firewood[i]
+		_add_cylinder(zone, "ValleyFirewood", 0.14, 0.22, 1.9, fp + Vector3(0, 0.9, 0), char_mat, Vector3(0.35 * sin(float(i) * 2.0), 0.0, 0.25 * cos(float(i) * 1.3)), 7)
+	# 上方谷 sign deep inside the gorge, clear of the 青龙 sign
+	# (77, 7.4, -37) and of the 葫芦谷 mouth sign.
+	_add_label3d(zone, "上方谷", Vector3(84.5, 6.6, -40.0), 52, Color(1.0, 0.82, 0.62))
+
+
+func _build_refiner_point() -> void:
+	# 炼化师 (TEARDOWN §2/§5: 左下 — sells synthesis materials 龙鳞/
+	# 凤羽/赤铜/玄铁 + forges set gear and hero-exclusive weapons).
+	# The stall geometry is stage-1; the synthesis system itself is
+	# stage-2 （炼化合成， done 2026-11-14): the smith registers in
+	# shop_defs below, so the market tap/click routing opens his panel.
+	# SITE (verified against the layout code, 2026-11-14): the south-
+	# west strip west of the training pen (x -84..-64, z 25..41) is free
+	# except one field tree at (-76, 34) and a gravel rubble at
+	# (-84.5, 31); the pen's west fence stands at x=-63.4 and the
+	# WestCliff foot at x=-86. The stall sits at (-70, 31.5), clear of
+	# the tree (7.2), the rubble (14.5) and the fence (6.6).
+	var zone := Node3D.new()
+	zone.name = "RefinerZone"
+	world_root.add_child(zone)
+	# Packed-earth stall floor.
+	var floor_mat := _mat(Color.html("#6d6244"), 1.0)
+	var floor := _add_cylinder(zone, "RefinerFloor", 3.5, 3.5, 0.03, Vector3(-70, 0.045, 31.5), floor_mat, Vector3.ZERO, 20)
+	floor.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	# Dirt approach track running south into the open field (the hero
+	# walks in from the south, clear of the pen's fences).
+	var path := _add_box(zone, "RefinerPath", Vector3(4.0, 0.04, 6.0), Vector3(-70, 0.020, 38.5), _mat(road_ribbon_color, 1.0))
+	path.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	# Forge furnace: stone body, dark mouth, chimney, warm glow.
+	var stone_mat := _mat(Color.html("#5d574e"), 0.95)
+	_add_cylinder(zone, "RefinerFurnace", 1.1, 1.3, 2.4, Vector3(-72, 1.2, 31.5), stone_mat, Vector3.ZERO, 14)
+	_add_box(zone, "RefinerFurnaceMouth", Vector3(0.25, 0.9, 0.9), Vector3(-70.9, 0.9, 31.5), _mat(Color.html("#140f0a"), 1.0))
+	_add_cylinder(zone, "RefinerChimney", 0.35, 0.42, 1.2, Vector3(-72, 3.0, 31.5), stone_mat, Vector3.ZERO, 10)
+	_add_omni_light(zone, "RefinerGlow", Vector3(-70.8, 1.6, 31.5), Color(1.0, 0.55, 0.22), 1.2, 8.0)
+	# Iron anvil on a stone block, east of the stall roof so it reads
+	# from the default camera (the first cut hid it under the roof,
+	# and the smith with it — both now stand clear of the roof edge).
+	var iron_mat := _mat(Color.html("#3a3a40"), 0.6, 0.6)
+	_add_box(zone, "RefinerAnvilBase", Vector3(0.7, 0.6, 0.7), Vector3(-65.8, 0.3, 29.3), stone_mat)
+	_add_box(zone, "RefinerAnvil", Vector3(1.0, 0.35, 0.45), Vector3(-65.8, 0.78, 29.3), iron_mat)
+	# Open roof on four posts over the work area.
+	var wood_mat := _mat(Color.html("#4a2f1d"), 0.9)
+	for px in [-72.5, -67.5]:
+		for pz in [28.8, 34.2]:
+			_add_cylinder(zone, "RefinerPost", 0.12, 0.12, 2.8, Vector3(px, 1.4, pz), wood_mat, Vector3.ZERO, 6)
+	_add_box(zone, "RefinerRoof", Vector3(5.6, 0.18, 6.2), Vector3(-70, 3.0, 31.5), _mat(Color.html("#7a4a30"), 0.9), Vector3(0.12, 0.0, 0.0))
+	# Material crate and barrel beside the stall, east of the track.
+	var crate := _place_model("res://assets/kaykit_hex/decoration/props/crate_A_small.gltf", zone, Vector3(-67.5, 0, 35.8), 0.5, 7.0)
+	if crate != null:
+		crate.name = "RefinerCrate"
+	var barrel := _place_model("res://assets/kaykit_hex/decoration/props/barrel.gltf", zone, Vector3(-68.6, 0, 35.6), 0.0, 6.0)
+	if barrel != null:
+		barrel.name = "RefinerBarrel"
+	# 炼化师, the smith (stage-2 quest giver / forger; stands clear of
+	# the stall roof, east of it by his anvil, facing east toward the
+	# training pen and the road — _spawn_static_npc faces east).
+	var refiner_npc := _spawn_static_npc(Vector3(-65.8, 0, 31.5), "general", Color(0.95, 0.88, 0.70), "炼化师")
+	# 炼化合成 (stage-2): the smith becomes the 7th shop entry; the
+	# existing _shop_index_at_screen / _try_open_shop_at routing then
+	# opens the refine panel on tap/click with no new input plumbing.
+	shop_defs.append({"name": "炼化师", "kind": "refine", "pos": Vector3(-70, 0, 31.5), "npc": refiner_npc})
+	# Point sign above the stall, clear of the 训练场 sign (-52, 5.2, 33).
+	_add_label3d(zone, "炼化师 · 合成打造", Vector3(-70, 6.4, 31.5), 64, Color(1.0, 0.88, 0.66))
+
+
+
+func _build_hunter_point() -> void:
+	# 猎人 (TEARDOWN §2/§5: 野外 — 野兽掉兽皮→猎人收购，普通 3000 /
+	# 优质 8000，开局重要资金来源；2D 坐标 (640,1760)，森林东缘南段）。
+	# Terrain, point and sign only — the hide-buying economy is stage 2.
+	# SITE (verified against the layout code, 2026-11-14): the forest's
+	# south-west edge (45,-29.5) — just south of the south tree line
+	# (47.5,-33.2), west of the forest path (x 56..62), ~6 clear of the
+	# north lane's south edge, clear of field tree (38,-32) by 7.4 and
+	# of the rubble at (56,-28) by 11; next to the 烧皮点, where the
+	# hides are scorched — the buyer's hut belongs by the burn site.
+	var zone := Node3D.new()
+	zone.name = "HunterZone"
+	world_root.add_child(zone)
+	# Packed-earth yard.
+	var floor_mat := _mat(Color.html("#6d6244"), 1.0)
+	var floor := _add_cylinder(zone, "HunterFloor", 3.0, 3.0, 0.03, Vector3(45, 0.045, -29.5), floor_mat, Vector3.ZERO, 20)
+	floor.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	# Dirt approach track running south to the north lane's edge.
+	var path := _add_box(zone, "HunterPath", Vector3(3.5, 0.04, 4.0), Vector3(45, 0.020, -25.5), _mat(road_ribbon_color, 1.0))
+	path.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	# The hut: a small kaykit house, muted tint, on the north end of
+	# the yard so the rack and hides read in the open front yard from
+	# the default camera.
+	var hut := _place_model("res://assets/kaykit_hex/buildings/red/building_home_A_red.gltf", zone, Vector3(44.5, 0, -31.0), 0.6, 2.0, Color(0.88, 0.82, 0.72))
+	if hut != null:
+		hut.name = "HunterHut"
+	# Drying rack: two posts, a crossbar, three hanging hides.
+	var wood_mat := _mat(Color.html("#4a2f1d"), 0.9)
+	for rx in [41.3, 43.1]:
+		_add_cylinder(zone, "HunterRackPost", 0.09, 0.09, 1.9, Vector3(rx, 0.95, -28.0), wood_mat, Vector3.ZERO, 6)
+	_add_box(zone, "HunterRackBar", Vector3(2.1, 0.12, 0.12), Vector3(42.2, 1.85, -28.0), wood_mat)
+	var hide_cols: Array = [Color.html("#a08050"), Color.html("#8a6a42"), Color.html("#b09868")]
+	for i in range(3):
+		var hc: Color = hide_cols[i]
+		_add_box(zone, "HunterHide", Vector3(0.55, 1.0, 0.06), Vector3(41.6 + float(i) * 0.6, 1.3, -28.0), _mat(hc, 1.0), Vector3(0.05 * sin(float(i) * 2.0), 0.0, 0.06 * cos(float(i) * 1.3)))
+	# Stacked hide pile in the yard.
+	var pile := _add_cylinder(zone, "HunterHidePile", 0.9, 1.0, 0.5, Vector3(47.8, 0.25, -28.2), _mat(Color.html("#96784a"), 1.0), Vector3.ZERO, 12)
+	pile.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	# Crate and barrel by the hut, east side.
+	var crate := _place_model("res://assets/kaykit_hex/decoration/props/crate_A_small.gltf", zone, Vector3(47.5, 0, -31.5), 0.5, 7.0)
+	if crate != null:
+		crate.name = "HunterCrate"
+	var barrel := _place_model("res://assets/kaykit_hex/decoration/props/barrel.gltf", zone, Vector3(46.6, 0, -31.3), 0.0, 6.0)
+	if barrel != null:
+		barrel.name = "HunterBarrel"
+	# Warm lantern by the hut door.
+	_add_omni_light(zone, "HunterLantern", Vector3(44.5, 2.2, -29.2), Color(1.0, 0.60, 0.24), 1.2, 6.0)
+	_add_lantern(zone, "LanternBodyHunter", Vector3(44.5, 2.2, -29.2), 0.5)
+	# 猎人, the hide buyer (stage-2 economy NPC; stands in the yard
+	# facing south toward the lane and the hero's approach).
+	var hunter := _spawn_static_npc(Vector3(44.5, 0, -28.6), "general", Color(0.85, 0.95, 0.70), "猎人")
+	hunter.rotation.y = PI # face south, toward the lane
+	# Point sign above the yard, clear of the 「森林」 zone sign
+	# (59,10,-28) and the 「烧皮点」 sign (51,6,-37).
+	_add_label3d(zone, "猎人 · 兽皮收购", Vector3(45, 6.2, -29.5), 64, Color(0.92, 1.0, 0.82))
+
+func _build_vegetation_and_rocks() -> void:
+	# Mobile performance round: trees live under one root and are
+	# recorded, so the quality tiers can thin them out (1/2, 1/4) on
+	# weak phones. Positions unchanged from the previous round.
+	vegetation_root = Node3D.new()
+	vegetation_root.name = "Vegetation"
+	world_root.add_child(vegetation_root)
+	var trunk_mat := _mat(Color.html("#3a2718"), 0.95)
+	var pine_mat := _mat(Color.html("#122e24"), 0.95)
+	var pine_mat2 := _mat(Color.html("#173d2b"), 0.95)
+	var tree_positions: Array = [
+		Vector3(-84, 0, -20), Vector3(-40, 0, -19), Vector3(-6, 0, -14), Vector3(44, 0, -14), Vector3(64, 0, -36),
+		Vector3(-84, 0, 20), Vector3(-30, 0, 19), Vector3(6, 0, 15), Vector3(46, 0, 14), Vector3(66, 0, 36),
+		Vector3(-20, 0, -20), Vector3(14, 0, -20), Vector3(58, 0, -8), Vector3(-14, 0, 20), Vector3(22, 0, 19),
+		Vector3(60, 0, 8), Vector3(-44, 0, -8), Vector3(80, 0, -12), Vector3(80, 0, 12), Vector3(-8, 0, -6),
+		Vector3(38, 0, 32), Vector3(38, 0, -32), Vector3(-24, 0, 36), Vector3(0, 0, 24), Vector3(0, 0, -24),
+		Vector3(-70, 0, 20), Vector3(84, 0, 0), Vector3(-36, 0, 8), Vector3(70, 0, -18), Vector3(70, 0, 18),
+		Vector3(-60, 0, -30), Vector3(-34, 0, -34), Vector3(-2, 0, -30), Vector3(30, 0, -34), Vector3(58, 0, -32),
+		Vector3(-84, 0, -32), Vector3(76, 0, -34), Vector3(-76, 0, 34), Vector3(-34, 0, 38), Vector3(4, 0, 34),
+		Vector3(30, 0, 38), Vector3(56, 0, 34), Vector3(78, 0, 30), Vector3(-8, 0, 40), Vector3(14, 0, -38),
+	]
+	for i in range(tree_positions.size()):
+		var pos: Vector3 = tree_positions[i]
+		var h := 1.0 + 0.18 * sin(float(i) * 2.7)
+		# VISUAL_AUDIT P1-5: dark-green local vegetation (was a near-white
+		# warm tint that read as snow/placeholder).
+		# 破损件清零 Rev 1: deepened again (0.42,0.58,0.40 still read
+		# pale mint in sun-facing views).
+		var tree_node := _place_model("res://assets/kenney_castle/tree-large.glb", vegetation_root, pos, float(i) * 0.7, 3.0 * h, field_tree_tint)
+		if tree_node != null:
+			vegetation_nodes.append(tree_node)
+
+func _build_selection_helpers() -> void:
+	# 单位可读性 Rev 2: the selection marker must be a signal no other
+	# unit carries — a gold-white double ring (Rev 1's single green
+	# ring read the same as the hero's own green team disc, Codex
+	# 首审 point 3). Container Node3D: outer gold ring + inner white
+	# ring; _process moves/pulses the container.
+	selection_ring = Node3D.new()
+	selection_ring.name = "SelectionRing"
+	var outer_mat := _mat(Color(1.0, 0.84, 0.30), 0.4, 0.0, Color(1.0, 0.78, 0.22), 1.8)
+	outer_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	outer_mat.albedo_color = Color(1.0, 0.84, 0.30, 0.95)
+	var outer := MeshInstance3D.new()
+	outer.name = "SelectionRingOuter"
+	var torus := TorusMesh.new()
+	torus.inner_radius = 1.04
+	torus.outer_radius = 1.42
+	torus.rings = 28
+	torus.ring_segments = 6
+	outer.mesh = torus
+	outer.rotation.x = PI / 2.0
+	outer.material_override = outer_mat
+	outer.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	selection_ring.add_child(outer)
+	var inner_mat := _mat(Color(1.0, 0.98, 0.90), 0.4, 0.0, Color(1.0, 0.96, 0.85), 1.6)
+	inner_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	inner_mat.albedo_color = Color(1.0, 0.98, 0.90, 0.9)
+	var inner := MeshInstance3D.new()
+	inner.name = "SelectionRingInner"
+	var torus_i := TorusMesh.new()
+	torus_i.inner_radius = 0.80
+	torus_i.outer_radius = 0.98
+	torus_i.rings = 28
+	torus_i.ring_segments = 6
+	inner.mesh = torus_i
+	inner.rotation.x = PI / 2.0
+	inner.position.y = 0.01
+	inner.material_override = inner_mat
+	inner.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	selection_ring.add_child(inner)
+	# Rev 3: a vertical beacon so the selected hero can be picked out
+	# at the full-field framing too — Codex 复审 found the flat double
+	# ring was swallowed by the hero's own green disc at dist ~100.
+	# Translucent gold pillar + a bobbing chevron above the head; no
+	# other unit carries anything vertical, so the signal is unique.
+	var pillar_mat := _mat(Color(1.0, 0.82, 0.30), 0.5, 0.0, Color(1.0, 0.75, 0.20), 1.5)
+	pillar_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	pillar_mat.albedo_color = Color(1.0, 0.82, 0.30, 0.32)
+	selection_pillar = MeshInstance3D.new()
+	selection_pillar.name = "SelectionPillar"
+	var pillar_mesh := CylinderMesh.new()
+	pillar_mesh.top_radius = 0.30
+	pillar_mesh.bottom_radius = 0.44
+	pillar_mesh.height = 3.4
+	pillar_mesh.radial_segments = 20
+	selection_pillar.mesh = pillar_mesh
+	selection_pillar.position = Vector3(0, 1.85, 0)
+	selection_pillar.material_override = pillar_mat
+	selection_pillar.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	selection_ring.add_child(selection_pillar)
+	var core_mat := _mat(Color(1.0, 0.93, 0.55), 0.4, 0.0, Color(1.0, 0.88, 0.40), 3.0)
+	core_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	core_mat.albedo_color.a = 0.95
+	var pillar_core := MeshInstance3D.new()
+	pillar_core.name = "SelectionPillarCore"
+	var core_mesh := CylinderMesh.new()
+	core_mesh.top_radius = 0.22
+	core_mesh.bottom_radius = 0.30
+	core_mesh.height = 4.45
+	core_mesh.radial_segments = 12
+	pillar_core.mesh = core_mesh
+	pillar_core.position = Vector3(0, 2.375, 0)
+	pillar_core.material_override = core_mat
+	pillar_core.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	selection_ring.add_child(pillar_core)
+	var chevron_mat := _mat(Color(1.0, 0.88, 0.38), 0.35, 0.0, Color(1.0, 0.80, 0.25), 2.2)
+	selection_chevron = MeshInstance3D.new()
+	selection_chevron.name = "SelectionChevron"
+	var chevron_mesh := CylinderMesh.new()
+	chevron_mesh.top_radius = 0.0
+	chevron_mesh.bottom_radius = 0.46
+	chevron_mesh.height = 0.66
+	chevron_mesh.radial_segments = 4
+	selection_chevron.mesh = chevron_mesh
+	selection_chevron.rotation.x = PI
+	selection_chevron.position = Vector3(0, 3.85, 0)
+	selection_chevron.material_override = chevron_mat
+	selection_chevron.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	selection_ring.add_child(selection_chevron)
+	var diamond_image := Image.create(128, 128, false, Image.FORMAT_RGBA8)
+	for py in range(128):
+		for px in range(128):
+			var d := (absf(px - 63.5) + absf(py - 63.5)) / 63.5
+			var diamond_color := Color(0, 0, 0, 0)
+			if d <= 0.44:
+				diamond_color = Color(1.0, 0.87, 0.32, 1.0)
+			elif d <= 0.58:
+				diamond_color = Color(0.14, 0.11, 0.04, 1.0)
+			elif d <= 0.74:
+				diamond_color = Color(1, 1, 1, lerpf(0.55, 0.0, (d - 0.58) / 0.16))
+			diamond_image.set_pixel(px, py, diamond_color)
+	var diamond_texture := ImageTexture.create_from_image(diamond_image)
+	var diamond_mat := StandardMaterial3D.new()
+	diamond_mat.albedo_texture = diamond_texture
+	diamond_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	diamond_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	diamond_mat.billboard_mode = BaseMaterial3D.BILLBOARD_ENABLED
+	diamond_mat.no_depth_test = false
+	var diamond_mesh := QuadMesh.new()
+	diamond_mesh.size = Vector2(3.8, 3.8)
+	selection_diamond = MeshInstance3D.new()
+	selection_diamond.name = "SelectionDiamond"
+	selection_diamond.mesh = diamond_mesh
+	selection_diamond.position = Vector3(0, 4.60, 0)
+	selection_diamond.material_override = diamond_mat
+	selection_diamond.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	selection_ring.add_child(selection_diamond)
+	selection_ring.position = Vector3(0, 0.18, 0)
+	selection_ring.visible = false
+	add_child(selection_ring)
+	var marker_mat := _mat(Color(1.0, 0.80, 0.30), 0.4, 0.0, Color(1.0, 0.72, 0.25), 1.8)
+	move_marker = MeshInstance3D.new()
+	move_marker.name = "MoveMarker"
+	var torus2 := TorusMesh.new()
+	torus2.inner_radius = 0.45
+	torus2.outer_radius = 0.60
+	torus2.rings = 20
+	torus2.ring_segments = 6
+	move_marker.mesh = torus2
+	move_marker.rotation.x = PI / 2.0
+	move_marker.material_override = marker_mat
+	move_marker.visible = false
+	add_child(move_marker)
+
+
+func _touch_ui_enabled() -> bool:
+	return _touch_ui
+
+
+# --- Mobile performance: quality tiers + FPS guard -----------------------
+# Tier 0 高：sun shadows + glow + all trees. Tier 1 中：no shadows, no
+# glow, every 2nd tree. Tier 2 低：no shadows, no glow, every 4th tree.
+# _perf_sample() runs from _process(); a manual set (button or
+# --quality=) disables the auto step-down for the session.
+func set_quality_tier(t: int, auto_drop: bool = false) -> void:
+	t = clampi(t, 0, 2)
+	quality_tier = t
+	if not auto_drop:
+		_quality_manual = true
+	if is_instance_valid(sun_light):
+		sun_light.shadow_enabled = (t == 0)
+	if env_ref != null:
+		env_ref.glow_enabled = (t == 0)
+		# Brightness compensation (2026-11-15, user Seeker report):
+		# with glow off the dusk scene measured ~38% darker in mean
+		# luminance (44.3 vs 71.6, probe_identity same view). Lower
+		# tiers buy the lost light back with tonemap exposure and
+		# ambient energy so dropping a tier changes sharpness and
+		# effects, not how dark the game looks.
+		env_ref.tonemap_exposure = [0.88, 1.42, 1.44][t]
+		env_ref.ambient_light_energy = [0.85, 1.16, 1.18][t]
+	# Internal render scale: the fragment cost is the mobile
+	# bottleneck; lower tiers render smaller and upscale.
+	if not auto_drop:
+		_dyn_scale = 0.0
+		_dyn_up_windows = 0
+	_apply_render_scale()
+	var keep := 1
+	if t == 1:
+		keep = 2
+	elif t == 2:
+		keep = 4
+	for i in range(vegetation_nodes.size()):
+		var n: Node3D = vegetation_nodes[i]
+		if is_instance_valid(n):
+			n.visible = (i % keep == 0)
+	_update_quality_button()
+	if auto_drop:
+		_update_ui("帧率偏低，已自动降为%s画质（画质按钮可手动改回）。" % PERF_TIER_NAMES[t])
+
+
+func _apply_render_scale() -> void:
+	var base: float = DYN_BASE[quality_tier]
+	var fl: float = DYN_FLOOR[quality_tier]
+	get_viewport().scaling_3d_scale = clampf(base + _dyn_scale, fl, base)
+
+
+func _update_quality_button() -> void:
+	if is_instance_valid(quality_button):
+		quality_button.text = "画质：%s" % PERF_TIER_NAMES[quality_tier]
+
+
+func _on_quality_button_pressed() -> void:
+	set_quality_tier((quality_tier + 1) % 3)
+	_update_ui("画质已设为%s（手动）。自动降档已关闭。" % PERF_TIER_NAMES[quality_tier])
+
+
+func _perf_sample(delta: float) -> void:
+	_perf_accum += delta
+	_perf_frames += 1
+	if _perf_accum < PERF_SAMPLE_WINDOW:
+		return
+	var avg := float(_perf_frames) / _perf_accum
+	_perf_fps_avg = avg
+	_perf_accum = 0.0
+	_perf_frames = 0
+	_perf_windows_seen += 1
+	if _perf_windows_seen <= 2:
+		return # warmup: load/spawn spikes in the first ~4s never drop a tier
+	if avg < DYN_DOWN_BELOW:
+		_dyn_up_windows = 0
+		var base2: float = DYN_BASE[quality_tier]
+		var fl2: float = DYN_FLOOR[quality_tier]
+		if base2 + _dyn_scale > fl2 + 0.001:
+			_dyn_scale = maxf(_dyn_scale - DYN_STEP, fl2 - base2)
+			_apply_render_scale()
+	elif avg > DYN_UP_ABOVE:
+		_dyn_up_windows += 1
+		if _dyn_up_windows >= 2:
+			_dyn_up_windows = 0
+			if _dyn_scale < 0.0:
+				_dyn_scale = minf(_dyn_scale + DYN_STEP, 0.0)
+				_apply_render_scale()
+	else:
+		_dyn_up_windows = 0
+	if avg < PERF_FPS_DROP_BELOW and quality_tier < 2 and not _quality_manual:
+		_perf_low_windows += 1
+		if _perf_low_windows >= PERF_DROP_WINDOWS:
+			_perf_low_windows = 0
+			set_quality_tier(quality_tier + 1, true)
+	else:
+		_perf_low_windows = 0
+
+
+func count_visible_vegetation() -> int:
+	var n := 0
+	for v in vegetation_nodes:
+		if is_instance_valid(v) and (v as Node3D).visible:
+			n += 1
+	return n
+
+
+# Safe-area insets (left, top, right, bottom) in logical px, from the OS
+# display safe area. Desktop/headless has no cutout and returns ZERO.
+# Test hook: `--safe-area=L,T,R,B` (screen px) simulates a notch /
+# gesture bar on desktop probes; never passed on a real device.
+func _compute_safe_insets() -> Vector4:
+	for arg in OS.get_cmdline_user_args():
+		if arg.begins_with("--safe-area="):
+			var parts := arg.trim_prefix("--safe-area=").split(",")
+			if parts.size() == 4:
+				var sc := _safe_area_scale()
+				return Vector4(float(parts[0]) * sc.x, float(parts[1]) * sc.y, float(parts[2]) * sc.x, float(parts[3]) * sc.y)
+	var safe := DisplayServer.get_display_safe_area()
+	var win := DisplayServer.window_get_size()
+	if win.x <= 0 or win.y <= 0 or safe.size.x <= 0 or safe.size.y <= 0:
+		return Vector4.ZERO
+	if safe.position == Vector2i.ZERO and safe.size == win:
+		return Vector4.ZERO
+	var sc := _safe_area_scale()
+	# A safe area is never negative: under Xvfb the display safe area
+	# is the whole X screen (1280x1024) while the game window is
+	# 1280x720, which would otherwise yield a -304 bottom inset and
+	# push the bottom bar + help label 304px off-screen (caught
+	# 2026-11-13 by the perf probe: bottom bar at y=960). Clamp each
+	# component at zero — a safe area larger than the window just
+	# means no inset.
+	var raw := Vector4(float(safe.position.x) * sc.x, float(safe.position.y) * sc.y, float(win.x - safe.end.x) * sc.x, float(win.y - safe.end.y) * sc.y)
+	return Vector4(maxf(raw.x, 0.0), maxf(raw.y, 0.0), maxf(raw.z, 0.0), maxf(raw.w, 0.0))
+
+
+func _safe_area_scale() -> Vector2:
+	var win := DisplayServer.window_get_size()
+	if win.x <= 0 or win.y <= 0:
+		return Vector2.ONE
+	var vp := get_viewport().get_visible_rect().size
+	return Vector2(vp.x / float(win.x), vp.y / float(win.y))
+
+
+# Re-positions the edge-anchored HUD widgets inside the safe area. Called
+# once after _build_ui() and on every window resize (fold / rotation).
+# MUST assign offsets, never `.position`: in Godot 4 `.position` is the
+# anchor-converted begin point, so re-assigning it after the widgets are
+# in the tree shifts CENTER_TOP / BOTTOM_* widgets by a whole parent
+# dimension (2026-11-13: message label went to x=-320, bottom bar to
+# y=-64, both off-screen). Offsets are anchor-relative and stable.
+func _apply_safe_area() -> void:
+	_safe_insets = _compute_safe_insets()
+	var vp := get_viewport().get_visible_rect().size
+	# 真实设备 inset 不会超过对应屏幕维度的一成，超过必是显示服务器单位混杂的假值。
+	# 2026-11-15 Xvfb 实测 533px 假右 inset 把小地图拖进横幅。
+	_safe_insets = Vector4(clampf(_safe_insets.x, 0.0, vp.x * 0.10), clampf(_safe_insets.y, 0.0, vp.y * 0.10), clampf(_safe_insets.z, 0.0, vp.x * 0.10), clampf(_safe_insets.w, 0.0, vp.y * 0.10))
+	if hud_panel != null:
+		hud_panel.offset_left = 16.0 + _safe_insets.x
+		hud_panel.offset_top = 14.0 + _safe_insets.y
+	if bottom_bar != null:
+		var bh := 64.0 if _touch_ui else 46.0
+		if _touch_ui:
+			# Touch layout (2026-11-14 归类整合): the bottom bar is a
+			# centred system strip (重开/视角/画质); combat actions live
+			# on the right, the joystick owns the lower-left.
+			bottom_bar.offset_left = -252.0
+			bottom_bar.offset_right = 252.0
+		else:
+			bottom_bar.offset_left = 16.0 + _safe_insets.x
+		bottom_bar.offset_top = -(bh + 18.0 + _safe_insets.w)
+	if inv_row != null:
+		var bh2 := 64.0 if _touch_ui else 46.0
+		var inv_h := 48.0 if _touch_ui else 40.0
+		if _touch_ui:
+			inv_row.offset_left = -270.0
+			inv_row.offset_right = 270.0
+		else:
+			inv_row.offset_left = 16.0 + _safe_insets.x
+		inv_row.offset_top = -(bh2 + 18.0 + inv_h + 8.0 + _safe_insets.w)
+	if _action_col != null:
+		_action_col.offset_left = -(20.0 + 220.0 + _safe_insets.z)
+		_action_col.offset_right = -(20.0 + _safe_insets.z)
+		_action_col.offset_bottom = -(64.0 + 18.0 + 14.0 + 118.0 + 10.0 + _safe_insets.w)
+		_action_col.offset_top = _action_col.offset_bottom - 140.0
+	if _minimap != null:
+		_minimap.offset_left = -(252.0 + 16.0 + _safe_insets.z)
+		_minimap.offset_top = 14.0 + _safe_insets.y
+		_minimap.offset_right = -(16.0 + _safe_insets.z)
+		_minimap.offset_bottom = 14.0 + 132.0 + _safe_insets.y
+	if _big_skill_button != null:
+		_big_skill_button.offset_left = -(118.0 + 20.0 + _safe_insets.z)
+		_big_skill_button.offset_top = -(118.0 + 64.0 + 18.0 + 14.0 + _safe_insets.w)
+		_big_skill_button.offset_right = -(20.0 + _safe_insets.z)
+		_big_skill_button.offset_bottom = -(64.0 + 18.0 + 14.0 + _safe_insets.w)
+		if _touch_ui and inv_row != null:
+			# Keep the 540px inventory row 12px clear of the right-anchored skill button.
+			inv_row.offset_right = minf(270.0, (vp.x + _big_skill_button.offset_left - 12.0) - vp.x * 0.5)
+			inv_row.offset_left = inv_row.offset_right - 540.0
+	if message_label != null:
+		message_label.offset_left = -320.0
+		message_label.offset_top = 16.0 + _safe_insets.y
+		message_label.offset_right = 320.0
+		if _touch_ui and _minimap != null:
+			message_label.offset_right = minf(message_label.offset_right, (vp.x + _minimap.offset_left - 12.0) - vp.x * 0.5)
+		message_label.offset_bottom = 50.0
+	if help_label != null:
+		help_label.offset_left = -900.0 - _safe_insets.z
+		help_label.offset_top = -34.0 - _safe_insets.w
+		help_label.offset_right = -16.0 - _safe_insets.z
+		help_label.offset_bottom = -10.0 - _safe_insets.w
+
+
+func _ui_panel_style(alpha: float = 0.94) -> StyleBoxFlat:
+	var style := StyleBoxFlat.new()
+	style.bg_color = Color(UI_INK.r, UI_INK.g, UI_INK.b, alpha)
+	style.border_color = UI_GOLD_DARK
+	style.set_border_width_all(2)
+	style.set_corner_radius_all(8)
+	style.content_margin_left = 12
+	style.content_margin_right = 12
+	style.content_margin_top = 10
+	style.content_margin_bottom = 10
+	return style
+
+
+func _ui_btn_style(bg: Color, border: Color, radius: int = 8) -> StyleBoxFlat:
+	var style := StyleBoxFlat.new()
+	style.bg_color = bg
+	style.border_color = border
+	style.set_border_width_all(2 if radius > 20 else 1)
+	style.set_corner_radius_all(radius)
+	return style
+
+
+func _ui_gold_btn_style() -> StyleBoxFlat:
+	var style := _ui_btn_style(UI_GOLD_DARK, UI_GOLD_HI, 10)
+	style.set_border_width_all(2)
+	return style
+
+
+func _ui_gold_btn_pressed_style() -> StyleBoxFlat:
+	var style := _ui_btn_style(UI_GOLD, UI_GOLD_HI, 10)
+	style.set_border_width_all(2)
+	return style
+
+
+func _style_button(b: Button, font_size: int = -1) -> void:
+	b.add_theme_stylebox_override("normal", _ui_btn_style(Color(UI_INK2.r, UI_INK2.g, UI_INK2.b, 0.95), UI_GOLD_DARK))
+	b.add_theme_stylebox_override("hover", _ui_btn_style(UI_INK2.lightened(0.12), UI_GOLD))
+	b.add_theme_stylebox_override("pressed", _ui_btn_style(Color(0.20, 0.16, 0.09, 0.98), UI_GOLD))
+	b.add_theme_stylebox_override("disabled", _ui_btn_style(Color(0.08, 0.07, 0.06, 0.9), Color(0.30, 0.26, 0.18)))
+	b.add_theme_color_override("font_color", UI_SILK)
+	b.add_theme_color_override("font_hover_color", UI_GOLD_HI)
+	b.add_theme_color_override("font_disabled_color", UI_SILK_DIM.darkened(0.25))
+	if font_size > 0:
+		b.add_theme_font_size_override("font_size", font_size)
+
+
+func _style_gold_button(b: Button) -> void:
+	_style_button(b)
+	b.add_theme_stylebox_override("normal", _ui_gold_btn_style())
+	b.add_theme_stylebox_override("pressed", _ui_gold_btn_pressed_style())
+	b.add_theme_stylebox_override("hover", _ui_gold_btn_style())
+	b.add_theme_color_override("font_color", Color(1, 0.97, 0.88))
+	b.add_theme_font_override("font", CJK_FONT_BOLD)
+
+
+func _build_ui() -> void:
+	var layer := CanvasLayer.new()
+	layer.name = "UI"
+	add_child(layer)
+	var root := Control.new()
+	root.set_anchors_preset(Control.PRESET_FULL_RECT)
+	root.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	layer.add_child(root)
+
+	var panel := PanelContainer.new()
+	hud_panel = panel
+	hud_panel.add_theme_stylebox_override("panel", _ui_panel_style(0.88))
+	panel.set_anchors_preset(Control.PRESET_TOP_LEFT)
+	panel.position = Vector2(16, 14)
+	# Touch UI: larger panel + type so the HUD stays readable at phone
+	# distance; desktop keeps the existing compact sizes.
+	panel.custom_minimum_size = Vector2(320, 140) if _touch_ui else Vector2(292, 118)
+	root.add_child(panel)
+	var vbox := VBoxContainer.new()
+	vbox.add_theme_constant_override("separation", 5)
+	panel.add_child(vbox)
+	var title := Label.new()
+	title.text = "守卫剑阁 · 纵横天下"
+	title.add_theme_font_size_override("font_size", 22 if _touch_ui else 19)
+	title.add_theme_color_override("font_color", UI_GOLD_HI)
+	title.add_theme_font_override("font", CJK_FONT_BOLD)
+	vbox.add_child(title)
+	var core_row := HBoxContainer.new()
+	core_row.add_theme_constant_override("separation", 6)
+	vbox.add_child(core_row)
+	core_row.add_child(_icon_rect(_ui_icon("core"), 22.0))
+	core_label = Label.new()
+	core_label.add_theme_font_size_override("font_size", 16 if _touch_ui else 15)
+	core_label.add_theme_color_override("font_color", UI_SILK)
+	core_row.add_child(core_label)
+	core_bar = ProgressBar.new()
+	core_bar.min_value = 0
+	core_bar.max_value = CORE_MAX_HP
+	core_bar.value = CORE_MAX_HP
+	core_bar.custom_minimum_size = Vector2(280, 20) if _touch_ui else Vector2(260, 16)
+	core_bar.show_percentage = false
+	var core_bg_style := StyleBoxFlat.new()
+	core_bg_style.bg_color = UI_INK2
+	core_bg_style.border_color = UI_GOLD_DARK
+	core_bg_style.set_border_width_all(1)
+	core_bg_style.set_corner_radius_all(4)
+	core_bar.add_theme_stylebox_override("background", core_bg_style)
+	core_bar_fill_style = StyleBoxFlat.new()
+	core_bar_fill_style.bg_color = UI_PURPLE
+	core_bar_fill_style.set_corner_radius_all(4)
+	core_bar.add_theme_stylebox_override("fill", core_bar_fill_style)
+	vbox.add_child(core_bar)
+	wave_label = Label.new()
+	wave_label.add_theme_font_size_override("font_size", 15 if _touch_ui else 14)
+	wave_label.add_theme_color_override("font_color", UI_SILK)
+	vbox.add_child(wave_label)
+	wave_preview_label = Label.new()
+	wave_preview_label.add_theme_font_size_override("font_size", 14 if _touch_ui else 13)
+	wave_preview_label.add_theme_color_override("font_color", Color(0.72, 0.82, 1.0))
+	wave_preview_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	wave_preview_label.custom_minimum_size = Vector2(260, 0)
+	wave_preview_label.visible = false
+	vbox.add_child(wave_preview_label)
+	var gold_row := HBoxContainer.new()
+	gold_row.add_theme_constant_override("separation", 6)
+	vbox.add_child(gold_row)
+	gold_row.add_child(_icon_rect(_ui_icon("coin"), 22.0))
+	gold_label = Label.new()
+	gold_label.add_theme_font_size_override("font_size", 16 if _touch_ui else 15)
+	gold_label.add_theme_color_override("font_color", UI_GOLD_HI)
+	gold_row.add_child(gold_label)
+	# Mobile performance round: live FPS + current tier, so a real-device
+	# test can report a number instead of a feeling.
+	fps_label = Label.new()
+	fps_label.add_theme_font_size_override("font_size", 14 if _touch_ui else 13)
+	fps_label.add_theme_color_override("font_color", UI_SILK_DIM)
+	vbox.add_child(fps_label)
+	var hero_row := HBoxContainer.new()
+	vbox.add_child(hero_row)
+	hero_emblem_label = Label.new()
+	hero_emblem_label.name = "HeroEmblem"
+	hero_emblem_label.custom_minimum_size = Vector2(52, 52)
+	hero_emblem_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	hero_emblem_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	hero_emblem_label.add_theme_font_size_override("font_size", 20)
+	hero_emblem_label.add_theme_font_override("font", CJK_FONT_BOLD)
+	hero_emblem_label.add_theme_color_override("font_color", UI_GOLD_HI)
+	hero_emblem_label.add_theme_stylebox_override("normal", _ui_btn_style(Color(0.25, 0.18, 0.05, 1.0), UI_GOLD, 26))
+	hero_emblem_label.text = "?"
+	hero_row.add_child(hero_emblem_label)
+	hero_emblem_portrait = TextureRect.new()
+	hero_emblem_portrait.name = "HeroEmblemPortrait"
+	hero_emblem_portrait.set_anchors_preset(Control.PRESET_FULL_RECT)
+	hero_emblem_portrait.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	hero_emblem_portrait.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_COVERED
+	hero_emblem_portrait.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	hero_emblem_portrait.visible = false
+	hero_emblem_label.add_child(hero_emblem_portrait)
+	var hero_stats := VBoxContainer.new()
+	hero_stats.add_theme_constant_override("separation", 2)
+	vbox.add_child(hero_stats)
+	var hs_line1 := HBoxContainer.new()
+	hs_line1.add_theme_constant_override("separation", 6)
+	hero_stats.add_child(hs_line1)
+	hero_name_label = Label.new()
+	hero_name_label.add_theme_font_size_override("font_size", 14 if _touch_ui else 13)
+	hero_name_label.add_theme_color_override("font_color", UI_SILK)
+	hs_line1.add_child(hero_name_label)
+	hs_line1.add_child(_icon_rect(_ui_icon("atk"), 18.0))
+	hero_atk_label = Label.new()
+	hero_atk_label.add_theme_font_size_override("font_size", 14 if _touch_ui else 13)
+	hero_atk_label.add_theme_color_override("font_color", UI_SILK)
+	hs_line1.add_child(hero_atk_label)
+	var hs_line2 := HBoxContainer.new()
+	hs_line2.add_theme_constant_override("separation", 6)
+	hero_stats.add_child(hs_line2)
+	hs_line2.add_child(_icon_rect(_ui_icon("hp"), 18.0))
+	hero_hp_label = Label.new()
+	hero_hp_label.add_theme_font_size_override("font_size", 14 if _touch_ui else 13)
+	hero_hp_label.add_theme_color_override("font_color", UI_SILK)
+	hs_line2.add_child(hero_hp_label)
+	hs_line2.add_child(_icon_rect(_ui_icon("xp"), 18.0))
+	hero_xp_label = Label.new()
+	hero_xp_label.add_theme_font_size_override("font_size", 14 if _touch_ui else 13)
+	hero_xp_label.add_theme_color_override("font_color", UI_SILK)
+	hs_line2.add_child(hero_xp_label)
+
+	message_label = Label.new()
+	message_label.clip_text = true
+	message_label.set_anchors_preset(Control.PRESET_CENTER_TOP)
+	message_label.position = Vector2(-320, 16)
+	message_label.size = Vector2(640, 34)
+	message_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	message_label.add_theme_font_size_override("font_size", 24 if _touch_ui else 21)
+	message_label.add_theme_font_override("font", CJK_FONT_BOLD)
+	message_label.add_theme_color_override("font_color", UI_GOLD_HI)
+	root.add_child(message_label)
+
+	var bottom := HBoxContainer.new()
+	bottom_bar = bottom
+	var btn_h := 64.0 if _touch_ui else 46.0
+	bottom.set_anchors_preset(Control.PRESET_BOTTOM_LEFT)
+	bottom.position = Vector2(16, -(btn_h + 18.0))
+	bottom.add_theme_constant_override("separation", 10)
+	root.add_child(bottom)
+	if _touch_ui:
+		# Touch layout: bottom bar becomes the centred system strip;
+		# combat actions （修复/下一波） move to a right-side column
+		# stacked over the big skill button; the bar's own skill button
+		# retires (the big round button replaces it).
+		bottom.set_anchors_preset(Control.PRESET_CENTER_BOTTOM)
+		_action_col = VBoxContainer.new()
+		_action_col.name = "ActionColumn"
+		_action_col.set_anchors_preset(Control.PRESET_BOTTOM_RIGHT)
+		_action_col.alignment = BoxContainer.ALIGNMENT_END
+		_action_col.add_theme_constant_override("separation", 8)
+		root.add_child(_action_col)
+	skill_button = Button.new()
+	_style_button(skill_button)
+	skill_button.focus_mode = Control.FOCUS_NONE
+	skill_button.text = "链式闪电"
+	skill_button.custom_minimum_size = Vector2(200, 64) if _touch_ui else Vector2(176, 46)
+	skill_button.add_theme_font_size_override("font_size", 19 if _touch_ui else 17)
+	skill_button.pressed.connect(_on_skill_button_pressed)
+	bottom.add_child(skill_button)
+	cooldown_label = Label.new()
+	cooldown_label.add_theme_font_size_override("font_size", 21 if _touch_ui else 19)
+	cooldown_label.add_theme_color_override("font_color", UI_XP_GOLD)
+	cooldown_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	cooldown_label.custom_minimum_size = Vector2(150, 64) if _touch_ui else Vector2(150, 46)
+	bottom.add_child(cooldown_label)
+	if _touch_ui:
+		skill_button.visible = false
+		cooldown_label.visible = false
+	var restart_button := Button.new()
+	_style_button(restart_button)
+	restart_button.focus_mode = Control.FOCUS_NONE
+	restart_button.text = "重开"
+	restart_button.custom_minimum_size = Vector2(104, 64) if _touch_ui else Vector2(92, 46)
+	restart_button.add_theme_font_size_override("font_size", 19 if _touch_ui else 17)
+	restart_button.pressed.connect(_on_restart_button_pressed)
+	_add_btn_icon(restart_button, _ui_icon("restart"), 24.0 if _touch_ui else 18.0)
+	bottom.add_child(restart_button)
+	var view_button := Button.new()
+	_style_button(view_button)
+	view_button.focus_mode = Control.FOCUS_NONE
+	view_button.text = "重置视角"
+	view_button.custom_minimum_size = Vector2(128, 64) if _touch_ui else Vector2(110, 46)
+	view_button.add_theme_font_size_override("font_size", 17 if _touch_ui else 15)
+	view_button.pressed.connect(reset_camera_view)
+	_add_btn_icon(view_button, _ui_icon("view"), 24.0 if _touch_ui else 18.0)
+	bottom.add_child(view_button)
+	var quest_button := Button.new()
+	_style_button(quest_button)
+	quest_button.focus_mode = Control.FOCUS_NONE
+	quest_button.text = "任务"
+	quest_button.custom_minimum_size = Vector2(104, 64) if _touch_ui else Vector2(92, 46)
+	quest_button.add_theme_font_size_override("font_size", 19 if _touch_ui else 17)
+	quest_button.pressed.connect(_open_quest_panel)
+	_add_btn_icon(quest_button, _ui_icon("quest"), 24.0 if _touch_ui else 18.0)
+	bottom.add_child(quest_button)
+	repair_button = Button.new()
+	_style_button(repair_button)
+	repair_button.focus_mode = Control.FOCUS_NONE
+	repair_button.text = "修复封印核（%d 金）" % REPAIR_COST
+	repair_button.custom_minimum_size = Vector2(220, 64) if _touch_ui else Vector2(196, 46)
+	repair_button.add_theme_font_size_override("font_size", 17 if _touch_ui else 15)
+	repair_button.pressed.connect(_on_repair_button_pressed)
+	_add_btn_icon(repair_button, _ui_icon("repair"), 24.0 if _touch_ui else 18.0)
+	(_action_col if _touch_ui else bottom).add_child(repair_button)
+	next_wave_button = Button.new()
+	_style_button(next_wave_button)
+	next_wave_button.focus_mode = Control.FOCUS_NONE
+	next_wave_button.text = "下一波"
+	next_wave_button.custom_minimum_size = Vector2(128, 64) if _touch_ui else Vector2(110, 46)
+	next_wave_button.add_theme_font_size_override("font_size", 19 if _touch_ui else 17)
+	next_wave_button.pressed.connect(_on_next_wave_pressed)
+	next_wave_button.visible = false
+	_add_btn_icon(next_wave_button, _ui_icon("nextwave"), 24.0 if _touch_ui else 18.0)
+	(_action_col if _touch_ui else bottom).add_child(next_wave_button)
+	# Mobile performance round: manual quality-tier cycle (高→中→低).
+	# Pressing it disables the auto step-down for the session.
+	quality_button = Button.new()
+	_style_button(quality_button)
+	quality_button.focus_mode = Control.FOCUS_NONE
+	quality_button.text = "画质：高"
+	quality_button.custom_minimum_size = Vector2(128, 64) if _touch_ui else Vector2(110, 46)
+	quality_button.add_theme_font_size_override("font_size", 19 if _touch_ui else 17)
+	quality_button.pressed.connect(_on_quality_button_pressed)
+	_add_btn_icon(quality_button, _ui_icon("quality"), 24.0 if _touch_ui else 18.0)
+	bottom.add_child(quality_button)
+	wallet_button_hud = Button.new()
+	wallet_button_hud.name = "WalletButtonHud"
+	_style_button(wallet_button_hud)
+	wallet_button_hud.focus_mode = Control.FOCUS_NONE
+	wallet_button_hud.text = "钱包"
+	wallet_button_hud.custom_minimum_size = Vector2(128, 64) if _touch_ui else Vector2(110, 46)
+	wallet_button_hud.add_theme_font_size_override("font_size", 19 if _touch_ui else 17)
+	wallet_button_hud.pressed.connect(_open_wallet_panel)
+	(_action_col if _touch_ui else bottom).add_child(wallet_button_hud)
+	# Inventory row (-0.4): the 6-slot bag (TEARDOWN §5). One button per
+	# slot above the bottom bar; tapping a consumable uses it, tapping
+	# worn gear reports its bonus. Empty slots show "空" and stay disabled.
+	var inv_h := 48.0 if _touch_ui else 40.0
+	inv_row = HBoxContainer.new()
+	inv_row.set_anchors_preset(Control.PRESET_BOTTOM_LEFT)
+	if _touch_ui:
+		inv_row.set_anchors_preset(Control.PRESET_CENTER_BOTTOM)
+	inv_row.position = Vector2(16, -(btn_h + 18.0 + inv_h + 8.0))
+	inv_row.add_theme_constant_override("separation", 6)
+	root.add_child(inv_row)
+	inv_buttons.clear()
+	for slot in range(SHOP_MAX_SLOTS):
+		var ib := Button.new()
+		_style_button(ib)
+		ib.focus_mode = Control.FOCUS_NONE
+		ib.text = "空"
+		ib.disabled = true
+		ib.custom_minimum_size = Vector2(84, 48) if _touch_ui else Vector2(72, 40)
+		ib.add_theme_font_size_override("font_size", 15 if _touch_ui else 13)
+		ib.pressed.connect(_on_inventory_button.bind(slot))
+		inv_row.add_child(ib)
+		inv_buttons.append(ib)
+
+	# Build-choice popup (intermission, after clicking an empty pad).
+	build_popup = PanelContainer.new()
+	build_popup.add_theme_stylebox_override("panel", _ui_panel_style(0.96))
+	build_popup.set_anchors_preset(Control.PRESET_CENTER)
+	build_popup.position = Vector2(-180, -300)
+	build_popup.custom_minimum_size = Vector2(360, 0)
+	build_popup.visible = false
+	root.add_child(build_popup)
+	var pv := VBoxContainer.new()
+	pv.add_theme_constant_override("separation", 8)
+	build_popup.add_child(pv)
+	var ptitle := Label.new()
+	ptitle.text = "建造防御塔"
+	ptitle.add_theme_font_size_override("font_size", 20 if _touch_ui else 18)
+	ptitle.add_theme_color_override("font_color", UI_GOLD_HI)
+	pv.add_child(ptitle)
+	for ttype in TOWER_TYPES_ORDER:
+		var tb := Button.new()
+		_style_button(tb)
+		tb.focus_mode = Control.FOCUS_NONE
+		tb.custom_minimum_size = Vector2(330, 52) if _touch_ui else Vector2(330, 42)
+		tb.add_theme_font_size_override("font_size", 17 if _touch_ui else 15)
+		tb.pressed.connect(_on_build_choice.bind(ttype))
+		_add_btn_icon(tb, _ui_icon("tower_" + ttype), 38.0 if _touch_ui else 30.0)
+		pv.add_child(tb)
+		build_type_buttons[ttype] = tb
+	var cancel_button := Button.new()
+	_style_button(cancel_button)
+	cancel_button.focus_mode = Control.FOCUS_NONE
+	cancel_button.text = "取消"
+	cancel_button.custom_minimum_size = Vector2(330, 48) if _touch_ui else Vector2(330, 36)
+	cancel_button.add_theme_font_size_override("font_size", 16 if _touch_ui else 14)
+	cancel_button.pressed.connect(_close_build_popup)
+	pv.add_child(cancel_button)
+	# Tower popup (stage-2): tapping a built pad shows its stats and the
+	# upgrade button (Lv3 max, the 2D upgrade ladder).
+	tower_popup = PanelContainer.new()
+	tower_popup.add_theme_stylebox_override("panel", _ui_panel_style(0.96))
+	tower_popup.set_anchors_preset(Control.PRESET_CENTER)
+	tower_popup.position = Vector2(-180, -140)
+	tower_popup.custom_minimum_size = Vector2(360, 0)
+	tower_popup.visible = false
+	root.add_child(tower_popup)
+	var tv := VBoxContainer.new()
+	tv.add_theme_constant_override("separation", 8)
+	tower_popup.add_child(tv)
+	tower_info_label = Label.new()
+	tower_info_label.add_theme_font_size_override("font_size", 18 if _touch_ui else 16)
+	tower_info_label.add_theme_color_override("font_color", UI_GOLD_HI)
+	tv.add_child(tower_info_label)
+	tower_upgrade_button = Button.new()
+	_style_button(tower_upgrade_button)
+	tower_upgrade_button.focus_mode = Control.FOCUS_NONE
+	tower_upgrade_button.custom_minimum_size = Vector2(330, 56) if _touch_ui else Vector2(330, 44)
+	tower_upgrade_button.add_theme_font_size_override("font_size", 18 if _touch_ui else 16)
+	tower_upgrade_button.pressed.connect(_on_tower_upgrade_pressed)
+	tv.add_child(tower_upgrade_button)
+	var tclose := Button.new()
+	_style_button(tclose)
+	tclose.focus_mode = Control.FOCUS_NONE
+	tclose.text = "关闭"
+	tclose.custom_minimum_size = Vector2(330, 48) if _touch_ui else Vector2(330, 36)
+	tclose.add_theme_font_size_override("font_size", 16 if _touch_ui else 14)
+	tclose.pressed.connect(_close_tower_popup)
+	tv.add_child(tclose)
+	# Shop panel (-0.4): same centered PanelContainer idiom as the build
+	# popup. Item buttons are rebuilt on every open/purchase so prices,
+	# gold and the 6-slot bag state stay truthful.
+	shop_panel = PanelContainer.new()
+	shop_panel.set_anchors_preset(Control.PRESET_CENTER)
+	shop_panel.position = Vector2(-210, -190)
+	shop_panel.custom_minimum_size = Vector2(420, 0)
+	shop_panel.visible = false
+	# Near-opaque backing: the default panel lets the 3D shop signs bleed
+	# through behind the list at phone distance.
+	var shop_frame := _ui_panel_frame_style()
+	var shop_bg: StyleBox = shop_frame if shop_frame != null else _ui_panel_style(0.97)
+	shop_panel.add_theme_stylebox_override("panel", shop_bg)
+	root.add_child(shop_panel)
+	var sv := VBoxContainer.new()
+	sv.add_theme_constant_override("separation", 8)
+	shop_panel.add_child(sv)
+	shop_title = Label.new()
+	shop_title.add_theme_font_size_override("font_size", 20 if _touch_ui else 18)
+	shop_title.add_theme_color_override("font_color", UI_GOLD_HI)
+	shop_title.add_theme_font_override("font", CJK_FONT_BOLD)
+	var shop_title_row := HBoxContainer.new()
+	var shop_title_sp := Control.new()
+	shop_title_sp.custom_minimum_size = Vector2(34, 0)
+	shop_title_sp.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	shop_title_row.add_child(shop_title_sp)
+	shop_title_row.add_child(shop_title)
+	sv.add_child(shop_title_row)
+	sv.add_child(_scroll_strip())
+	var shop_gold_row := HBoxContainer.new()
+	shop_gold_row.add_theme_constant_override("separation", 6)
+	sv.add_child(shop_gold_row)
+	shop_gold_row.add_child(_icon_rect(_ui_icon("coin"), 18.0))
+	shop_gold_label = Label.new()
+	shop_gold_label.add_theme_font_size_override("font_size", 16 if _touch_ui else 14)
+	shop_gold_label.add_theme_color_override("font_color", UI_GOLD_HI)
+	shop_gold_row.add_child(shop_gold_label)
+	shop_scroll = ScrollContainer.new()
+	shop_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	shop_scroll.custom_minimum_size = Vector2(436, 200)
+	sv.add_child(shop_scroll)
+	shop_items_box = VBoxContainer.new()
+	shop_items_box.add_theme_constant_override("separation", 6)
+	shop_items_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	shop_scroll.add_child(shop_items_box)
+	var shop_close := Button.new()
+	_style_button(shop_close)
+	shop_close.focus_mode = Control.FOCUS_NONE
+	shop_close.text = "关闭"
+	shop_close.custom_minimum_size = Vector2(390, 48) if _touch_ui else Vector2(390, 36)
+	shop_close.add_theme_font_size_override("font_size", 16 if _touch_ui else 14)
+	shop_close.pressed.connect(_close_shop_panel)
+	sv.add_child(shop_close)
+	# Quest log panel (stage 2): same centered idiom as the shop panel.
+	quest_panel = PanelContainer.new()
+	quest_panel.set_anchors_preset(Control.PRESET_CENTER)
+	quest_panel.custom_minimum_size = Vector2(540, 0)
+	quest_panel.visible = false
+	var quest_frame := _ui_panel_frame_style()
+	var qbg: StyleBox = quest_frame if quest_frame != null else _ui_panel_style(0.97)
+	quest_panel.add_theme_stylebox_override("panel", qbg)
+	root.add_child(quest_panel)
+	var qv := VBoxContainer.new()
+	qv.add_theme_constant_override("separation", 8)
+	quest_panel.add_child(qv)
+	var qtitle := Label.new()
+	qtitle.text = "任务"
+	qtitle.add_theme_font_size_override("font_size", 20 if _touch_ui else 18)
+	qtitle.add_theme_color_override("font_color", UI_GOLD_HI)
+	qtitle.add_theme_font_override("font", CJK_FONT_BOLD)
+	var quest_title_row := HBoxContainer.new()
+	var quest_title_sp := Control.new()
+	quest_title_sp.custom_minimum_size = Vector2(34, 0)
+	quest_title_sp.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	quest_title_row.add_child(quest_title_sp)
+	quest_title_row.add_child(qtitle)
+	qv.add_child(quest_title_row)
+	qv.add_child(_scroll_strip())
+	var qscroll := ScrollContainer.new()
+	qscroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	qscroll.custom_minimum_size = Vector2(540, 300)
+	qv.add_child(qscroll)
+	quest_box = VBoxContainer.new()
+	quest_box.add_theme_constant_override("separation", 6)
+	quest_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	qscroll.add_child(quest_box)
+	var qclose := Button.new()
+	_style_button(qclose)
+	qclose.focus_mode = Control.FOCUS_NONE
+	qclose.text = "关闭"
+	qclose.custom_minimum_size = Vector2(500, 48) if _touch_ui else Vector2(500, 36)
+	qclose.add_theme_font_size_override("font_size", 16 if _touch_ui else 14)
+	qclose.pressed.connect(_close_quest_panel)
+	qv.add_child(qclose)
+	wallet_panel = PanelContainer.new()
+	wallet_panel.name = "WalletPanel"
+	wallet_panel.set_anchors_preset(Control.PRESET_CENTER)
+	wallet_panel.custom_minimum_size = Vector2(540, 0)
+	wallet_panel.visible = false
+	var wallet_frame := _ui_panel_frame_style()
+	wallet_panel.add_theme_stylebox_override("panel", wallet_frame if wallet_frame != null else _ui_panel_style(0.97))
+	root.add_child(wallet_panel)
+	var wv := VBoxContainer.new()
+	wv.add_theme_constant_override("separation", 8)
+	wallet_panel.add_child(wv)
+	var wtitle := Label.new()
+	wtitle.text = "钱包"
+	wtitle.add_theme_font_size_override("font_size", 20 if _touch_ui else 18)
+	wtitle.add_theme_color_override("font_color", UI_GOLD_HI)
+	wtitle.add_theme_font_override("font", CJK_FONT_BOLD)
+	wv.add_child(wtitle)
+	wallet_status_label = Label.new()
+	wallet_status_label.name = "WalletStatus"
+	wallet_status_label.text = "游客模式 · 未连接钱包"
+	wallet_status_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	wallet_status_label.add_theme_font_size_override("font_size", 16 if _touch_ui else 15)
+	wallet_status_label.add_theme_color_override("font_color", Color(0.90, 0.88, 0.82))
+	wv.add_child(wallet_status_label)
+	wallet_connect_button = Button.new()
+	wallet_disconnect_button = Button.new()
+	wallet_sign_button = Button.new()
+	wallet_p0_button = Button.new()
+	var wallet_buttons := [wallet_connect_button, wallet_disconnect_button, wallet_sign_button, wallet_p0_button]
+	var wallet_texts := ["连接钱包", "断开", "签名测试消息", "转账 0.01 SOL（P0 冒烟）"]
+	for i in wallet_buttons.size():
+		var button: Button = wallet_buttons[i]
+		_style_button(button)
+		button.focus_mode = Control.FOCUS_NONE
+		button.text = wallet_texts[i]
+		button.custom_minimum_size = Vector2(500, 48) if _touch_ui else Vector2(500, 36)
+		wv.add_child(button)
+	wallet_connect_button.pressed.connect(_on_wallet_connect_pressed)
+	wallet_disconnect_button.pressed.connect(_on_wallet_disconnect_pressed)
+	wallet_sign_button.pressed.connect(_on_wallet_sign_pressed)
+	wallet_p0_button.pressed.connect(_on_wallet_p0_pressed)
+	wallet_fallback_label = Label.new()
+	wallet_fallback_label.name = "WalletFallback"
+	wallet_fallback_label.text = Wallet.ERR_MWA_UNAVAILABLE
+	wallet_fallback_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	wallet_fallback_label.add_theme_font_size_override("font_size", 15 if _touch_ui else 14)
+	wallet_fallback_label.add_theme_color_override("font_color", Color(0.75, 0.72, 0.62))
+	wv.add_child(wallet_fallback_label)
+	var address_row := HBoxContainer.new()
+	address_row.add_theme_constant_override("separation", 8)
+	wv.add_child(address_row)
+	wallet_address_edit = LineEdit.new()
+	wallet_address_edit.name = "WalletAddressEdit"
+	wallet_address_edit.placeholder_text = "输入公开地址（仅查询余额）"
+	wallet_address_edit.custom_minimum_size = Vector2(340, 48) if _touch_ui else Vector2(340, 36)
+	wallet_address_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	address_row.add_child(wallet_address_edit)
+	wallet_balance_button = Button.new()
+	_style_button(wallet_balance_button)
+	wallet_balance_button.focus_mode = Control.FOCUS_NONE
+	wallet_balance_button.text = "查询余额"
+	wallet_balance_button.custom_minimum_size = Vector2(140, 48) if _touch_ui else Vector2(140, 36)
+	wallet_balance_button.pressed.connect(_on_wallet_balance_pressed)
+	address_row.add_child(wallet_balance_button)
+	var wallet_close := Button.new()
+	_style_button(wallet_close)
+	wallet_close.focus_mode = Control.FOCUS_NONE
+	wallet_close.text = "关闭"
+	wallet_close.custom_minimum_size = Vector2(500, 48) if _touch_ui else Vector2(500, 36)
+	wallet_close.pressed.connect(_close_wallet_panel)
+	wv.add_child(wallet_close)
+	var help := Label.new()
+	help_label = help
+	help.set_anchors_preset(Control.PRESET_BOTTOM_RIGHT)
+	help.position = Vector2(-900, -34)
+	help.size = Vector2(884, 24)
+	help.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	help.add_theme_font_size_override("font_size", 15 if _touch_ui else 13)
+	help.add_theme_color_override("font_color", UI_SILK_DIM)
+	# Touch devices get the touch wording: there is no right mouse button
+	# on a phone. DisplayServer.is_touchscreen_available() is true on
+	# Android; desktop keeps the mouse wording.
+	if _touch_ui:
+		help.text = "左下摇杆移动英雄 · 拖动屏幕平移镜头（自由视角） · 右下大按钮放技能 · 右上小地图看战况 · 双指捏合缩放 · 点市集掌柜买装备 · 训练场在基地南侧"
+	else:
+		help.text = "右键单击下令移动 · 右键拖动/中键拖动平移视角 · 滚轮缩放 · 技能按钮释放英雄技能 · 点市集掌柜买装备 · 训练场在基地南侧"
+	root.add_child(help)
+	# Touch control revamp widgets (touch UI only): minimap top-right,
+	# big round skill button bottom-right, joystick overlay on top.
+	if _touch_ui:
+		_minimap = MinimapScript.new()
+		_minimap.name = "Minimap"
+		_minimap.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+		_minimap.custom_minimum_size = Vector2(252, 132)
+		_minimap.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		_minimap.set("game", self)
+		root.add_child(_minimap)
+		_big_skill_button = Button.new()
+		_big_skill_button.name = "BigSkillButton"
+		_big_skill_button.focus_mode = Control.FOCUS_NONE
+		_big_skill_button.text = "技能"
+		_big_skill_button.add_theme_font_size_override("font_size", 21)
+		_big_skill_button.add_theme_color_override("font_color", Color(0, 0, 0, 0))
+		_big_skill_button.add_theme_color_override("font_hover_color", Color(0, 0, 0, 0))
+		_big_skill_button.add_theme_color_override("font_pressed_color", Color(0, 0, 0, 0))
+		_big_skill_button.add_theme_color_override("font_disabled_color", Color(0, 0, 0, 0))
+		var sb := StyleBoxFlat.new()
+		sb.bg_color = Color(0.30, 0.14, 0.55, 0.92)
+		sb.set_corner_radius_all(59)
+		sb.border_color = UI_GOLD
+		sb.set_border_width_all(3)
+		_big_skill_button.add_theme_stylebox_override("normal", sb)
+		var sbp := sb.duplicate() as StyleBoxFlat
+		sbp.bg_color = Color(0.42, 0.22, 0.72, 0.95)
+		_big_skill_button.add_theme_stylebox_override("pressed", sbp)
+		_big_skill_button.set_anchors_preset(Control.PRESET_BOTTOM_RIGHT)
+		_big_skill_button.custom_minimum_size = Vector2(118, 118)
+		_big_skill_button.pressed.connect(_on_skill_button_pressed)
+		root.add_child(_big_skill_button)
+		_big_skill_cd_label = Label.new()
+		_big_skill_cd_label.set_anchors_preset(Control.PRESET_FULL_RECT)
+		_big_skill_cd_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		_big_skill_cd_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+		_big_skill_cd_label.add_theme_font_size_override("font_size", 36)
+		_big_skill_cd_label.add_theme_font_override("font", CJK_FONT_BOLD)
+		_big_skill_cd_label.add_theme_color_override("font_color", UI_GOLD_HI)
+		_big_skill_cd_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		_big_skill_cd_label.add_theme_color_override("font_shadow_color", Color(0, 0, 0, 0.9))
+		_big_skill_cd_label.add_theme_constant_override("shadow_offset_x", 2)
+		_big_skill_cd_label.add_theme_constant_override("shadow_offset_y", 2)
+		_big_skill_button.add_child(_big_skill_cd_label)
+		_big_skill_icon = TextureRect.new()
+		_big_skill_icon.name = "SkillIcon"
+		_big_skill_icon.anchor_left = 0.5
+		_big_skill_icon.anchor_right = 0.5
+		_big_skill_icon.offset_left = -37.0
+		_big_skill_icon.offset_right = 37.0
+		_big_skill_icon.offset_top = 6.0
+		_big_skill_icon.offset_bottom = 80.0
+		_big_skill_icon.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+		_big_skill_icon.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_COVERED
+		_big_skill_icon.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		_big_skill_icon.visible = false
+		_big_skill_button.add_child(_big_skill_icon)
+		_big_skill_name_label = Label.new()
+		_big_skill_name_label.name = "SkillName"
+		_big_skill_name_label.set_anchors_preset(Control.PRESET_BOTTOM_WIDE)
+		_big_skill_name_label.offset_top = -31.0
+		_big_skill_name_label.offset_bottom = -5.0
+		_big_skill_name_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		_big_skill_name_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+		_big_skill_name_label.add_theme_font_size_override("font_size", 15)
+		_big_skill_name_label.add_theme_font_override("font", CJK_FONT_BOLD)
+		_big_skill_name_label.add_theme_color_override("font_color", UI_SILK)
+		_big_skill_name_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		_big_skill_button.add_child(_big_skill_name_label)
+		_big_skill_button.move_child(_big_skill_cd_label, _big_skill_button.get_child_count() - 1)
+		_joy = JoystickScript.new()
+		_joy.name = "Joystick"
+		_joy.set_anchors_preset(Control.PRESET_FULL_RECT)
+		_joy.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		root.add_child(_joy)
+	_build_select_panel(root)
+
+
+# --- Hero select panel ----------------------------------------------------
+
+func _load_ui_icons() -> void:
+	ui_icon_textures.clear()
+	skill_icon_textures.clear()
+	var ui_names := ["coin", "hp", "atk", "armor", "speed", "xp", "pop", "core", "quest", "repair", "quality", "restart", "view", "nextwave", "ring", "book", "bow", "hoe", "axe", "swords", "tower_arrow", "tower_frost", "tower_thunder", "tower_stone", "tower_flame", "tower_crossbow", "potion", "stone_home", "stone_revive", "material", "gear", "token", "growth", "chip", "beast", "skull"]
+	for n in ui_names:
+		var p := "res://assets/icons/ic_%s.png" % n
+		ui_icon_textures[n] = load(p) if ResourceLoader.exists(p) else null
+	for h in HERO_ROSTER:
+		var sid := String(h.get("skill", ""))
+		if sid != "" and not skill_icon_textures.has(sid):
+			var p2 := "res://assets/icons/skill_%s.png" % sid
+			skill_icon_textures[sid] = load(p2) if ResourceLoader.exists(p2) else null
+
+
+func _ui_icon(icon_name: String) -> Texture2D:
+	return ui_icon_textures.get(icon_name, null) as Texture2D
+
+
+func _skill_icon(skill_id: String) -> Texture2D:
+	return skill_icon_textures.get(skill_id, null) as Texture2D
+
+
+func _icon_rect(tex: Texture2D, px: float) -> TextureRect:
+	var tr := TextureRect.new()
+	tr.texture = tex
+	tr.custom_minimum_size = Vector2(px, px)
+	tr.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	tr.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	tr.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	return tr
+
+
+func _add_btn_icon(b: Button, tex: Texture2D, px: float) -> void:
+	if tex == null:
+		return
+	if not b.has_theme_stylebox_override("normal"):
+		_style_button(b)
+	var tr := TextureRect.new()
+	tr.name = "BtnIcon"
+	tr.texture = tex
+	tr.set_anchors_preset(Control.PRESET_CENTER_LEFT)
+	tr.offset_left = 7.0
+	tr.offset_top = -px * 0.5
+	tr.offset_right = 7.0 + px
+	tr.offset_bottom = px * 0.5
+	tr.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	tr.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_COVERED
+	tr.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	b.add_child(tr)
+	for sn in ["normal", "hover", "pressed", "disabled"]:
+		var sb := b.get_theme_stylebox(sn) as StyleBoxFlat
+		if sb != null:
+			sb.content_margin_left = px + 15.0
+
+
+func _set_btn_icon(b: Button, tex: Texture2D, px: float) -> void:
+	if b == null:
+		return
+	var tr := b.get_node_or_null("BtnIcon") as TextureRect
+	if tex == null:
+		if tr != null:
+			tr.visible = false
+		return
+	if tr == null:
+		_add_btn_icon(b, tex, px)
+	else:
+		tr.texture = tex
+		tr.visible = true
+
+
+func _item_icon(item: Dictionary) -> Texture2D:
+	if item.has("growth"):
+		return _ui_icon("growth")
+	var kind := String(item.get("kind", ""))
+	if kind.begins_with("book"):
+		return _ui_icon("book")
+	match kind:
+		"weapon":
+			return _ui_icon("atk")
+		"armor":
+			return _ui_icon("armor")
+		"boots":
+			return _ui_icon("speed")
+		"trinket":
+			return _ui_icon("ring")
+		"potion_heal":
+			return _ui_icon("potion")
+		"stone_home":
+			return _ui_icon("stone_home")
+		"stone_revive":
+			return _ui_icon("stone_revive")
+		"material":
+			return _ui_icon("material")
+		"gear":
+			return _ui_icon("gear")
+		"quest":
+			return _ui_icon("token")
+	return _ui_icon("token")
+
+
+func _ui_panel_frame_style() -> StyleBoxTexture:
+	var tex := load("res://assets/icons/tex_panel_frame.png") as Texture2D
+	if tex == null:
+		return null
+	var sbt := StyleBoxTexture.new()
+	sbt.texture = tex
+	sbt.texture_margin_left = 110.0
+	sbt.texture_margin_right = 110.0
+	sbt.texture_margin_top = 110.0
+	sbt.texture_margin_bottom = 110.0
+	sbt.axis_stretch_horizontal = StyleBoxTexture.AXIS_STRETCH_MODE_TILE
+	sbt.axis_stretch_vertical = StyleBoxTexture.AXIS_STRETCH_MODE_TILE
+	sbt.content_margin_left = 26.0
+	sbt.content_margin_right = 26.0
+	sbt.content_margin_top = 22.0
+	sbt.content_margin_bottom = 18.0
+	return sbt
+
+
+func _scroll_strip() -> NinePatchRect:
+	var np := NinePatchRect.new()
+	var tex := load("res://assets/icons/tex_scroll_edge.png") as Texture2D
+	if tex == null:
+		np.visible = false
+		return np
+	np.texture = tex
+	np.patch_margin_left = 34
+	np.patch_margin_right = 34
+	np.custom_minimum_size = Vector2(0, 16)
+	np.modulate = Color(1, 1, 1, 0.9)
+	np.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	return np
+
+
+func _load_hero_portraits() -> void:
+	hero_portrait_textures.clear()
+	hero_portrait_circ_textures.clear()
+	for i in range(HERO_ROSTER.size()):
+		var sq_path := "res://assets/portraits/hero_%02d.jpg" % i
+		var circ_path := "res://assets/portraits/hero_%02d_circ.png" % i
+		hero_portrait_textures.append(load(sq_path) if ResourceLoader.exists(sq_path) else null)
+		hero_portrait_circ_textures.append(load(circ_path) if ResourceLoader.exists(circ_path) else null)
+
+
+func _build_select_panel(root: Control) -> void:
+	select_panel = PanelContainer.new()
+	var sel_frame := _ui_panel_frame_style()
+	select_panel.add_theme_stylebox_override("panel", sel_frame if sel_frame != null else _ui_panel_style(0.97))
+	select_panel.set_anchors_preset(Control.PRESET_CENTER)
+	select_panel.position = Vector2(-450, -360) if _touch_ui else Vector2(-430, -340)
+	select_panel.custom_minimum_size = Vector2(900, 720) if _touch_ui else Vector2(860, 680)
+	root.add_child(select_panel)
+	var sv := VBoxContainer.new()
+	sv.add_theme_constant_override("separation", 8)
+	select_panel.add_child(sv)
+	var stitle := Label.new()
+	stitle.text = "选择你的英雄"
+	stitle.add_theme_font_size_override("font_size", 26 if _touch_ui else 24)
+	stitle.add_theme_color_override("font_color", UI_GOLD_HI)
+	stitle.add_theme_font_override("font", CJK_FONT_BOLD)
+	stitle.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	sv.add_child(stitle)
+	var grid := GridContainer.new()
+	grid.columns = 6
+	grid.add_theme_constant_override("h_separation", 6)
+	grid.add_theme_constant_override("v_separation", 6)
+	sv.add_child(grid)
+	hero_buttons.clear()
+	for i in range(HERO_ROSTER.size()):
+		var b := Button.new()
+		_style_button(b)
+		b.focus_mode = Control.FOCUS_NONE
+		b.custom_minimum_size = Vector2(140, 110) if _touch_ui else Vector2(132, 102)
+		b.add_theme_font_size_override("font_size", 17 if _touch_ui else 15)
+		b.pressed.connect(_on_hero_button.bind(i))
+		grid.add_child(b)
+		var portrait := TextureRect.new()
+		portrait.name = "Portrait"
+		portrait.set_anchors_preset(Control.PRESET_FULL_RECT)
+		portrait.offset_left = 3.0
+		portrait.offset_top = 3.0
+		portrait.offset_right = -3.0
+		portrait.offset_bottom = -3.0
+		var name_strip := ColorRect.new()
+		name_strip.name = "NameStrip"
+		name_strip.anchor_top = 1.0
+		name_strip.anchor_bottom = 1.0
+		name_strip.anchor_right = 1.0
+		name_strip.offset_top = -31.0
+		name_strip.offset_bottom = -3.0
+		name_strip.offset_left = 3.0
+		name_strip.offset_right = -3.0
+		name_strip.color = Color(0.05, 0.04, 0.02, 0.62)
+		name_strip.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		portrait.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+		portrait.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_COVERED
+		portrait.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		if i < hero_portrait_textures.size() and hero_portrait_textures[i] != null:
+			portrait.texture = hero_portrait_textures[i]
+		b.add_child(portrait)
+		b.add_child(name_strip)
+		var name_label := Label.new()
+		name_label.name = "HeroName"
+		name_label.anchor_top = 1.0
+		name_label.anchor_bottom = 1.0
+		name_label.anchor_right = 1.0
+		name_label.offset_top = -30.0
+		name_label.offset_bottom = 0.0
+		name_label.offset_left = 0.0
+		name_label.offset_right = 0.0
+		name_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		name_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+		name_label.add_theme_font_size_override("font_size", 16 if _touch_ui else 15)
+		name_label.add_theme_font_override("font", CJK_FONT_BOLD)
+		name_label.add_theme_color_override("font_color", UI_SILK)
+		name_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		b.add_child(name_label)
+		# 0.1.69 UI二期留账#4: 选将卡属性行 (设计图卡片带攻/防小字, Lv1 数值)
+		var attr_strip := ColorRect.new()
+		attr_strip.name = "AttrStrip"
+		attr_strip.anchor_top = 1.0
+		attr_strip.anchor_bottom = 1.0
+		attr_strip.anchor_right = 1.0
+		attr_strip.offset_top = -52.0
+		attr_strip.offset_bottom = -32.0
+		attr_strip.offset_left = 3.0
+		attr_strip.offset_right = -3.0
+		attr_strip.color = Color(0.05, 0.04, 0.02, 0.55)
+		attr_strip.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		b.add_child(attr_strip)
+		var attr_label := Label.new()
+		attr_label.name = "HeroAttrs"
+		attr_label.anchor_top = 1.0
+		attr_label.anchor_bottom = 1.0
+		attr_label.anchor_right = 1.0
+		attr_label.offset_top = -51.0
+		attr_label.offset_bottom = -32.0
+		attr_label.offset_left = 0.0
+		attr_label.offset_right = 0.0
+		attr_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		attr_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+		attr_label.add_theme_font_size_override("font_size", 13 if _touch_ui else 12)
+		attr_label.add_theme_font_override("font", CJK_FONT_BOLD)
+		attr_label.add_theme_color_override("font_color", UI_SILK)
+		attr_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		var st_attr := hero_stats_at(i, 1)
+		attr_label.text = "攻 %d · 防 %.1f" % [int(float(st_attr["damage"])), float(st_attr["armor"])]
+		b.add_child(attr_label)
+		hero_buttons.append(b)
+	hero_detail_label = Label.new()
+	hero_detail_label.add_theme_font_size_override("font_size", 16 if _touch_ui else 15)
+	hero_detail_label.add_theme_color_override("font_color", UI_SILK)
+	hero_detail_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	hero_detail_label.custom_minimum_size = Vector2(860, 64) if _touch_ui else Vector2(820, 64)
+	sv.add_child(hero_detail_label)
+	var pw_row := HBoxContainer.new()
+	pw_row.add_theme_constant_override("separation", 8)
+	sv.add_child(pw_row)
+	var pw_hint := Label.new()
+	pw_hint.text = "隐藏英雄口令："
+	pw_hint.add_theme_font_size_override("font_size", 16 if _touch_ui else 14)
+	pw_hint.add_theme_color_override("font_color", UI_SILK)
+	pw_row.add_child(pw_hint)
+	pw_edit = LineEdit.new()
+	pw_edit.custom_minimum_size = Vector2(240, 48) if _touch_ui else Vector2(220, 36)
+	pw_edit.placeholder_text = "输入口令解锁隐藏英雄"
+	pw_row.add_child(pw_edit)
+	var unlock_button := Button.new()
+	_style_button(unlock_button)
+	unlock_button.focus_mode = Control.FOCUS_NONE
+	unlock_button.text = "解锁"
+	unlock_button.custom_minimum_size = Vector2(96, 48) if _touch_ui else Vector2(80, 36)
+	unlock_button.pressed.connect(_on_unlock_pressed)
+	pw_row.add_child(unlock_button)
+	start_button = Button.new()
+	_style_gold_button(start_button)
+	start_button.focus_mode = Control.FOCUS_NONE
+	start_button.text = "开始守城"
+	start_button.custom_minimum_size = Vector2(260, 60) if _touch_ui else Vector2(240, 48)
+	start_button.add_theme_font_size_override("font_size", 20 if _touch_ui else 18)
+	start_button.pressed.connect(_on_start_pressed)
+	var start_row := HBoxContainer.new()
+	start_row.add_theme_constant_override("separation", 8)
+	sv.add_child(start_row)
+	start_row.add_child(start_button)
+	wallet_button_select = Button.new()
+	wallet_button_select.name = "WalletButtonSelect"
+	_style_button(wallet_button_select)
+	wallet_button_select.focus_mode = Control.FOCUS_NONE
+	wallet_button_select.text = "钱包"
+	wallet_button_select.custom_minimum_size = Vector2(140, 60) if _touch_ui else Vector2(120, 48)
+	wallet_button_select.add_theme_font_size_override("font_size", 20 if _touch_ui else 18)
+	wallet_button_select.pressed.connect(_open_wallet_panel)
+	start_row.add_child(wallet_button_select)
+
+
+func _hero_detail_text(idx: int) -> String:
+	var h: Dictionary = HERO_ROSTER[idx]
+	var st := hero_stats_at(idx, 1)
+	var b: Array = h["birth"]
+	var g: Array = h["growth"]
+	var kit_note := "完整技能" if String(h["kit"]) == "full" else "通用技能件"
+	return "%s（%s · 主%s）力量 %d(+%.1f) 敏捷 %d(+%.1f) 智力 %d(+%.1f)\n气血 %d · 攻击 %d · 移速 %d · 技能：%s（%s）" % [
+		String(h["name"]), String(h["kind"]), String(h["attr"]).to_upper(),
+		int(b[0]), float(g[0]), int(b[1]), float(g[1]), int(b[2]), float(g[2]),
+		int(float(st["hp"])), int(float(st["damage"])), int(h["speed"]),
+		String(h["skill_name"]), kit_note]
+
+
+func _refresh_select_ui() -> void:
+	for i in range(hero_buttons.size()):
+		var b: Button = hero_buttons[i]
+		var h: Dictionary = HERO_ROSTER[i]
+		if hero_is_locked(i):
+			b.text = String(h["name"]) + "（锁）"
+			b.disabled = true
+			b.modulate = Color(0.45, 0.45, 0.48)
+		else:
+			b.text = String(h["name"])
+			b.disabled = false
+			b.modulate = Color.WHITE
+		_style_button(b)
+		if i == chosen_index:
+			var sel := _ui_btn_style(Color(0.28, 0.20, 0.06, 1.0), UI_GOLD_HI, 8)
+			sel.set_border_width_all(2)
+			b.add_theme_stylebox_override("normal", sel)
+			b.add_theme_color_override("font_color", UI_GOLD_HI)
+		var name_label := b.get_node_or_null("HeroName") as Label
+		if name_label != null:
+			name_label.text = String(h["name"]) + ("（锁）" if hero_is_locked(i) else "")
+			name_label.add_theme_color_override("font_color", UI_GOLD_HI if i == chosen_index else UI_SILK)
+			name_label.modulate = Color(2.2, 2.2, 2.2) if hero_is_locked(i) else Color.WHITE
+		var attr_label := b.get_node_or_null("HeroAttrs") as Label
+		if attr_label != null:
+			attr_label.modulate = Color(2.2, 2.2, 2.2) if hero_is_locked(i) else Color.WHITE
+		b.add_theme_color_override("font_color", Color(1, 1, 1, 0))
+		b.add_theme_color_override("font_hover_color", Color(1, 1, 1, 0))
+		b.add_theme_color_override("font_pressed_color", Color(1, 1, 1, 0))
+		b.add_theme_color_override("font_disabled_color", Color(1, 1, 1, 0))
+	if chosen_index >= 0 and chosen_index < HERO_ROSTER.size():
+		hero_detail_label.text = _hero_detail_text(chosen_index)
+		start_button.disabled = false
+	else:
+		hero_detail_label.text = "点击英雄查看属性与技能；带（锁）的是隐藏英雄，用口令解锁。"
+		start_button.disabled = true
+
+
+func _on_hero_button(idx: int) -> void:
+	if hero_is_locked(idx):
+		return
+	chosen_index = idx
+	_refresh_select_ui()
+
+
+func _on_unlock_pressed() -> void:
+	if pw_edit == null:
+		return
+	if try_unlock_hero(pw_edit.text):
+		_update_ui("口令正确，隐藏英雄已解锁！")
+		# The top message is hidden while the select panel is open, so
+		# mirror the feedback into the panel's detail line (set after
+		# try_unlock_hero, which refreshes the select UI on success).
+		hero_detail_label.text = "口令正确，隐藏英雄已解锁！"
+	else:
+		_update_ui("口令不对。")
+		hero_detail_label.text = "口令不对，请重试。"
+
+
+func _on_start_pressed() -> void:
+	if chosen_index >= 0:
+		select_hero(chosen_index)
+
+
+func _make_unit(archetype: String, team_name: String, unit_name: String, pos: Vector3, hp: float, speed: float, atk_range: float, damage: float, cooldown: float, visual_key: String = "", visual_tint: Color = Color.WHITE, visual_scale: float = -1.0) -> ArticulatedUnit:
+	var unit: ArticulatedUnit = UnitScript.new()
+	# Visual overrides must land BEFORE configure(): it builds the model.
+	# Only applied when a visual key is given, so plain archetype units
+	# keep their built-in MODEL_TINTS.
+	if visual_key != "":
+		unit.set("visual_key", visual_key)
+		unit.set("visual_tint", visual_tint)
+		unit.set("visual_tint_set", true)
+	if visual_scale > 0.0:
+		unit.set("visual_scale", visual_scale)
+	unit.configure(archetype, team_name, unit_name, hp, speed, atk_range, damage, cooldown)
+	unit.position = pos
+	unit.add_to_group("units")
+	units_root.add_child(unit)
+	# Rev 1 (光影丰富度): every unit carries its own contact shadow
+	# so heroes, guards, NPCs, enemies and bosses read as standing on
+	# the ground instead of floating over it.
+	var shadow_r := 0.78
+	if archetype == "boss":
+		shadow_r = 0.92 * maxf(visual_scale, 1.0) if visual_scale > 0.0 else 1.55
+	elif archetype == "beast":
+		shadow_r = 1.9
+	_attach_contact_shadow(unit, shadow_r)
+	return unit
+
+
+func reset_game() -> void:
+	_clear_units()
+	core_hp = CORE_MAX_HP
+	skill_cooldown = 0.0
+	last_chain_hit_count = 0
+	last_chain_feedback = ""
+	bounty_popups_spawned = 0
+	last_damage_events = 0
+	built_tower_damage_events = 0
+	core_flash = 0.0
+	elapsed = 0.0
+	selected = true
+	gold = START_GOLD
+	intermission_timer = 0.0
+	hero_inventory.clear()
+	crafted_count = 0
+	train_level = 0
+	brush_session = false
+	boss_session = false
+	train_boss = null
+	quest_state.clear()
+	saved_villagers = 0
+	escort_active = false
+	escort_pending = 0
+	hides_n = 0
+	hides_f = 0
+	letter_pending = false
+	general_level = 1
+	soul_timer = 0.0
+	assassin_timer = ASSASSIN_FIRST_DELAY
+	defeat_reason = ""
+	if is_instance_valid(kongming_unit):
+		_refresh_kongming_stats(true)
+	pending_quest_items.clear()
+	casino_chips = CASINO_CHIPS_PER_GAME
+	casino_pulls = 0
+	casino_last_roll = -1.0
+	casino_last_result = ""
+	casino_beast_name = ""
+	upkeep_timer = 0.0
+	finale_active = false
+	finale_done = false
+	yi_revive_timer = -1.0
+	yi_trapped = false
+	sima_yi = null
+	finale_hint_stage = 0
+	for f in finale_flames:
+		if is_instance_valid(f):
+			(f as Node).queue_free()
+	finale_flames.clear()
+	dot_effects.clear()
+	status_units.clear()
+	boss_zones.clear()
+	boss_pending.clear()
+	hero_bonus_damage = 0.0
+	hero_bonus_max_hp = 0.0
+	hero_bonus_str = 0.0
+	hero_bonus_agi = 0.0
+	hero_bonus_int = 0.0
+	hero_bonus_speed = 0.0
+	_close_build_popup()
+	_close_shop_panel()
+	_refresh_inventory_row()
+	if is_instance_valid(crystal_group):
+		crystal_group.visible = true
+		crystal_group.scale = Vector3.ONE
+	enter_hero_select()
+	_update_ui("选择你的英雄，守住封印核——二十波敌兵与名将之后，是三司马。")
+
+
+func _clear_units() -> void:
+	for e in enemies:
+		if is_instance_valid(e):
+			e.free()
+	enemies.clear()
+	trainees.clear()
+	for wd in wilds:
+		if is_instance_valid(wd):
+			wd.free()
+	wilds.clear()
+	for pt in wild_points:
+		pt["unit"] = null
+		# Respawn immediately on the next frames: a fresh run (and the
+		# boot-time reset) must start with the wilds already placed.
+		pt["timer"] = float(pt.get("respawn", 60.0))
+	for v in villagers:
+		if is_instance_valid(v):
+			v.free()
+	villagers.clear()
+	for mc in mercs:
+		if is_instance_valid(mc):
+			mc.free()
+	mercs.clear()
+	for sb in saints_active:
+		if is_instance_valid(sb):
+			(sb as Node).free()
+	saints_active.clear()
+	if is_instance_valid(mengda_unit):
+		mengda_unit.free()
+	mengda_unit = null
+	if is_instance_valid(strategist):
+		strategist.free()
+		strategist = null
+	if is_instance_valid(general):
+		general.free()
+		general = null
+	for p in projectiles:
+		if is_instance_valid(p.get("node")):
+			p["node"].free()
+	projectiles.clear()
+	for fx in effects:
+		if is_instance_valid(fx.get("node")):
+			fx["node"].free()
+	effects.clear()
+	# Remove built towers; the two fortress watchtowers stay.
+	for i in range(towers.size() - 1, -1, -1):
+		var t: Dictionary = towers[i]
+		if String(t.get("type", "arrow")) != "arrow":
+			if is_instance_valid(t.get("node")):
+				t["node"].free()
+			if is_instance_valid(t.get("shadow")):
+				t["shadow"].free()
+			towers.remove_at(i)
+	for p in pads:
+		p["tower"] = null
+	for t in towers:
+		t["cooldown"] = 0.35
+
+
+# --- Hero select / roster logic ------------------------------------------
+
+func hero_is_locked(idx: int) -> bool:
+	if idx < 0 or idx >= HERO_ROSTER.size():
+		return true
+	var pw := String(HERO_ROSTER[idx].get("pw", ""))
+	if pw == "":
+		return false
+	return not bool(unlocked_hidden.get(pw, false))
+
+
+func try_unlock_hero(pw: String) -> bool:
+	var clean := pw.strip_edges().to_lower()
+	if clean == "":
+		return false
+	for h in HERO_ROSTER:
+		if String(h.get("pw", "")) == clean:
+			unlocked_hidden[clean] = true
+			_refresh_select_ui()
+			return true
+	return false
+
+
+func hero_stats_at(idx: int, level: int) -> Dictionary:
+	var h: Dictionary = HERO_ROSTER[idx]
+	var b: Array = h["birth"]
+	var g: Array = h["growth"]
+	var lv := float(level - 1)
+	var strv := float(b[0]) + float(g[0]) * lv + hero_bonus_str
+	var agi := float(b[1]) + float(g[1]) * lv + hero_bonus_agi
+	var intv := float(b[2]) + float(g[2]) * lv + hero_bonus_int
+	var main_attr := strv
+	match String(h["attr"]):
+		"agi":
+			main_attr = agi
+		"int":
+			main_attr = intv
+	return {
+		"str": strv, "agi": agi, "int": intv, "main": main_attr,
+		# 0.1.52: HP/armor aligned to 2D heroStats (game/index.html): maxhp=420+str*22, armor=agi*0.22; level HP growth rides str growth only.
+		"hp": 420.0 + strv * 22.0 + hero_bonus_max_hp,
+		"armor": agi * 0.22,
+		"damage": 9.0 + main_attr * 0.85 + hero_bonus_damage,
+		"range": 12.0 if bool(h["ranged"]) else 2.9,
+		"speed": float(h["speed"]) * 0.016 + hero_bonus_speed,
+	}
+
+
+func xp_to_next(level: int) -> int:
+	return 50 + 45 * level
+
+
+func enter_hero_select() -> void:
+	_clear_units()
+	game_state = "select"
+	hero_index = -1
+	chosen_index = -1
+	hero_level = 1
+	hero_xp = 0
+	hero_was_alive = false
+	hero_respawn_timer = 0.0
+	current_wave = 1
+	spawn_queue.clear()
+	spawned_count = 0
+	wave_total = 0
+	bosses_spawned_names.clear()
+	if select_panel != null:
+		select_panel.visible = true
+	_refresh_select_ui()
+	_refresh_hud()
+
+
+func _spawn_hero_and_guard() -> void:
+	var h: Dictionary = HERO_ROSTER[hero_index]
+	var st := hero_stats_at(hero_index, hero_level)
+	strategist = _make_unit("strategist", "defender", String(h["name"]), HERO_HOME,
+		float(st["hp"]), float(st["speed"]), float(st["range"]), float(st["damage"]), 0.72,
+		String(h["visual"]), h["tint"])
+	strategist.set_meta("hero_index", hero_index)
+	hero_was_alive = true
+	hero_respawn_timer = 0.0
+	general = _make_unit("general", "defender", "枪将", GUARD_POS, 340.0, 4.4, 3.1, 17.0, 0.75)
+	general.set_meta("guard_post", GUARD_POS)
+
+
+func select_hero(idx: int) -> bool:
+	if idx < 0 or idx >= HERO_ROSTER.size():
+		return false
+	if game_state != "select":
+		return false
+	if hero_is_locked(idx):
+		return false
+	hero_index = idx
+	if select_panel != null:
+		select_panel.visible = false
+	_spawn_hero_and_guard()
+	_start_wave(1)
+	_update_ui("英雄「%s」参战！守住封印核，迎战第一波。" % String(HERO_ROSTER[idx]["name"]))
+	return true
+
+
+func hero_gain_xp(amount: int) -> void:
+	if hero_index < 0:
+		return
+	hero_xp += amount
+	while hero_xp >= xp_to_next(hero_level):
+		hero_xp -= xp_to_next(hero_level)
+		hero_level += 1
+		_apply_hero_level_stats()
+	_refresh_hud()
+
+
+func _apply_hero_level_stats() -> void:
+	if not is_instance_valid(strategist) or not strategist.alive:
+		return
+	var st := hero_stats_at(hero_index, hero_level)
+	var ratio := strategist.hp / maxf(strategist.max_hp, 1.0)
+	strategist.max_hp = float(st["hp"])
+	strategist.hp = clampf(strategist.max_hp * ratio + 60.0, 1.0, strategist.max_hp)
+	# -0.4 fix: ArticulatedUnit has no `damage` field (combat reads
+	# attack_damage) — the old assignment errored and silently dropped
+	# every level-up damage gain. Item bonuses ride hero_stats_at, so
+	# they survive level-ups through this same path.
+	strategist.attack_damage = float(st["damage"])
+	strategist.move_speed = float(st["speed"])
+	_refresh_hud()
+
+
+func _respawn_hero() -> void:
+	if hero_index < 0:
+		return
+	var h: Dictionary = HERO_ROSTER[hero_index]
+	var st := hero_stats_at(hero_index, hero_level)
+	strategist = _make_unit("strategist", "defender", String(h["name"]), HERO_HOME,
+		float(st["hp"]), float(st["speed"]), float(st["range"]), float(st["damage"]), 0.72,
+		String(h["visual"]), h["tint"])
+	strategist.set_meta("hero_index", hero_index)
+	selected = true
+	hero_was_alive = true
+	_update_ui("英雄「%s」已在主城复活，继续战斗！" % String(h["name"]))
+
+
+func alive_enemy_count() -> int:
+	var n := 0
+	for e in enemies:
+		if is_instance_valid(e) and e.alive:
+			n += 1
+	return n
+
+
+func alive_enemies() -> Array:
+	var out: Array = []
+	for e in enemies:
+		if is_instance_valid(e) and e.alive:
+			out.append(e)
+	return out
+
+
+# Skill targeting pool: wave enemies plus training-pen units, so hero
+# skills land inside the training rooms too. Wave logic, towers and
+# wave-clear keep using alive_enemies()/alive_enemy_count() only.
+# Hidden assassins are excluded here (2D: invisible units are skipped
+# by targeting unless the attacker has detection) — every _nearest_enemy
+# caller (towers, hero skills, chain lightning) inherits the rule.
+func combat_targets() -> Array:
+	var out: Array = []
+	for e in alive_enemies():
+		if _enemy_targetable(e):
+			out.append(e)
+	for t in trainees:
+		if is_instance_valid(t) and t.alive:
+			out.append(t)
+	for wd in wilds:
+		if is_instance_valid(wd) and wd.alive:
+			out.append(wd)
+	return out
+
+
+func _build_wave_queue(wave: int) -> Array:
+	# Stage-1: formula-driven compositions for all 20 waves; boss tokens
+	# ("boss") are interleaved at 45%/57%/69% of the queue so pressure
+	# arrives spread through the wave instead of in a clump at the end.
+	var q: Array = []
+	var n_inf := 12 + 2 * (wave - 1)
+	for i in range(n_inf):
+		q.append("infantry")
+		if wave >= 3 and i % 3 == 2:
+			q.append("archer")
+	if wave >= 4:
+		# Calibration G3: cavalry (2D qibing — from wave 4, ~22% of the
+		# foot stream, fastest regular foe). Convert every 5th infantry
+		# slot (20%), spread through the queue.
+		var cav_seen := 0
+		for ci in range(q.size()):
+			if String(q[ci]) == "infantry":
+				cav_seen += 1
+				if cav_seen % 5 == 0:
+					q[ci] = "cavalry"
+	var n_arch := mini(2 * maxi(wave - 2, 0), 16)
+	while q.count("archer") < n_arch:
+		q.append("archer")
+	if wave >= 4:
+		var n_beast := 1 + (1 if wave >= 10 else 0) + (1 if wave >= 16 else 0)
+		for i in range(n_beast):
+			var pos := int(q.size() * (0.45 + 0.12 * float(i)))
+			q.insert(clampi(pos, 0, q.size()), "beast")
+	var n_boss := bosses_for_wave(wave).size()
+	for i in range(n_boss):
+		var pos := int(q.size() * (0.45 + 0.12 * float(i)))
+		q.insert(clampi(pos, 0, q.size()), "boss")
+	return q
+
+
+func wave_composition(wave: int) -> Dictionary:
+	var counts := {"infantry": 0, "archer": 0, "cavalry": 0, "beast": 0, "boss": 0}
+	for kind in _build_wave_queue(wave):
+		var k := String(kind)
+		counts[k] = int(counts.get(k, 0)) + 1
+	return counts
+
+
+func wave_preview_text(wave: int) -> String:
+	var counts := wave_composition(wave)
+	var parts: Array = []
+	if int(counts["infantry"]) > 0:
+		parts.append("蓝甲兵 ×%d" % int(counts["infantry"]))
+	if int(counts.get("cavalry", 0)) > 0:
+		parts.append("骑兵 ×%d" % int(counts["cavalry"]))
+	if int(counts["archer"]) > 0:
+		parts.append("弓兵 ×%d" % int(counts["archer"]))
+	if int(counts["beast"]) > 0:
+		parts.append("攻城巨兽 ×%d" % int(counts["beast"]))
+	if int(counts.get("boss", 0)) > 0:
+		var names: Array = []
+		for b in bosses_for_wave(wave):
+			names.append(String(b["name"]))
+		parts.append("将领：" + "、".join(names))
+	return " · ".join(parts)
+
+
+func _start_wave(wave: int) -> void:
+	current_wave = wave
+	spawn_queue = _build_wave_queue(wave)
+	wave_total = spawn_queue.size()
+	spawn_interval = wave_spawn_interval(wave)
+	spawned_count = 0
+	spawn_timer = 0.6
+	current_boss_list = bosses_for_wave(wave)
+	boss_spawn_index = 0
+	game_state = "battle"
+	_close_build_popup()
+	_update_ui("第 %d 波敌兵来袭！" % wave)
+	if wave == MAX_WAVES:
+		finale_active = true
+		finale_done = false
+		sima_state = {"司马昭": "pending", "司马师": "pending", "司马懿": "pending"}
+		finale_hint_stage = 0
+		finale_hint_timer = 1.2
+		if qstate("shangfanggu") == "no":
+			qset("shangfanggu", "on")
+	if wave % 5 == 0:
+		spawn_escort_event()
+
+
+func _enter_intermission() -> void:
+	if current_wave >= MAX_WAVES:
+		game_state = "victory"
+		_update_ui("胜利！二十波敌兵与三司马全部击退，封印核守住了。")
+		return
+	game_state = "intermission"
+	intermission_timer = INTERMISSION_TIME
+	_update_ui("第 %d 波已击退！休整期间点空基座建塔、修复封印核，或点「下一波」提前开战。" % current_wave)
+
+
+func _spawn_from_queue() -> void:
+	if spawn_queue.is_empty():
+		return
+	var kind: String = String(spawn_queue.pop_front())
+	_spawn_enemy_of_type(kind)
+
+
+func _spawn_enemy() -> void:
+	_spawn_enemy_of_type("infantry")
+
+
+func _make_beast(pos: Vector3, hp_scale: float = 1.0) -> ArticulatedUnit:
+	var beast: ArticulatedUnit = BeastScript.new()
+	beast.set_meta("lane", spawned_count % 2)
+	var lane_path: Array = LANE_SOUTH if spawned_count % 2 == 1 else LANE_NORTH
+	beast.set_meta("lane_path", lane_path)
+	beast.set_meta("wp_index", 1)
+	beast.configure("beast", "enemy", "攻城巨兽", 780.0 * hp_scale, 1.35, 4.4, 30.0, 1.4)
+	beast.position = pos
+	beast.add_to_group("units")
+	units_root.add_child(beast)
+	_attach_contact_shadow(beast, 1.9)
+	return beast
+
+
+func _spawn_enemy_of_type(kind: String) -> ArticulatedUnit:
+	# Two lanes: the north and south rifts alternate so both roads carry
+	# pressure; units walk the lane waypoints to the core (see _think).
+	var lane_offsets: Array = [-2.2, -0.8, 0.8, 2.3, -1.5, 1.5, 0.0, -2.8, 2.8, -0.4, 0.4, -1.9, 1.9, 0.0]
+	var lane: float = lane_offsets[spawned_count % lane_offsets.size()]
+	var lane_idx := spawned_count % 2
+	var lane_path: Array = LANE_SOUTH if lane_idx == 1 else LANE_NORTH
+	var spawn_pos: Vector3 = lane_path[0] + Vector3(_rng.randf_range(-0.5, 0.5), 0, lane)
+	var hp_scale := wave_hp_scale(current_wave)
+	var atk_scale := wave_atk_scale(current_wave)
+	var enemy: ArticulatedUnit
+	match kind:
+		"boss":
+			enemy = _spawn_boss(lane_idx, lane_path, spawn_pos)
+		"archer":
+			enemy = _make_unit("archer", "enemy", "弓兵", spawn_pos, 44.0 * hp_scale, 2.3, 13.0, 11.0 * atk_scale, 1.6)
+		"beast":
+			enemy = _make_beast(spawn_pos + Vector3(0, 0, lane * 0.3 - lane * 0.3), wave_beast_scale(current_wave))
+			enemy.attack_damage = 30.0 * atk_scale
+		"cavalry":
+			# 2D qibing ratios vs bubing: hp x1.53, spd x1.57 (fastest
+			# regular foe; assassin 5.0 still tops it), atk x1.43, scale 1.15.
+			enemy = _make_unit("cavalry", "enemy", "骑兵", spawn_pos, 100.0 * hp_scale, 4.3, 2.05, 10.0 * atk_scale, 0.85, "enemy", Color(0.55, 0.38, 0.45), 1.15)
+		_:
+			enemy = _make_unit("enemy", "enemy", "蓝甲兵", spawn_pos, 66.0 * hp_scale, 2.72 + _rng.randf_range(-0.15, 0.25), 2.05, 7.0 * atk_scale, 0.85)
+	enemy.set_meta("lane_z", lane)
+	enemy.set_meta("lane", lane_idx)
+	enemy.set_meta("lane_path", lane_path)
+	enemy.set_meta("wp_index", 1)
+	enemies.append(enemy)
+	spawned_count += 1
+	return enemy
+
+
+func _spawn_boss(lane_idx: int, lane_path: Array, spawn_pos: Vector3) -> ArticulatedUnit:
+	var spec: Dictionary = current_boss_list[boss_spawn_index] if boss_spawn_index < current_boss_list.size() else {"name": "敌将", "visual": "general", "tint": Color(0.85, 0.85, 0.9), "mul": 1.0, "ranged": false}
+	boss_spawn_index += 1
+	var mul := float(spec.get("mul", 1.0))
+	# Calibration G2: composite HP curve — the linear base keeps the
+	# early game, then x1.10 per wave past wave 10 bends it toward the
+	# 2D exponential (1.32^(w-1)) without importing its absolute scale.
+	var hp := 380.0 * (1.0 + 0.32 * float(current_wave - 1)) * pow(1.10, float(maxi(current_wave - 10, 0))) * mul
+	var dmg := 14.0 + 2.2 * float(current_wave)
+	var is_ranged := bool(spec.get("ranged", false))
+	var boss := _make_unit("boss", "enemy", String(spec["name"]), spawn_pos, hp,
+		2.55 if is_ranged else 2.9, 12.0 if is_ranged else 3.4, dmg, 1.0,
+		String(spec["visual"]), spec["tint"], clampf(mul, 1.3, 1.9))
+	boss.set_meta("bounty", 120 + 30 * current_wave)
+	boss.set_meta("xp", 120 + 10 * current_wave)
+	boss.set_meta("is_boss", true)
+	# Boss signature skills (stage 2): attach the 2D skill list + special.
+	var bsk_spec: Dictionary = BOSS_SKILLS.get(String(spec["name"]), {})
+	if not bsk_spec.is_empty():
+		boss.set_meta("boss_skills", bsk_spec.get("skills", []))
+		if bsk_spec.has("special"):
+			boss.set_meta("boss_special", String(bsk_spec["special"]))
+		boss.set_meta("bsk_next_cast", elapsed + 2.0)
+		if (bsk_spec.get("skills", []) as Array).has("白马阵"):
+			boss.move_speed *= 1.2 # 白马阵 aura lands on the boss itself in 3D
+	# 单位可读性 Rev 1: bosses carried no name label at all — the
+	# repositioning code below looked up a "NameLabel" node that was
+	# never created, so a boss read as just a bigger minion. Create
+	# the label the rest of this function already expects.
+	# Rev 2: smaller type (72 -> 56) and a clearer gap above the HP
+	# bar — Rev 1's label sat on the bar and crowded the flag glyphs.
+	var boss_k := clampf(mul, 1.3, 1.9)
+	# Rev 3: Label3D hangs its glyphs BELOW the node origin (top
+	# anchor), so the label origin must clear bar top (3.1k + 0.24)
+	# plus the full glyph height (56pt x 0.02 = 1.12) plus a gap that
+	# scales with the boss (0.5k) — a screen-space proportion, not a
+	# fixed world offset (Rev 2's gap collapsed into the glyphs).
+	var boss_label := _add_label3d(boss, String(spec["name"]), Vector3(0, 3.6 * boss_k + 1.36, 0), 56, Color(1.0, 0.80, 0.45))
+	boss_label.name = "NameLabel"
+	bosses_spawned_names.append(String(spec["name"]))
+	# Bosses tower over their model: lift the HP bar above the scaled head
+	# and float the name label higher still.
+	var bar := boss.get_node_or_null("HpBar")
+	if bar != null:
+		bar.position.y = 3.1 * boss_k
+	var nl := boss.get_node_or_null("NameLabel")
+	if nl != null:
+		nl.position.y = 3.6 * boss_k + 1.36
+	if finale_active and sima_state.has(String(spec["name"])):
+		sima_state[String(spec["name"])] = "alive"
+		if String(spec["name"]) == "司马懿":
+			sima_yi = boss
+			boss.set_meta("finale_yi", true)
+	return boss
+
+
+func spawn_training_soldier() -> ArticulatedUnit:
+	var pos: Vector3 = TRAIN_SPAWN_POINTS[train_spawn_cursor % TRAIN_SPAWN_POINTS.size()]
+	train_spawn_cursor += 1
+	var t := _make_unit("trainee", "enemy", "训练兵", pos, 60.0 + 6.0 * float(current_wave),
+		2.6, 2.6, 6.0, 0.9, "enemy", Color(0.92, 0.86, 0.55))
+	t.set_meta("bounty", 10)
+	t.set_meta("xp", 6)
+	t.set_meta("is_trainee", true)
+	trainees.append(t)
+	return t
+
+
+func bounty_for(archetype: String) -> int:
+	var base := INFANTRY_BOUNTY
+	match archetype:
+		"archer":
+			base = ARCHER_BOUNTY
+		"cavalry":
+			base = CAVALRY_BOUNTY
+		"beast":
+			base = BEAST_BOUNTY
+		"boss":
+			return 120
+		"trainee":
+			return 4
+	# Calibration G4: foe bounties grow with the wave (2D x(1+0.1w);
+	# 3D takes 0.08/wave with wave 1 at the table value).
+	return int(round(float(base) * (1.0 + 0.08 * float(maxi(current_wave - 1, 0)))))
+
+
+func xp_for(target: ArticulatedUnit) -> int:
+	if target.has_meta("xp"):
+		return int(target.get_meta("xp"))
+	var xp_base := 6
+	match target.archetype:
+		"beast":
+			xp_base = 40
+		"archer":
+			xp_base = 8
+		"cavalry":
+			xp_base = 8
+		"enemy":
+			xp_base = 6
+		_:
+			return xp_base
+	# Calibration G5: lane-foe xp grows with the wave (2D x(1+0.15w);
+	# 3D takes 0.10/wave, wave 1 at table value). Non-foe archetypes
+	# (trainees, wilds) keep the flat table via the match default above.
+	return int(round(float(xp_base) * (1.0 + 0.10 * float(maxi(current_wave - 1, 0)))))
+
+
+func armor_factor(armor: float) -> float:
+	# 2D armorFactor (game/index.html:602), verbatim.
+	return 1.0 / (1.0 + armor * 0.06) if armor >= 0.0 else 2.0 - pow(0.94, -armor)
+
+
+func hero_armor() -> float:
+	# Only the hero carries an armor stat in 3D (2D armorT = agi*0.22;
+	# 3D has no item-armor stat, gear agi flows in via hero_stats_at).
+	if hero_index < 0:
+		return 0.0
+	return float(hero_stats_at(hero_index, hero_level)["armor"])
+
+
+func apply_damage(source: Node, target: ArticulatedUnit, amount: float, _kind: String = "physical") -> float:
+	if target == null or not is_instance_valid(target):
+		return 0.0
+	if not target.alive:
+		return 0.0
+	# Battle damage flows only in battle state; the training pen also runs
+	# during intermissions, but only between the hero and trainees.
+	if game_state != "battle":
+		var training := false
+		if game_state == "intermission":
+			if target.archetype == "trainee" or target.has_meta("is_train_boss") or target.has_meta("wild_kind") or target == mengda_unit:
+				training = true
+			elif source is ArticulatedUnit and ((source as ArticulatedUnit).archetype == "trainee" or (source as ArticulatedUnit).has_meta("is_train_boss") or (source as ArticulatedUnit).has_meta("wild_kind") or source == mengda_unit):
+				training = true
+		if not training:
+			return 0.0
+	if target == strategist and soul_timer > 0.0:
+		return 0.0 # 魂 form: the hero takes no damage （魂 quest reward)
+	if target.has_meta("finale_trapped"):
+		return 0.0 # 上方谷 fire trap: 司马懿 is invulnerable while trapped
+	if _kind != "harness_probe" and target.has_meta("bsk_invuln_until") and elapsed < float(target.get_meta("bsk_invuln_until")):
+		return 0.0 # Boss 天下无敌: invulnerable while the buff lasts (test probes act by fiat and bypass it)
+	if target == strategist and hero_index >= 0 and String(HERO_ROSTER[hero_index].get("passive", "")) == "drunk" and _rng.randf() < 0.20:
+		return 0.0 # 廖化 醉拳： 20% evasion
+	if not _dot_tick_active and target.has_meta("boss_skills") and (target.get_meta("boss_skills") as Array).has("闪避") and _kind != "zone" and _kind != "reflect" and _kind != "meteor" and _rng.randf() < 0.30:
+		return 0.0 # Boss 闪避 (2D pevade 30%)
+	# 韩德 death-curse bookkeeping: remember who hit him, and when.
+	if target.has_meta("boss_special") and String(target.get_meta("boss_special")) == "hande" and source is ArticulatedUnit and (source as ArticulatedUnit).team != "enemy":
+		var atk_by: Dictionary = target.get_meta("atk_by", {})
+		atk_by[source.get_instance_id()] = [source, elapsed]
+		target.set_meta("atk_by", atk_by)
+	var dealt := amount
+	# Hero passives (stage-1 full kits): 赵统 crit, 关兴 lifesteal.
+	if source == strategist and hero_index >= 0 and target.team == "enemy":
+		var passive := String(HERO_ROSTER[hero_index].get("passive", ""))
+		if (passive == "crit" or passive == "drunk") and _rng.randf() < 0.25:
+			dealt = amount * (3.0 if passive == "drunk" else 2.0)
+		elif passive == "lifesteal" and is_instance_valid(strategist) and strategist.alive:
+			strategist.hp = minf(strategist.max_hp, strategist.hp + amount * 0.2)
+		elif passive == "curhp" and _rng.randf() < 0.1667:
+			dealt += target.hp * 0.10 # 刘谌 元灵之怒： cut 10% of current HP
+	# Boss attack passives (2D BSK): 倍击/致命一击 crits, 重击 bonus, and
+	# the 战鼓 aura (+25% for any enemy attacker near a drum boss).
+	# kind "boss_skill" skips this whole hook: 2D rolls these passives only
+	# on the basic-attack path, never on boss skill damage.
+	if _kind != "boss_skill" and source is ArticulatedUnit and (source as ArticulatedUnit).has_meta("boss_skills"):
+		var bsk: Array = (source as ArticulatedUnit).get_meta("boss_skills")
+		if bsk.has("倍击") and _rng.randf() < 0.25:
+			dealt *= 3.0
+		elif bsk.has("致命一击") and _rng.randf() < 0.20:
+			dealt *= 4.5
+		if bsk.has("重击") and _rng.randf() < 0.20:
+			dealt += (source as ArticulatedUnit).attack_damage * 2.0
+	if _kind != "boss_skill" and source is ArticulatedUnit and (source as ArticulatedUnit).team == "enemy" and _boss_drum_near((source as ArticulatedUnit).global_position):
+		dealt *= 1.25
+	if target.has_meta("vuln_until") and elapsed < float(target.get_meta("vuln_until")):
+		dealt *= 1.0 + float(target.get_meta("vuln_pct", 0.25))
+	if source is ArticulatedUnit and (source as ArticulatedUnit).has_meta("atk_cut_until") and elapsed < float((source as ArticulatedUnit).get_meta("atk_cut_until")):
+		dealt *= float((source as ArticulatedUnit).get_meta("atk_cut_mul", 0.5))
+	if source is ArticulatedUnit and (source as ArticulatedUnit).has_meta("siege") and target.archetype == "boss":
+		dealt *= 2.0 # 霹雳车 siege: double damage against bosses (2D)
+	# 0.1.52: 2D phys armor reduction — basic attacks only (kind
+	# "melee"/"physical"), hero only; boss_skill/magic kinds never
+	# reduced (damage() in game/index.html applies armorFactor solely
+	# on the phys path, after all attack-side multipliers).
+	if target == strategist and (_kind == "melee" or _kind == "physical"):
+		dealt *= armor_factor(hero_armor())
+	if dealt > 0.0 and target.has_meta("bsk_shield_hp") and elapsed < float(target.get_meta("bsk_shield_until", 0.0)):
+		var sh := float(target.get_meta("bsk_shield_hp"))
+		var absorbed := minf(sh, dealt)
+		target.set_meta("bsk_shield_hp", sh - absorbed)
+		dealt -= absorbed
+	target.hp = maxf(target.hp - dealt, 0.0)
+	if target.hp <= 0.0 and target.has_meta("revive_once") and not target.has_meta("revived"):
+		target.set_meta("revived", true)
+		target.hp = target.max_hp * 0.6
+		_update_ui("强盗头子诈死复活了！（复活一次）再杀他一次！")
+	# Boss on-hit passives: 血刃 lifesteal, 分裂 cleave, 烈焰刀 splash,
+	# 红色怒雷 chain, 无名火 DoT. Splash/chain re-enter apply_damage, so
+	# the whole cluster runs under the _boss_splash_busy guard.
+	if dealt > 0.0 and not _boss_splash_busy and source is ArticulatedUnit and is_instance_valid(source) and (source as ArticulatedUnit).alive:
+		var su := source as ArticulatedUnit
+		if su.has_meta("boss_skills") and target.team != "enemy":
+			var ssk: Array = su.get_meta("boss_skills")
+			if ssk.has("血刃"):
+				su.hp = minf(su.max_hp, su.hp + dealt * 0.25)
+			_boss_splash_busy = true
+			if ssk.has("分裂"):
+				_boss_splash(su, target, dealt * 0.35, 2.6)
+			if su.has_meta("boss_special") and String(su.get_meta("boss_special")) == "lieyan":
+				_boss_splash(su, target, dealt * 0.5, 5.0, true)
+			if ssk.has("红色怒雷") and _rng.randf() < 0.22:
+				_boss_predthunder(su, target)
+			_boss_splash_busy = false
+			if su.has_meta("bsk_fire_until") and elapsed < float(su.get_meta("bsk_fire_until")):
+				_apply_dot(target, su.attack_damage * 0.5, 3.0, "flame", su)
+	# 荆棘阵 reflect (雅丹): 20% of what the boss took goes back.
+	if dealt > 0.0 and not _boss_splash_busy and target.has_meta("boss_skills") and (target.get_meta("boss_skills") as Array).has("荆棘阵") and source is ArticulatedUnit and (source as ArticulatedUnit).team != "enemy":
+		_boss_splash_busy = true
+		apply_damage(target, source, dealt * 0.20, "reflect")
+		_boss_splash_busy = false
+	target.play_hit()
+	_spawn_hit_spark(target.get_hit_position(), _kind)
+	last_damage_events += 1
+	if target.hp <= 0.0:
+		target.start_death()
+		if target == kongming_unit:
+			# 2D 原制：孔明死则败（game/index.html:729）。
+			game_state = "defeat"
+			defeat_reason = "孔明遇刺身亡"
+			_update_ui("孔明遇刺身亡……点「重开」再来。")
+		if target in mercs:
+			mercs.erase(target)
+		if target in saints_active:
+			saints_active.erase(target)
+			var sb_name := String(target.get_meta("saint_name", ""))
+			if sb_name != "":
+				give_hero_item(saint_mark_item(sb_name))
+				_update_ui("「%s」力竭，变回「圣痕·%s」回到背包。" % [sb_name, sb_name])
+		if target.has_meta("boss_special") and String(target.get_meta("boss_special")) == "hande":
+			_hande_death_curse(target)
+		if finale_active and target.has_meta("is_boss"):
+			var bn := target.display_name
+			if sima_state.has(bn):
+				if bn == "司马懿":
+					if String(sima_state["司马师"]) != "dead" or String(sima_state["司马昭"]) != "dead":
+						sima_state["司马懿"] = "reviving"
+						yi_revive_timer = 5.0
+						_update_ui("司马懿诈死！师、昭未死之前，他不会真正倒下——5 秒后复活。")
+					else:
+						sima_state["司马懿"] = "dead"
+				else:
+					sima_state[bn] = "dead"
+					if String(sima_state["司马师"]) == "dead" and String(sima_state["司马昭"]) == "dead" and yi_trapped:
+						_release_yi_trap()
+				_check_finale_done()
+		if target.team == "enemy":
+			var bounty := int(target.get_meta("bounty")) if target.has_meta("bounty") else bounty_for(target.archetype)
+			gold += bounty
+			_spawn_bounty_popup(target, bounty)
+			if is_instance_valid(strategist) and strategist.alive and strategist.global_position.distance_to(target.global_position) <= 34.0:
+				hero_gain_xp(xp_for(target))
+			if source == strategist:
+				_growth_on_hero_kill()
+			if target.has_meta("is_train_boss"):
+				training_boss_drop(_rng.randf())
+			if target.has_meta("wild_kind"):
+				_on_wild_death(String(target.get_meta("wild_kind", "")), target)
+			if target.archetype == "boss" and target.display_name == "雅丹" and qstate("xincheng") == "no" and not letter_pending:
+				letter_pending = true
+				_update_ui("雅丹丞相掉落孔明的书信——回帅帐旁点孔明领取，送往新城孟达。")
+	return dealt
+
+
+func _spawn_hit_spark(pos: Vector3, kind: String) -> void:
+	var color := Color(1.0, 0.85, 0.45)
+	match kind:
+		"lightning":
+			color = Color(0.75, 0.88, 1.0)
+		"flame":
+			color = Color(1.0, 0.55, 0.20)
+		"arrow":
+			color = Color(0.95, 0.80, 0.55)
+	_spawn_burst(pos, color, 4, 0.13, 0.20)
+
+
+func _spawn_bounty_popup(unit: ArticulatedUnit, amount: int) -> void:
+	if not bounty_popups_enabled:
+		return
+	var label := Label3D.new()
+	label.name = "BountyPopup"
+	label.text = "+%d" % amount
+	label.font = CJK_FONT
+	label.font_size = 64
+	label.pixel_size = 0.012
+	label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+	label.modulate = Color(1.0, 0.84, 0.35)
+	label.outline_size = 12
+	label.outline_modulate = Color(0.16, 0.10, 0.0)
+	label.position = unit.global_position + Vector3(0, 2.7, 0)
+	effects_root.add_child(label)
+	effects.append({"node": label, "ttl": 0.9, "kind": "bounty", "ttl0": 0.9})
+	bounty_popups_spawned += 1
+
+
+func damage_core(amount: float, _source: Node) -> void:
+	if game_state != "battle":
+		return
+	core_hp = maxf(core_hp - amount, 0.0)
+	core_flash = 0.25
+	last_damage_events += 1
+	if core_hp <= 0.0:
+		game_state = "defeat"
+		defeat_reason = "封印核已毁"
+		if is_instance_valid(crystal_group):
+			crystal_group.visible = false
+		_spawn_burst(CORE_POS + Vector3(0, 2.6, 0), Color(0.72, 0.36, 1.0), 14)
+		_update_ui("封印核被摧毁……点「重开」再来。")
+
+
+func _nearest_enemy(from_pos: Vector3, max_dist: float, exclude: Array = []) -> ArticulatedUnit:
+	var best: ArticulatedUnit = null
+	var best_d := max_dist
+	for e in combat_targets():
+		if exclude.has(e):
+			continue
+		var d := Vector2(e.global_position.x - from_pos.x, e.global_position.z - from_pos.z).length()
+		if d < best_d:
+			best_d = d
+			best = e
+	return best
+
+
+# The classic chain lightning stays available as a direct call (harness /
+# thunder towers use it). The hero SKILL button dispatches to the chosen
+# hero's skill via cast_hero_skill(); for 马谡 the skill IS the chain.
+func _cast_chain_lightning() -> int:
+	last_chain_hit_count = 0
+	# Every blocked cast reports why (optimization round): these paths used
+	# to return 0 silently, e.g. pressing space during the cooldown.
+	if game_state != "battle":
+		last_chain_feedback = "not_battle"
+		_update_ui("闪电：战斗结束后无法释放。")
+		return 0
+	if skill_cooldown > 0.0:
+		last_chain_feedback = "cooldown"
+		_update_ui("技能冷却中，还剩 %.1f 秒。" % skill_cooldown)
+		return 0
+	if not is_instance_valid(strategist) or not strategist.alive:
+		last_chain_feedback = "strategist_down"
+		_update_ui("技能：英雄已阵亡，无法释放。")
+		return 0
+	var first := _nearest_enemy(strategist.global_position, CHAIN_RANGE)
+	if first == null:
+		last_chain_feedback = "no_targets"
+		_update_ui("技能：范围内没有敌人。")
+		return 0
+	var main_attr := 10.0
+	if hero_index >= 0:
+		main_attr = float(hero_stats_at(hero_index, hero_level)["main"])
+	var dmg := (24.0 + main_attr * 0.8) * hero_skill_mul()
+	var targets: Array = [first]
+	var current: ArticulatedUnit = first
+	while targets.size() < CHAIN_MAX_TARGETS:
+		var nxt := _nearest_enemy(current.global_position, CHAIN_JUMP_RANGE, targets)
+		if nxt == null:
+			break
+		targets.append(nxt)
+		current = nxt
+	skill_cooldown = SKILL_COOLDOWN_TIME
+	strategist.play_attack()
+	strategist.face_towards(first.global_position)
+	var points: Array = [strategist.global_position + Vector3(0, 2.0, 0)]
+	for t in targets:
+		points.append(t.get_hit_position())
+	_spawn_lightning(points)
+	for t in targets:
+		apply_damage(strategist, t, dmg, "lightning")
+	last_chain_hit_count = targets.size()
+	if targets.size() < 3:
+		last_chain_feedback = "few_targets"
+		_update_ui("链式闪电命中 %d 名敌人——目标不足 3 名，未打满。" % targets.size())
+	else:
+		last_chain_feedback = "ok"
+		_update_ui("链式闪电命中 %d 名敌人！" % targets.size())
+	return targets.size()
+
+
+# --- Hero skills (stage-1: 6 bespoke kits + 3 generic archetype kits) ----
+
+func cast_hero_skill() -> int:
+	last_chain_hit_count = 0
+	if game_state != "battle":
+		last_chain_feedback = "not_battle"
+		_update_ui("技能：战斗结束后无法释放。")
+		return 0
+	if skill_cooldown > 0.0:
+		last_chain_feedback = "cooldown"
+		_update_ui("技能冷却中，还剩 %.1f 秒。" % skill_cooldown)
+		return 0
+	if not is_instance_valid(strategist) or not strategist.alive:
+		last_chain_feedback = "strategist_down"
+		_update_ui("技能：英雄已阵亡，无法释放。")
+		return 0
+	# 蚀心咒 silence (boss skill): the hero cannot cast while silenced.
+	if strategist.has_meta("silenced_until") and elapsed < float(strategist.get_meta("silenced_until")):
+		last_chain_feedback = "silenced"
+		_update_ui("技能：被蚀心咒沉默中，无法释放！")
+		return 0
+	# 董卓 七星刀 (2D special): negates one hero skill cast per 25 s; the
+	# cast is still consumed (cooldown starts), nothing else happens.
+	if hero_index >= 0:
+		for e in enemies:
+			if is_instance_valid(e) and e.alive and e.has_meta("boss_special") and String(e.get_meta("boss_special")) == "qixing" and elapsed >= float(e.get_meta("qixing_ready", 0.0)) and strategist.global_position.distance_to(e.global_position) <= 15.0:
+				e.set_meta("qixing_ready", elapsed + 25.0)
+				skill_cooldown = SKILL_COOLDOWN_TIME
+				_spawn_burst(e.get_hit_position(), Color(1.0, 0.84, 0.37), 10, 0.25, 0.3)
+				_update_ui("七星刀抵挡了技能【%s】！" % String(HERO_ROSTER[hero_index].get("skill_name", "技能")))
+				return 0
+	if hero_index < 0:
+		return _cast_chain_lightning()
+	var h: Dictionary = HERO_ROSTER[hero_index]
+	var st := hero_stats_at(hero_index, hero_level)
+	var mainv := float(st["main"])
+	var skill_id := String(h["skill"])
+	var skill_name := String(h["skill_name"])
+	var excl_mul := hero_skill_mul()
+	var hero_pos := strategist.global_position
+	var hits := 0
+	match skill_id:
+		"thunder_chain":
+			# 马谡 一指惊雷: the chain itself, with int-scaled damage.
+			skill_cooldown = SKILL_COOLDOWN_TIME
+			var first := _nearest_enemy(hero_pos, CHAIN_RANGE)
+			if first == null:
+				last_chain_feedback = "no_targets"
+				_update_ui("%s：范围内没有敌人。" % skill_name)
+				return 0
+			var dmg := (18.0 + mainv * 1.15) * excl_mul
+			var targets: Array = [first]
+			var current: ArticulatedUnit = first
+			while targets.size() < 6:
+				var nxt := _nearest_enemy(current.global_position, CHAIN_JUMP_RANGE, targets)
+				if nxt == null:
+					break
+				targets.append(nxt)
+				current = nxt
+			strategist.play_attack()
+			strategist.face_towards(first.global_position)
+			var points: Array = [hero_pos + Vector3(0, 2.0, 0)]
+			for t in targets:
+				points.append(t.get_hit_position())
+			_spawn_lightning(points)
+			for t in targets:
+				apply_damage(strategist, t, dmg, "lightning")
+			hits = targets.size()
+		"line_slash":
+			# 赵统 残影剑: damage along the facing line.
+			var first := _nearest_enemy(hero_pos, 13.0)
+			if first == null:
+				last_chain_feedback = "no_targets"
+				_update_ui("%s：范围内没有敌人。" % skill_name)
+				return 0
+			skill_cooldown = SKILL_COOLDOWN_TIME
+			strategist.play_attack()
+			strategist.face_towards(first.global_position)
+			var dir := (first.global_position - hero_pos)
+			dir.y = 0.0
+			dir = dir.normalized()
+			var dmg := (26.0 + mainv * 1.2) * excl_mul
+			_spawn_burst(hero_pos + dir * 5.0 + Vector3(0, 1.6, 0), Color(0.75, 0.88, 1.0), 10, 0.22)
+			for e in combat_targets():
+				var rel: Vector3 = e.global_position - hero_pos
+				rel.y = 0.0
+				var along: float = rel.dot(dir)
+				if along < 0.0 or along > 13.0:
+					continue
+				var side: float = (rel - dir * along).length()
+				if side <= 2.6:
+					apply_damage(strategist, e, dmg, "physical")
+					hits += 1
+		"slam":
+			# 孟获 雷霆一击: point-blank shockwave.
+			var near := _nearest_enemy(hero_pos, 7.5)
+			if near == null:
+				last_chain_feedback = "no_targets"
+				_update_ui("%s：身边没有敌人。" % skill_name)
+				return 0
+			skill_cooldown = SKILL_COOLDOWN_TIME
+			strategist.play_attack()
+			var dmg := (30.0 + mainv * 1.15) * excl_mul
+			_spawn_burst(hero_pos + Vector3(0, 1.2, 0), Color(1.0, 0.72, 0.30), 12, 0.28)
+			for e in combat_targets():
+				if e.global_position.distance_to(hero_pos) <= 7.5:
+					apply_damage(strategist, e, dmg, "physical")
+					hits += 1
+		"fire_line":
+			# 姜维 烈火燎原: burning ground at the densest target point.
+			var first := _nearest_enemy(hero_pos, CHAIN_RANGE)
+			if first == null:
+				last_chain_feedback = "no_targets"
+				_update_ui("%s：范围内没有敌人。" % skill_name)
+				return 0
+			skill_cooldown = SKILL_COOLDOWN_TIME
+			strategist.play_attack()
+			strategist.face_towards(first.global_position)
+			var center := first.global_position
+			var dmg := (22.0 + mainv * 1.15) * excl_mul
+			_spawn_burst(center + Vector3(0, 1.0, 0), Color(1.0, 0.5, 0.16), 14, 0.3)
+			for e in combat_targets():
+				if e.global_position.distance_to(center) <= 6.5:
+					apply_damage(strategist, e, dmg, "flame")
+					hits += 1
+		"blink_strike":
+			# 关兴 幻影斩: blink to the strongest foe and strike hard.
+			var best: ArticulatedUnit = null
+			for e in combat_targets():
+				if e.global_position.distance_to(hero_pos) <= CHAIN_RANGE:
+					if best == null or e.max_hp > best.max_hp:
+						best = e
+			if best == null:
+				last_chain_feedback = "no_targets"
+				_update_ui("%s：范围内没有敌人。" % skill_name)
+				return 0
+			skill_cooldown = SKILL_COOLDOWN_TIME
+			var back := (hero_pos - best.global_position)
+			back.y = 0.0
+			back = back.normalized()
+			strategist.global_position = best.global_position + back * 2.2
+			strategist.face_towards(best.global_position)
+			strategist.play_attack()
+			_spawn_burst(best.get_hit_position(), Color(0.85, 0.80, 1.0), 10, 0.2)
+			apply_damage(strategist, best, (34.0 + mainv * 1.35) * excl_mul, "physical")
+			hits = 1
+		"heal":
+			# 黄月英 天降甘霖: heal nearby defenders + the seal core.
+			skill_cooldown = SKILL_COOLDOWN_TIME
+			strategist.play_attack()
+			var heal_amt := (130.0 + mainv * 2.2) * excl_mul
+			strategist.hp = minf(strategist.max_hp, strategist.hp + heal_amt)
+			if is_instance_valid(general) and general.alive and general.global_position.distance_to(hero_pos) <= 16.0:
+				general.hp = minf(general.max_hp, general.hp + heal_amt)
+				hits += 1
+			core_hp = minf(CORE_MAX_HP, core_hp + 50.0 * excl_mul)
+			_spawn_burst(hero_pos + Vector3(0, 2.0, 0), Color(0.55, 1.0, 0.62), 12, 0.3)
+			_refresh_hud()
+			hits += 1
+		"frost_arrow":
+			# 赵广 玄冰神箭： single-target nuke + stun (2D: 敏-scaled + stun).
+			var first := _nearest_enemy(hero_pos, CHAIN_RANGE)
+			if first == null:
+				last_chain_feedback = "no_targets"
+				_update_ui("%s：范围内没有敌人。" % skill_name)
+				return 0
+			skill_cooldown = SKILL_COOLDOWN_TIME
+			strategist.play_attack()
+			strategist.face_towards(first.global_position)
+			_spawn_burst(first.get_hit_position(), Color(0.65, 0.85, 1.0), 10, 0.22)
+			apply_damage(strategist, first, (30.0 + mainv * 1.25) * excl_mul, "magic")
+			_apply_stun(first, 2.0)
+			hits = 1
+		"bind":
+			# 关索 束缚： root + DoT (2D: duration halved against bosses).
+			var first := _nearest_enemy(hero_pos, 13.0)
+			if first == null:
+				last_chain_feedback = "no_targets"
+				_update_ui("%s：范围内没有敌人。" % skill_name)
+				return 0
+			skill_cooldown = SKILL_COOLDOWN_TIME
+			strategist.play_attack()
+			strategist.face_towards(first.global_position)
+			_spawn_burst(first.get_hit_position(), Color(0.55, 0.95, 0.55), 10, 0.22)
+			var dur := 3.0 if first.has_meta("is_boss") else 6.0
+			_apply_root(first, dur)
+			_apply_dot(first, (5.0 + mainv * 0.10) * excl_mul, dur, "poison")
+			hits = 1
+		"rift_slash":
+			# 关凤/刘谌 裂空斩： line damage + brief stun (2D line + stun).
+			var first := _nearest_enemy(hero_pos, 13.0)
+			if first == null:
+				last_chain_feedback = "no_targets"
+				_update_ui("%s：范围内没有敌人。" % skill_name)
+				return 0
+			skill_cooldown = SKILL_COOLDOWN_TIME
+			strategist.play_attack()
+			strategist.face_towards(first.global_position)
+			var dir := (first.global_position - hero_pos)
+			dir.y = 0.0
+			dir = dir.normalized()
+			var dmg := (28.0 + mainv * 1.25) * excl_mul
+			_spawn_burst(hero_pos + dir * 5.0 + Vector3(0, 1.6, 0), Color(0.80, 0.95, 1.0), 10, 0.22)
+			for e in combat_targets():
+				var rel: Vector3 = e.global_position - hero_pos
+				rel.y = 0.0
+				var along: float = rel.dot(dir)
+				if along < 0.0 or along > 13.0:
+					continue
+				var side: float = (rel - dir * along).length()
+				if side <= 2.6:
+					apply_damage(strategist, e, dmg, "physical")
+					_apply_stun(e, 1.5)
+					hits += 1
+		"earth_stomp":
+			# 张苞 地裂脚： point-blank AoE + stun (2D aoe + stun).
+			var near := _nearest_enemy(hero_pos, 7.5)
+			if near == null:
+				last_chain_feedback = "no_targets"
+				_update_ui("%s：身边没有敌人。" % skill_name)
+				return 0
+			skill_cooldown = SKILL_COOLDOWN_TIME
+			strategist.play_attack()
+			var dmg := (30.0 + mainv * 1.15) * excl_mul
+			_spawn_burst(hero_pos + Vector3(0, 1.2, 0), Color(0.95, 0.75, 0.45), 12, 0.28)
+			for e in combat_targets():
+				if e.global_position.distance_to(hero_pos) <= 7.5:
+					apply_damage(strategist, e, dmg, "physical")
+					_apply_stun(e, 1.5)
+					hits += 1
+		"armor_break":
+			# 王平 削铁如泥： vulnerability debuff (3D has no armor stat:
+			# shred reads as +25% damage taken; 2D also reveals — no
+			# stealth system yet, noted in the ledger).
+			var first := _nearest_enemy(hero_pos, 13.0)
+			if first == null:
+				last_chain_feedback = "no_targets"
+				_update_ui("%s：范围内没有敌人。" % skill_name)
+				return 0
+			skill_cooldown = SKILL_COOLDOWN_TIME
+			strategist.play_attack()
+			strategist.face_towards(first.global_position)
+			_spawn_burst(first.get_hit_position(), Color(1.0, 0.85, 0.50), 10, 0.22)
+			apply_damage(strategist, first, (15.0 + mainv * 0.8) * excl_mul, "physical")
+			_apply_vuln(first, 0.25, 8.0)
+			hits = 1
+		"heart_curse":
+			# 陆逊 蚀心咒： long DoT + attack cut (2D: dot + silence +
+			# atk -50%; silence has no enemy casters to block in 3D).
+			var first := _nearest_enemy(hero_pos, CHAIN_RANGE)
+			if first == null:
+				last_chain_feedback = "no_targets"
+				_update_ui("%s：范围内没有敌人。" % skill_name)
+				return 0
+			skill_cooldown = SKILL_COOLDOWN_TIME
+			strategist.play_attack()
+			strategist.face_towards(first.global_position)
+			_spawn_burst(first.get_hit_position(), Color(0.85, 0.55, 1.0), 10, 0.22)
+			_apply_dot(first, (7.0 + mainv * 0.14) * excl_mul, 12.0, "magic")
+			_apply_atk_cut(first, 0.5, 12.0)
+			hits = 1
+		"hex":
+			# 木鹿大王 妖术： transform — root + shrink (2D: 50 s, boss 4 s;
+			# 3D pacing: 10 s / 4 s).
+			var first := _nearest_enemy(hero_pos, CHAIN_RANGE)
+			if first == null:
+				last_chain_feedback = "no_targets"
+				_update_ui("%s：范围内没有敌人。" % skill_name)
+				return 0
+			skill_cooldown = SKILL_COOLDOWN_TIME
+			strategist.play_attack()
+			strategist.face_towards(first.global_position)
+			_spawn_burst(first.get_hit_position(), Color(0.75, 1.0, 0.65), 12, 0.26)
+			_apply_hex(first, 4.0 if first.has_meta("is_boss") else 10.0)
+			hits = 1
+		"thunder_bomb":
+			# 夏侯霸 轰天雷 (his 2D ultimate): huge single hit + stun.
+			var first := _nearest_enemy(hero_pos, 13.0)
+			if first == null:
+				last_chain_feedback = "no_targets"
+				_update_ui("%s：范围内没有敌人。" % skill_name)
+				return 0
+			skill_cooldown = SKILL_COOLDOWN_TIME
+			strategist.play_attack()
+			strategist.face_towards(first.global_position)
+			_spawn_burst(first.get_hit_position(), Color(1.0, 0.65, 0.30), 14, 0.3)
+			apply_damage(strategist, first, (48.0 + mainv * 1.8) * excl_mul, "physical")
+			_apply_stun(first, 1.5)
+			hits = 1
+		"mana_burn":
+			# 蒋琬 法力燃烧： 3D has no mana pool — the burn reads as
+			# damage + weakened attacks for 6 s.
+			var first := _nearest_enemy(hero_pos, CHAIN_RANGE)
+			if first == null:
+				last_chain_feedback = "no_targets"
+				_update_ui("%s：范围内没有敌人。" % skill_name)
+				return 0
+			skill_cooldown = SKILL_COOLDOWN_TIME
+			strategist.play_attack()
+			strategist.face_towards(first.global_position)
+			_spawn_burst(first.get_hit_position(), Color(0.55, 0.75, 1.0), 10, 0.22)
+			apply_damage(strategist, first, (30.0 + mainv * 1.3) * excl_mul, "magic")
+			_apply_atk_cut(first, 0.6, 6.0)
+			hits = 1
+		"frost_burst":
+			# 诸葛瞻 玄冰爆： AoE nuke + slow (2D: int-scaled + 50% slow).
+			var first := _nearest_enemy(hero_pos, CHAIN_RANGE)
+			if first == null:
+				last_chain_feedback = "no_targets"
+				_update_ui("%s：范围内没有敌人。" % skill_name)
+				return 0
+			skill_cooldown = SKILL_COOLDOWN_TIME
+			strategist.play_attack()
+			strategist.face_towards(first.global_position)
+			var center := first.global_position
+			_spawn_burst(center + Vector3(0, 1.0, 0), Color(0.65, 0.85, 1.0), 12, 0.26)
+			for e in combat_targets():
+				if e.global_position.distance_to(center) <= 5.5:
+					apply_damage(strategist, e, (24.0 + mainv * 1.2) * excl_mul, "magic")
+					_apply_slow(e, 0.5, 3.0)
+					hits += 1
+		"poison":
+			# 花蔓 淬毒： DoT + strong slow (2D: 270/s + 45% slow, 6 s).
+			var first := _nearest_enemy(hero_pos, CHAIN_RANGE)
+			if first == null:
+				last_chain_feedback = "no_targets"
+				_update_ui("%s：范围内没有敌人。" % skill_name)
+				return 0
+			skill_cooldown = SKILL_COOLDOWN_TIME
+			strategist.play_attack()
+			strategist.face_towards(first.global_position)
+			_spawn_burst(first.get_hit_position(), Color(0.55, 1.0, 0.45), 10, 0.22)
+			_apply_dot(first, (8.0 + mainv * 0.15) * excl_mul, 6.0, "poison")
+			_apply_slow(first, 0.55, 6.0)
+			hits = 1
+		"fire_breath":
+			# 廖化 火焰呼吸： fire line (his 醉拳 lives in the passive slot).
+			var first := _nearest_enemy(hero_pos, 13.0)
+			if first == null:
+				last_chain_feedback = "no_targets"
+				_update_ui("%s：范围内没有敌人。" % skill_name)
+				return 0
+			skill_cooldown = SKILL_COOLDOWN_TIME
+			strategist.play_attack()
+			strategist.face_towards(first.global_position)
+			var dir := (first.global_position - hero_pos)
+			dir.y = 0.0
+			dir = dir.normalized()
+			var dmg := (26.0 + mainv * 1.2) * excl_mul
+			_spawn_burst(hero_pos + dir * 5.0 + Vector3(0, 1.6, 0), Color(1.0, 0.5, 0.16), 12, 0.24)
+			for e in combat_targets():
+				var rel: Vector3 = e.global_position - hero_pos
+				rel.y = 0.0
+				var along: float = rel.dot(dir)
+				if along < 0.0 or along > 13.0:
+					continue
+				var side: float = (rel - dir * along).length()
+				if side <= 2.6:
+					apply_damage(strategist, e, dmg, "flame")
+					hits += 1
+		"explosive_arrow":
+			# 祝融夫人 爆裂箭： burning DoT + shred (2D: dot + armor down;
+			# shred reads as vulnerability in 3D).
+			var first := _nearest_enemy(hero_pos, CHAIN_RANGE)
+			if first == null:
+				last_chain_feedback = "no_targets"
+				_update_ui("%s：范围内没有敌人。" % skill_name)
+				return 0
+			skill_cooldown = SKILL_COOLDOWN_TIME
+			strategist.play_attack()
+			strategist.face_towards(first.global_position)
+			_spawn_burst(first.get_hit_position(), Color(1.0, 0.55, 0.25), 10, 0.22)
+			_apply_dot(first, (9.0 + mainv * 0.16) * excl_mul, 10.0, "flame")
+			_apply_vuln(first, 0.15, 10.0)
+			hits = 1
+		"sleeve_arrow":
+			# 马岱 袖箭： quick heavy single shot (2D: agi x level / 2).
+			var first := _nearest_enemy(hero_pos, CHAIN_RANGE)
+			if first == null:
+				last_chain_feedback = "no_targets"
+				_update_ui("%s：范围内没有敌人。" % skill_name)
+				return 0
+			skill_cooldown = SKILL_COOLDOWN_TIME
+			strategist.play_attack()
+			strategist.face_towards(first.global_position)
+			_spawn_burst(first.get_hit_position(), Color(0.95, 0.95, 0.85), 8, 0.18)
+			apply_damage(strategist, first, (26.0 + mainv * 1.2) * excl_mul, "physical")
+			hits = 1
+		"poison_arrow":
+			# 马忠 毒箭： instant hit + poison DoT (2D: agi-scaled + dot).
+			var first := _nearest_enemy(hero_pos, CHAIN_RANGE)
+			if first == null:
+				last_chain_feedback = "no_targets"
+				_update_ui("%s：范围内没有敌人。" % skill_name)
+				return 0
+			skill_cooldown = SKILL_COOLDOWN_TIME
+			strategist.play_attack()
+			strategist.face_towards(first.global_position)
+			_spawn_burst(first.get_hit_position(), Color(0.60, 1.0, 0.50), 10, 0.22)
+			apply_damage(strategist, first, (24.0 + mainv * 1.1) * excl_mul, "physical")
+			_apply_dot(first, (5.0 + mainv * 0.10) * excl_mul, 5.0, "poison")
+			hits = 1
+		"generic_str":
+			var first := _nearest_enemy(hero_pos, 13.0)
+			if first == null:
+				last_chain_feedback = "no_targets"
+				_update_ui("%s：范围内没有敌人。" % skill_name)
+				return 0
+			skill_cooldown = SKILL_COOLDOWN_TIME
+			strategist.play_attack()
+			strategist.face_towards(first.global_position)
+			_spawn_burst(first.get_hit_position(), Color(1.0, 0.72, 0.30), 10, 0.22)
+			apply_damage(strategist, first, (44.0 + mainv * 1.6) * excl_mul, "physical")
+			hits = 1
+		"generic_agi":
+			var first := _nearest_enemy(hero_pos, CHAIN_RANGE)
+			if first == null:
+				last_chain_feedback = "no_targets"
+				_update_ui("%s：范围内没有敌人。" % skill_name)
+				return 0
+			skill_cooldown = SKILL_COOLDOWN_TIME
+			strategist.play_attack()
+			strategist.face_towards(first.global_position)
+			for i in range(3):
+				if is_instance_valid(first) and first.alive:
+					apply_damage(strategist, first, (20.0 + mainv * 1.05) * excl_mul, "physical")
+					hits += 1
+		"generic_int":
+			var first := _nearest_enemy(hero_pos, CHAIN_RANGE)
+			if first == null:
+				last_chain_feedback = "no_targets"
+				_update_ui("%s：范围内没有敌人。" % skill_name)
+				return 0
+			skill_cooldown = SKILL_COOLDOWN_TIME
+			strategist.play_attack()
+			strategist.face_towards(first.global_position)
+			var center := first.global_position
+			_spawn_burst(center + Vector3(0, 1.0, 0), Color(0.72, 0.60, 1.0), 12, 0.26)
+			for e in combat_targets():
+				if e.global_position.distance_to(center) <= 5.5:
+					apply_damage(strategist, e, (22.0 + mainv * 1.15) * excl_mul, "magic")
+					hits += 1
+		_:
+			return _cast_chain_lightning()
+	last_chain_hit_count = hits
+	if hits > 0:
+		last_chain_feedback = "ok"
+		_update_ui("%s 命中 %d 名敌人！" % [skill_name, hits])
+	elif last_chain_feedback != "no_targets":
+		last_chain_feedback = "ok"
+	return hits
+
+
+func _on_skill_button_pressed() -> void:
+	cast_hero_skill()
+
+
+func _on_restart_button_pressed() -> void:
+	reset_game()
+
+
+func _on_repair_button_pressed() -> void:
+	repair_core()
+
+
+func _on_next_wave_pressed() -> void:
+	if game_state == "intermission":
+		_start_wave(current_wave + 1)
+
+
+func _open_build_popup(pad_index: int) -> void:
+	_popup_pad_index = pad_index
+	var pop_full := pop_used() + 1 > pop_cap()
+	for ttype in TOWER_TYPES_ORDER:
+		var tb: Button = build_type_buttons.get(ttype)
+		if tb == null:
+			continue
+		var tdef: Dictionary = TOWER_DEFS[ttype]
+		tb.text = "%s · %s（%d 金）" % [String(tdef["name"]), String(tdef["desc"]), int(tdef["cost"])]
+		tb.disabled = pop_full or gold < int(tdef["cost"])
+	build_popup.visible = true
+
+
+func _open_tower_popup(pad_index: int) -> void:
+	_popup_pad_index = pad_index
+	var pad: Dictionary = pads[pad_index]
+	var t = pad.get("tower")
+	if t == null:
+		return
+	var ttype := String(t.get("type", ""))
+	var lvl := int(t.get("level", 1))
+	tower_info_label.text = "%s Lv%d\n气血 %d/%d · 攻击 %d · 射程 %d" % [tower_display_name(ttype), lvl, int(float(t.get("hp", 0.0))), int(float(t.get("max_hp", 1.0))), int(float(t.get("dmg", 0.0))), int(float(TOWER_DEFS.get(ttype, {}).get("range", 0.0)))]
+	_set_btn_icon(tower_upgrade_button, _ui_icon("tower_" + ttype), 38.0 if _touch_ui else 30.0)
+	if lvl >= 3:
+		tower_upgrade_button.text = "已满级（Lv3）"
+		tower_upgrade_button.disabled = true
+	else:
+		var ucost := int(TOWER_UP_COSTS[lvl - 1])
+		tower_upgrade_button.text = "升级（%d 金）：攻击 +55%%、气血 +250" % ucost
+		tower_upgrade_button.disabled = gold < ucost
+	tower_popup.visible = true
+
+
+func _on_tower_upgrade_pressed() -> void:
+	if _popup_pad_index >= 0 and _popup_pad_index < pads.size():
+		upgrade_tower(_popup_pad_index)
+		if pads[_popup_pad_index].get("tower") != null:
+			_open_tower_popup(_popup_pad_index)
+
+
+func _close_tower_popup() -> void:
+	if is_instance_valid(tower_popup):
+		tower_popup.visible = false
+
+
+func _close_build_popup() -> void:
+	_popup_pad_index = -1
+	_close_tower_popup()
+	if is_instance_valid(build_popup):
+		build_popup.visible = false
+
+
+# --- Shop purchase (-0.4, TEARDOWN §5 市肆) ------------------------------
+
+const SHOP_MAX_SLOTS := 6
+const SHOP_TIER_WAVE_STEP := 5
+const SHOP_TIER_NAMES := ["白装", "绿装", "蓝装", "紫装"]
+# Equipment tiers: weapon / armor / boots per tier. Prices are scaled to
+# this slice's gold economy (infantry bounty 10, boss 120+30/wave).
+const SHOP_GEAR_TIERS := [
+	[
+		{"id": "sword_t1", "name": "铁剑", "price": 120, "kind": "weapon", "val": 6.0, "desc": "+6 攻击"},
+		{"id": "armor_t1", "name": "布衣", "price": 100, "kind": "armor", "val": 120.0, "desc": "+120 气血上限"},
+		{"id": "boots_t1", "name": "草鞋", "price": 90, "kind": "boots", "val": 0.25, "desc": "+移速"},
+	],
+	[
+		{"id": "sword_t2", "name": "精钢剑", "price": 300, "kind": "weapon", "val": 14.0, "desc": "+14 攻击"},
+		{"id": "armor_t2", "name": "皮甲", "price": 260, "kind": "armor", "val": 260.0, "desc": "+260 气血上限"},
+		{"id": "boots_t2", "name": "快靴", "price": 240, "kind": "boots", "val": 0.45, "desc": "+移速"},
+	],
+	[
+		{"id": "sword_t3", "name": "寒铁剑", "price": 650, "kind": "weapon", "val": 26.0, "desc": "+26 攻击"},
+		{"id": "armor_t3", "name": "锁子甲", "price": 580, "kind": "armor", "val": 480.0, "desc": "+480 气血上限"},
+		{"id": "boots_t3", "name": "疾行靴", "price": 520, "kind": "boots", "val": 0.7, "desc": "+移速"},
+	],
+	[
+		{"id": "sword_t4", "name": "龙纹剑", "price": 1200, "kind": "weapon", "val": 45.0, "desc": "+45 攻击"},
+		{"id": "armor_t4", "name": "玄铁甲", "price": 1050, "kind": "armor", "val": 800.0, "desc": "+800 气血上限"},
+		{"id": "boots_t4", "name": "追风靴", "price": 950, "kind": "boots", "val": 1.0, "desc": "+移速"},
+	],
+]
+# Fine shop (精品店) trinkets: one tier above the equipment shop.
+const SHOP_TRINKET_TIERS := [
+	[
+		{"id": "ring_t1", "name": "铜戒", "price": 150, "kind": "trinket", "val": 4.0, "val2": 60.0, "desc": "+4 攻击 · +60 气血"},
+		{"id": "charm_t1", "name": "木护符", "price": 130, "kind": "trinket", "val": 3.0, "val2": 100.0, "desc": "+3 攻击 · +100 气血"},
+	],
+	[
+		{"id": "ring_t2", "name": "玉戒", "price": 260, "kind": "trinket", "val": 8.0, "val2": 120.0, "desc": "+8 攻击 · +120 气血"},
+		{"id": "charm_t2", "name": "铁护符", "price": 240, "kind": "trinket", "val": 6.0, "val2": 220.0, "desc": "+6 攻击 · +220 气血"},
+	],
+	[
+		{"id": "ring_t3", "name": "银戒", "price": 520, "kind": "trinket", "val": 15.0, "val2": 220.0, "desc": "+15 攻击 · +220 气血"},
+		{"id": "charm_t3", "name": "金丝护符", "price": 480, "kind": "trinket", "val": 12.0, "val2": 380.0, "desc": "+12 攻击 · +380 气血"},
+	],
+	[
+		{"id": "ring_t4", "name": "金戒", "price": 950, "kind": "trinket", "val": 26.0, "val2": 380.0, "desc": "+26 攻击 · +380 气血"},
+		{"id": "charm_t4", "name": "玄铁护符", "price": 900, "kind": "trinket", "val": 20.0, "val2": 650.0, "desc": "+20 攻击 · +650 气血"},
+	],
+]
+const SHOP_GROCERY := [
+	{"id": "potion_heal", "name": "金创药", "price": 40, "kind": "potion_heal", "val": 0.5, "desc": "回 50% 气血（点背包使用）"},
+	{"id": "stone_home", "name": "天遁石", "price": 60, "kind": "stone_home", "val": 0.0, "desc": "立即回主城（点背包使用）"},
+	{"id": "stone_revive", "name": "复活石", "price": 150, "kind": "stone_revive", "val": 0.0, "desc": "阵亡时立即复活（点背包使用）"},
+]
+# Original book prices (TEARDOWN §5: 5000 / 7500 / 4200 gold) scaled 1/10
+# to this slice's gold economy; the scaling is recorded, not hidden.
+const SHOP_BOOKS := [
+	{"id": "book_str", "name": "力量之书", "price": 500, "kind": "book_str", "val": 5.0, "desc": "力量 +5（立即使用）"},
+	{"id": "book_agi", "name": "敏捷之书", "price": 500, "kind": "book_agi", "val": 5.0, "desc": "敏捷 +5（立即使用）"},
+	{"id": "book_int", "name": "智力之书", "price": 500, "kind": "book_int", "val": 5.0, "desc": "智力 +5（立即使用）"},
+	{"id": "book_all", "name": "全属性之书", "price": 750, "kind": "book_all", "val": 5.0, "desc": "力量/敏捷/智力 +5（立即使用）"},
+	{"id": "book_atk", "name": "攻击之书", "price": 420, "kind": "book_atk", "val": 8.0, "desc": "+8 攻击（立即使用）"},
+]
+
+
+# --- 炼化合成 (stage-2, TEARDOWN §5 / PARITY §5: 炼化师) -------------------
+# Faithful port of the 2D v2 refiner (game/index.html MATERIALS / SETS /
+# EXCLUSIVES / craftSet / craftExcl):
+#   * Materials are bought into the 6-slot bag and consumed on forge.
+#   * 6 sets x 3 pieces; every piece costs the same material recipe +
+#     a per-piece gold fee; owning all 3 pieces applies the set bonus.
+#   * 15 hero-exclusive weapons; each costs a flat fee + 龙鳞x1 玄铁x1.
+# Conversions to this slice's systems (recorded, not hidden):
+#   * Prices/fees follow the book precedent: 2D gold / 10 （龙鳞 800->80,
+#     set fees 3200-4500 -> 320-450, exclusive fee 6000 -> 600).
+#   * 2D atk -> 3D damage at x0.5 (tier-4 shop sword is +45 for 1200g);
+#     str/agi/int/hp carry 1:1; 2D armor has no 3D channel, folded into
+#     hp at x15; 2D mp folds into int at /50; 2D move-speed 40/45 -> the
+#     boots scale 0.6/0.7; 项羽套's crit 0.10 folds into +10 damage.
+#   * The 2D "exclusive weapon: owner's skills +1 level" becomes
+#     "owner's skill power x1.3" — 3D hero skills have no levels; the
+#     multiplier is applied inside cast_hero_skill / _cast_chain_lightning.
+const REFINE_EXCL_FEE := 600
+const REFINE_EXCL_COST := {"龙鳞": 1, "玄铁": 1}
+const REFINE_MATERIALS := [
+	{"id": "mat_longlin", "name": "龙鳞", "price": 80, "kind": "material", "desc": "合成材料"},
+	{"id": "mat_fengyu", "name": "凤羽", "price": 80, "kind": "material", "desc": "合成材料"},
+	{"id": "mat_chitong", "name": "赤铜", "price": 80, "kind": "material", "desc": "合成材料"},
+	{"id": "mat_xuantie", "name": "玄铁", "price": 80, "kind": "material", "desc": "合成材料"},
+	{"id": "mat_lianhua", "name": "炼化石", "price": 50, "kind": "material", "desc": "合成材料"},
+]
+const REFINE_SETS := [
+	{"name": "青龙套", "fee": 350, "cost": {"龙鳞": 2, "玄铁": 1},
+		"bonus": {"dmg": 15.0, "str": 15.0, "desc": "攻击+15 · 力量+15"},
+		"pieces": [
+			{"name": "青龙偃月刀·套", "dmg": 35.0, "str": 12.0, "desc": "攻击+35 · 力量+12"},
+			{"name": "青鳞战甲", "hp": 710.0, "desc": "气血+710（含护甲折算）"},
+			{"name": "龙魂玉", "str": 14.0, "agi": 8.0, "desc": "力量+14 · 敏捷+8"},
+		]},
+	{"name": "项羽套", "fee": 380, "cost": {"赤铜": 2, "玄铁": 1},
+		"bonus": {"dmg": 30.0, "desc": "攻击+30（含暴击折算）"},
+		"pieces": [
+			{"name": "项羽战刃·套", "dmg": 42.0, "agi": 10.0, "desc": "攻击+42 · 敏捷+10"},
+			{"name": "霸王战甲", "hp": 825.0, "desc": "气血+825（含护甲折算）"},
+			{"name": "破军战盔", "str": 16.0, "dmg": 7.0, "desc": "力量+16 · 攻击+7"},
+		]},
+	{"name": "玄铁套", "fee": 320, "cost": {"玄铁": 3},
+		"bonus": {"hp": 870.0, "desc": "气血+870（含护甲折算）"},
+		"pieces": [
+			{"name": "玄铁重剑", "dmg": 30.0, "str": 14.0, "desc": "攻击+30 · 力量+14"},
+			{"name": "玄铁重甲", "hp": 850.0, "desc": "气血+850（含护甲折算）"},
+			{"name": "玄铁巨盾", "hp": 580.0, "desc": "气血+580（含护甲折算）"},
+		]},
+	{"name": "后羿套", "fee": 350, "cost": {"凤羽": 2, "赤铜": 1},
+		"bonus": {"agi": 20.0, "dmg": 12.0, "desc": "敏捷+20 · 攻击+12"},
+		"pieces": [
+			{"name": "落日神弓", "dmg": 37.0, "agi": 14.0, "desc": "攻击+37 · 敏捷+14"},
+			{"name": "追风衣", "hp": 150.0, "spd": 0.6, "desc": "气血+150 · 移速提升"},
+			{"name": "射日箭囊", "agi": 18.0, "dmg": 9.0, "desc": "敏捷+18 · 攻击+9"},
+		]},
+	{"name": "镇魂套", "fee": 350, "cost": {"凤羽": 2, "龙鳞": 1},
+		"bonus": {"int": 30.0, "desc": "智力+30（含法力折算）"},
+		"pieces": [
+			{"name": "镇魂法杖", "dmg": 27.0, "int": 20.0, "desc": "攻击+27 · 智力+20"},
+			{"name": "镇魂法袍", "int": 24.0, "desc": "智力+24（含法力折算）"},
+			{"name": "镇魂铃·套", "int": 18.0, "hp": 300.0, "desc": "智力+18 · 气血+300"},
+		]},
+	{"name": "魔神套", "fee": 450, "cost": {"龙鳞": 2, "凤羽": 2},
+		"bonus": {"dmg": 17.0, "int": 18.0, "desc": "攻击+17 · 智力+18"},
+		"pieces": [
+			{"name": "魔神之刃", "dmg": 45.0, "int": 14.0, "desc": "攻击+45 · 智力+14"},
+			{"name": "魔神战甲", "hp": 890.0, "desc": "气血+890（含护甲折算）"},
+			{"name": "魔神之翼·套", "int": 16.0, "spd": 0.7, "desc": "智力+16 · 移速提升"},
+		]},
+]
+# Owner names follow the 2D EXCLUSIVES crafting table （神农鼎→木鹿大王;
+# the 2D hero-data excl field disagrees for 神农鼎 — the crafting table
+# is the source of truth for forging).
+const REFINE_EXCLUSIVES := [
+	{"name": "青釭剑", "owner": "赵统", "dmg": 32.0, "agi": 16.0, "desc": "攻击+32 · 敏捷+16"},
+	{"name": "李广之弓", "owner": "赵广", "dmg": 30.0, "agi": 18.0, "desc": "攻击+30 · 敏捷+18"},
+	{"name": "盘古斧", "owner": "孟获", "dmg": 40.0, "str": 16.0, "desc": "攻击+40 · 力量+16"},
+	{"name": "鼎文杖", "owner": "姜维", "dmg": 27.0, "int": 22.0, "desc": "攻击+27 · 智力+22"},
+	{"name": "青龙偃月刀", "owner": "关索", "dmg": 39.0, "str": 15.0, "desc": "攻击+39 · 力量+15"},
+	{"name": "丈八蛇矛", "owner": "张苞", "dmg": 36.0, "str": 16.0, "desc": "攻击+36 · 力量+16"},
+	{"name": "刑天盾", "owner": "王平", "hp": 840.0, "str": 8.0, "desc": "气血+840 · 力量+8"},
+	{"name": "水神戟", "owner": "黄月英", "dmg": 29.0, "int": 20.0, "desc": "攻击+29 · 智力+20"},
+	{"name": "龙胆枪", "owner": "马岱", "dmg": 34.0, "agi": 15.0, "desc": "攻击+34 · 敏捷+15"},
+	{"name": "虎筋弦弓", "owner": "马忠", "dmg": 31.0, "agi": 16.0, "desc": "攻击+31 · 敏捷+16"},
+	{"name": "震天弓", "owner": "祝融夫人", "dmg": 33.0, "agi": 15.0, "desc": "攻击+33 · 敏捷+15"},
+	{"name": "镇魂杖", "owner": "诸葛瞻", "dmg": 26.0, "int": 20.0, "desc": "攻击+26 · 智力+20"},
+	{"name": "太平要术", "owner": "马谡", "int": 32.0, "desc": "智力+32（含法力折算）"},
+	{"name": "神农鼎", "owner": "木鹿大王", "str": 14.0, "int": 14.0, "hp": 400.0, "desc": "力量+14 · 智力+14 · 气血+400"},
+	{"name": "穿云箭", "owner": "祝融夫人", "dmg": 15.0, "agi": 10.0, "desc": "攻击+15 · 敏捷+10"},
+]
+
+
+func refine_material_count(mat_name: String) -> int:
+	var n := 0
+	for item in hero_inventory:
+		if String((item as Dictionary).get("name", "")) == mat_name:
+			n += 1
+	return n
+
+
+func refine_missing_material(cost: Dictionary) -> String:
+	for k in cost.keys():
+		if refine_material_count(String(k)) < int(cost[k]):
+			return String(k)
+	return ""
+
+
+func _refine_take_materials(cost: Dictionary) -> void:
+	for k in cost.keys():
+		var need := int(cost[k])
+		var i := hero_inventory.size() - 1
+		while need > 0 and i >= 0:
+			if String((hero_inventory[i] as Dictionary).get("name", "")) == String(k):
+				hero_inventory.remove_at(i)
+				need -= 1
+			i -= 1
+
+
+func _refine_cost_count(cost: Dictionary) -> int:
+	var n := 0
+	for k in cost.keys():
+		n += int(cost[k])
+	return n
+
+
+func _refine_cost_text(cost: Dictionary) -> String:
+	var parts: Array = []
+	for k in cost.keys():
+		parts.append("%s×%d" % [String(k), int(cost[k])])
+	return " ".join(parts)
+
+
+func refine_set_count(set_name: String) -> int:
+	var n := 0
+	for item in hero_inventory:
+		if String((item as Dictionary).get("set", "")) == set_name:
+			n += 1
+	return n
+
+
+func refine_has_item(item_name: String) -> bool:
+	for item in hero_inventory:
+		if String((item as Dictionary).get("name", "")) == item_name:
+			return true
+	return false
+
+
+func _refine_set_by_name(set_name: String) -> Dictionary:
+	for s in REFINE_SETS:
+		if String((s as Dictionary).get("name", "")) == set_name:
+			return s
+	return {}
+
+
+func _refine_check_forge(fee: int, cost: Dictionary, item_name: String) -> bool:
+	# Shared gate for both forge paths; reports the exact blocker.
+	if refine_has_item(item_name):
+		_update_ui("「%s」已经打造过了。" % item_name)
+		return false
+	var lack := refine_missing_material(cost)
+	if lack != "":
+		_update_ui("缺材料：%s（先在炼化师处买齐材料）。" % lack)
+		return false
+	if gold < fee:
+		_update_ui("金币不足！打造「%s」工费 %d 金，现有 %d 金。" % [item_name, fee, gold])
+		return false
+	if hero_inventory.size() - _refine_cost_count(cost) + 1 > SHOP_MAX_SLOTS:
+		_update_ui("背包空间不足：合成后仍需 1 格，先腾出格子。")
+		return false
+	return true
+
+
+func refine_craft_set(set_name: String, piece_name: String) -> bool:
+	var setd := _refine_set_by_name(set_name)
+	if setd.is_empty():
+		return false
+	var piece: Dictionary = {}
+	for p in (setd["pieces"] as Array):
+		if String((p as Dictionary).get("name", "")) == piece_name:
+			piece = p
+	if piece.is_empty():
+		return false
+	var fee := int(setd.get("fee", 0))
+	var cost: Dictionary = setd.get("cost", {})
+	if not _refine_check_forge(fee, cost, piece_name):
+		return false
+	gold -= fee
+	_refine_take_materials(cost)
+	var forged: Dictionary = piece.duplicate()
+	forged["kind"] = "gear"
+	forged["set"] = set_name
+	hero_inventory.append(forged)
+	_apply_item_effect(forged)
+	crafted_count += 1
+	var owned := refine_set_count(set_name)
+	if owned >= 3:
+		var bonus: Dictionary = (setd.get("bonus", {}) as Dictionary).duplicate()
+		bonus["kind"] = "gear"
+		_apply_item_effect(bonus)
+		_update_ui("打造成功「%s」——集齐【%s】！套装加成生效：%s。" % [piece_name, set_name, String(bonus.get("desc", ""))])
+	else:
+		_update_ui("打造成功「%s」（%s %d/3，剩余 %d 金）。" % [piece_name, set_name, owned, gold])
+	_refresh_inventory_row()
+	_refresh_hud()
+	return true
+
+
+func refine_craft_exclusive(excl_name: String) -> bool:
+	var ex: Dictionary = {}
+	for e in REFINE_EXCLUSIVES:
+		if String((e as Dictionary).get("name", "")) == excl_name:
+			ex = e
+	if ex.is_empty():
+		return false
+	if not _refine_check_forge(REFINE_EXCL_FEE, REFINE_EXCL_COST, excl_name):
+		return false
+	gold -= REFINE_EXCL_FEE
+	_refine_take_materials(REFINE_EXCL_COST)
+	var forged: Dictionary = ex.duplicate()
+	forged["kind"] = "gear"
+	hero_inventory.append(forged)
+	_apply_item_effect(forged)
+	crafted_count += 1
+	var owner := String(ex.get("owner", ""))
+	var tail := ""
+	if hero_index >= 0 and String(HERO_ROSTER[hero_index].get("name", "")) == owner:
+		tail = "专属契合——%s 的技能威力 +30%%！" % owner
+	_update_ui("打造成功「%s」（专属·%s，剩余 %d 金）。%s" % [excl_name, owner, gold, tail])
+	_refresh_inventory_row()
+	_refresh_hud()
+	return true
+
+
+func hero_has_exclusive() -> bool:
+	if hero_index < 0:
+		return false
+	var hname := String(HERO_ROSTER[hero_index].get("name", ""))
+	for item in hero_inventory:
+		var d: Dictionary = item
+		if String(d.get("kind", "")) == "gear" and String(d.get("owner", "")) == hname:
+			return true
+	return false
+
+
+func hero_skill_mul() -> float:
+	# 2D 专属武器 "技能 +1 级" as a 3D power multiplier (see REFINE note).
+	return 1.3 if hero_has_exclusive() else 1.0
+
+
+func _shop_section_label(text_value: String, icon_name: String = "") -> void:
+	var l := Label.new()
+	l.text = text_value
+	l.add_theme_font_size_override("font_size", 15 if _touch_ui else 14)
+	l.add_theme_font_override("font", CJK_FONT_BOLD)
+	l.add_theme_color_override("font_color", Color(1.0, 0.84, 0.40))
+	l.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	l.custom_minimum_size = Vector2(390, 0)
+	var tex := _ui_icon(icon_name) if icon_name != "" else null
+	if tex == null:
+		shop_items_box.add_child(l)
+	else:
+		l.custom_minimum_size = Vector2(364, 0)
+		var row := HBoxContainer.new()
+		row.add_theme_constant_override("separation", 6)
+		row.add_child(_icon_rect(tex, 18.0))
+		row.add_child(l)
+		shop_items_box.add_child(row)
+
+
+func _shop_row_button() -> Button:
+	var b := Button.new()
+	b.focus_mode = Control.FOCUS_NONE
+	b.custom_minimum_size = Vector2(390, 52) if _touch_ui else Vector2(390, 40)
+	b.add_theme_font_size_override("font_size", 15 if _touch_ui else 13)
+	return b
+
+
+func _build_refine_panel_rows() -> void:
+	_shop_section_label("材料（买入背包，打造时消耗）", "material")
+	for item in REFINE_MATERIALS:
+		var d: Dictionary = item
+		var b := _shop_row_button()
+		b.text = "%s · %d金 · 现有 %d" % [String(d.get("name", "")), int(d.get("price", 0)), refine_material_count(String(d.get("name", "")))]
+		_add_btn_icon(b, _ui_icon("material"), 26.0 if _touch_ui else 22.0)
+		b.disabled = gold < int(d.get("price", 0)) or hero_inventory.size() >= SHOP_MAX_SLOTS
+		b.pressed.connect(_on_shop_buy.bind(String(d.get("id", ""))))
+		shop_items_box.add_child(b)
+	_shop_section_label("套装打造（每件同料：工费 + 材料；集齐 3 件触发套装加成）", "armor")
+	for s in REFINE_SETS:
+		var setd: Dictionary = s
+		var set_name := String(setd.get("name", ""))
+		_shop_section_label("【%s】集齐加成：%s（已集 %d/3）" % [set_name, String((setd.get("bonus", {}) as Dictionary).get("desc", "")), refine_set_count(set_name)])
+		for p in (setd["pieces"] as Array):
+			var piece: Dictionary = p
+			var pname := String(piece.get("name", ""))
+			var b2 := _shop_row_button()
+			var owned := refine_has_item(pname)
+			b2.text = "%s%s · 工费%d金 + %s · %s" % ["已拥有 · " if owned else "", pname, int(setd.get("fee", 0)), _refine_cost_text(setd.get("cost", {})), String(piece.get("desc", ""))]
+			b2.disabled = owned
+			_add_btn_icon(b2, _ui_icon("gear"), 26.0 if _touch_ui else 22.0)
+			b2.pressed.connect(_on_refine_craft_set.bind(set_name, pname))
+			shop_items_box.add_child(b2)
+	_shop_section_label("专属终极武器（工费%d金 + %s；对应英雄持有时技能威力 +30%%）" % [REFINE_EXCL_FEE, _refine_cost_text(REFINE_EXCL_COST)], "gear")
+	for e in REFINE_EXCLUSIVES:
+		var ex: Dictionary = e
+		var ename := String(ex.get("name", ""))
+		var b3 := _shop_row_button()
+		var owned3 := refine_has_item(ename)
+		b3.text = "%s%s · 专属%s · %s" % ["已拥有 · " if owned3 else "", ename, String(ex.get("owner", "")), String(ex.get("desc", ""))]
+		b3.disabled = owned3
+		_add_btn_icon(b3, _ui_icon("gear"), 26.0 if _touch_ui else 22.0)
+		b3.pressed.connect(_on_refine_craft_excl.bind(ename))
+		shop_items_box.add_child(b3)
+	if has_hero_item("轩辕剑") and has_hero_item("魄"):
+		var bb := _shop_row_button()
+		bb.text = "轩辕剑开光 · 持魄封入剑身（任务）"
+		_add_btn_icon(bb, _ui_icon("gear"), 26.0 if _touch_ui else 22.0)
+		bb.pressed.connect(_on_xuanyuan_bless)
+		shop_items_box.add_child(bb)
+
+
+func _on_xuanyuan_bless() -> void:
+	if xuanyuan_bless():
+		_refresh_shop_panel()
+	else:
+		_update_ui("开光需要同时持有轩辕剑与「魄」。")
+		_refresh_shop_panel()
+
+
+func _on_refine_craft_set(set_name: String, piece_name: String) -> void:
+	refine_craft_set(set_name, piece_name)
+	if _open_shop_index >= 0:
+		_refresh_shop_panel()
+
+
+func _on_refine_craft_excl(excl_name: String) -> void:
+	refine_craft_exclusive(excl_name)
+	if _open_shop_index >= 0:
+		_refresh_shop_panel()
+
+
+func shop_tier() -> int:
+	# Equipment tier rises one step every 5 waves (20-wave adaptation of
+	# the original's one tier per 7 waves): waves 1-5 tier 1 … 16-20 tier 4.
+	return mini(4, 1 + maxi(current_wave - 1, 0) / SHOP_TIER_WAVE_STEP)
+
+
+func shop_stock(shop_kind: String) -> Array:
+	match shop_kind:
+		"equip":
+			return (SHOP_GEAR_TIERS[shop_tier() - 1] as Array).duplicate()
+		"fine":
+			return (SHOP_TRINKET_TIERS[mini(4, shop_tier() + 1) - 1] as Array).duplicate()
+		"grocery":
+			return SHOP_GROCERY.duplicate()
+		"book":
+			return SHOP_BOOKS.duplicate()
+		"refine":
+			return REFINE_MATERIALS.duplicate()
+	return []
+
+
+func _shop_item_by_id(item_id: String) -> Dictionary:
+	if _open_shop_index < 0 or _open_shop_index >= shop_defs.size():
+		return {}
+	var kind := String((shop_defs[_open_shop_index] as Dictionary).get("kind", ""))
+	for item in shop_stock(kind):
+		var d: Dictionary = item
+		if String(d.get("id", "")) == item_id:
+			return d
+	return {}
+
+
+func _open_shop_panel(idx: int) -> void:
+	if idx < 0 or idx >= shop_defs.size():
+		return
+	var def: Dictionary = shop_defs[idx]
+	var kind := String(def.get("kind", ""))
+	_open_shop_index = idx
+	_refresh_shop_panel()
+	if is_instance_valid(shop_panel):
+		shop_panel.visible = true
+
+
+func _close_shop_panel() -> void:
+	_open_shop_index = -1
+	if is_instance_valid(shop_panel):
+		shop_panel.visible = false
+
+
+func _refresh_shop_panel() -> void:
+	if not is_instance_valid(shop_panel) or _open_shop_index < 0:
+		return
+	var def: Dictionary = shop_defs[_open_shop_index]
+	var kind := String(def.get("kind", ""))
+	var tier := shop_tier()
+	var title := String(def.get("name", "商店"))
+	if kind == "equip":
+		title += " · %s（第 %d 波档位）" % [SHOP_TIER_NAMES[tier - 1], current_wave]
+	elif kind == "fine":
+		title += " · %s（高一档）" % SHOP_TIER_NAMES[mini(4, tier + 1) - 1]
+	elif kind == "grocery":
+		title += " · 消耗品"
+	elif kind == "book":
+		title += " · 属性书"
+	elif kind == "trainer":
+		title += " · 训练场（刷兵房 / 小Boss房）"
+	elif kind == "refine":
+		title += " · 合成打造（材料 / 套装 / 专属）"
+	elif kind == "casino":
+		title += " · 免费筹码赌场"
+	elif kind == "mercenary":
+		title += " · 雇佣兵（人口 %d/%d）" % [pop_used(), pop_cap()]
+	shop_title.text = title
+	shop_gold_label.text = "金币 %d · 背包 %d/%d" % [gold, hero_inventory.size(), SHOP_MAX_SLOTS]
+	for child in shop_items_box.get_children():
+		child.free()
+	if kind == "trainer":
+		_build_trainer_panel_rows()
+		_fit_shop_scroll()
+		_center_shop_panel()
+		return
+	if kind == "refine":
+		_build_refine_panel_rows()
+		_fit_shop_scroll()
+		_center_shop_panel()
+		return
+	if kind == "casino":
+		_build_casino_panel_rows()
+		_fit_shop_scroll()
+		_center_shop_panel()
+		return
+	if kind == "mercenary":
+		_build_merc_panel_rows()
+		_fit_shop_scroll()
+		_center_shop_panel()
+		return
+	for item in shop_stock(kind):
+		var d: Dictionary = item
+		var b := Button.new()
+		_style_button(b)
+		b.add_theme_color_override("font_color", UI_SILK)
+		b.focus_mode = Control.FOCUS_NONE
+		b.custom_minimum_size = Vector2(390, 60) if _touch_ui else Vector2(390, 44)
+		b.add_theme_font_size_override("font_size", 17 if _touch_ui else 15)
+		b.text = "%s · %d金 · %s" % [String(d.get("name", "")), int(d.get("price", 0)), String(d.get("desc", ""))]
+		_add_btn_icon(b, _item_icon(d), 30.0 if _touch_ui else 24.0)
+		var is_book := String(d.get("kind", "")).begins_with("book")
+		b.set_meta("price", int(d.get("price", 0)))
+		b.set_meta("is_book", is_book)
+		b.disabled = gold < int(d.get("price", 0)) or (not is_book and hero_inventory.size() >= SHOP_MAX_SLOTS)
+		b.pressed.connect(_on_shop_buy.bind(String(d.get("id", ""))))
+		shop_items_box.add_child(b)
+	_fit_shop_scroll()
+	_center_shop_panel()
+
+
+func _center_shop_panel() -> void:
+	# shop_panel is center-anchored; center it from its content size
+	# via offsets. (Setting .position at refresh time computes offsets
+	# against the laid-out parent and threw the panel off-screen —
+	# caught by probe_refine's screenshots, 2026-11-14.)
+	var ms := shop_panel.get_combined_minimum_size()
+	shop_panel.offset_left = -ms.x * 0.5
+	shop_panel.offset_right = ms.x * 0.5
+	shop_panel.offset_top = -ms.y * 0.5
+	shop_panel.offset_bottom = ms.y * 0.5
+
+
+func _fit_shop_scroll() -> void:
+	# Cap the items area: normal shops size to content, the refine
+	# panel (38 rows) scrolls instead of overflowing the screen.
+	if not is_instance_valid(shop_scroll) or not is_instance_valid(shop_items_box):
+		return
+	var h := 0.0
+	var n := shop_items_box.get_child_count()
+	for child in shop_items_box.get_children():
+		h += (child as Control).get_combined_minimum_size().y
+	if n > 1:
+		h += 6.0 * float(n - 1)
+	shop_scroll.custom_minimum_size = Vector2(436, clampf(h, 40.0, 400.0))
+
+
+func _update_shop_panel_state() -> void:
+	if not is_instance_valid(shop_panel) or _open_shop_index < 0:
+		return
+	var kind := String((shop_defs[_open_shop_index] as Dictionary).get("kind", ""))
+	if kind == "mercenary":
+		# Mercenary buttons are gated by wave unlock, population and
+		# gold — not by bag space (a mercenary is not an item).
+		shop_gold_label.text = "金币 %d · 背包 %d/%d" % [gold, hero_inventory.size(), SHOP_MAX_SLOTS]
+		for child in shop_items_box.get_children():
+			var b := child as Button
+			if b != null and b.has_meta("merc_idx"):
+				var mdef: Dictionary = MERC_DEFS[int(b.get_meta("merc_idx"))]
+				b.disabled = current_wave < int(mdef.get("wave", 0)) or pop_used() + int(mdef.get("pop", 1)) > pop_cap() or gold < int(mdef.get("cost", 0))
+		return
+	if kind == "casino":
+		# The gamble button is gated by free chips, never by gold or
+		# bag space (a won item stashes when the bag is full).
+		for child in shop_items_box.get_children():
+			var b := child as Button
+			if b != null and bool(b.get_meta("casino_gamble", false)):
+				b.disabled = casino_chips <= 0
+		return
+	shop_gold_label.text = "金币 %d · 背包 %d/%d" % [gold, hero_inventory.size(), SHOP_MAX_SLOTS]
+	for child in shop_items_box.get_children():
+		var b := child as Button
+		if b == null:
+			continue
+		var price := int(b.get_meta("price", 0))
+		var is_book := bool(b.get_meta("is_book", false))
+		b.disabled = gold < price or (not is_book and hero_inventory.size() >= SHOP_MAX_SLOTS)
+
+
+func _on_shop_buy(item_id: String) -> void:
+	var item := _shop_item_by_id(item_id)
+	if item.is_empty():
+		return
+	var price := int(item.get("price", 0))
+	var kind := String(item.get("kind", ""))
+	var is_book := kind.begins_with("book")
+	if not is_book and hero_inventory.size() >= SHOP_MAX_SLOTS:
+		_update_ui("背包已满（6 格）！先用掉消耗品再买。")
+		return
+	if gold < price:
+		_update_ui("金币不足！「%s」需要 %d 金，现有 %d 金。" % [String(item.get("name", "")), price, gold])
+		return
+	gold -= price
+	if is_book:
+		# Books are consumed on purchase (original behavior): the bonus
+		# lands at once and no bag slot is taken.
+		_apply_item_effect(item)
+		_update_ui("已使用「%s」：%s（剩余 %d 金）。" % [String(item.get("name", "")), String(item.get("desc", "")), gold])
+	else:
+		hero_inventory.append(item.duplicate())
+		_apply_item_effect(item)
+		_refresh_inventory_row()
+		_update_ui("已购得「%s」！%s（剩余 %d 金）。" % [String(item.get("name", "")), String(item.get("desc", "")), gold])
+	if _open_shop_index >= 0 and String((shop_defs[_open_shop_index] as Dictionary).get("kind", "")) == "refine":
+		_refresh_shop_panel()
+	else:
+		_update_shop_panel_state()
+	_refresh_hud()
+
+
+# --- 赌场 (stage-2, TEARDOWN §5 / PARITY §5) ------------------------------
+# 2D gamble (game/index.html): 500 gold a pull; r < 0.03 startles a saint
+# beast in the forest; r < 0.10 a consumable; r < 0.30 a premium item;
+# otherwise a normal drop following the equipment shop tier. This slice
+# keeps the odds and swaps the 500 gold for 1 free chip — the SOL design
+# doc red line 1 (recon-jiange/SOL_CHAIN_IAP_DESIGN.md) forbids any
+# gold -> casino path, so a pull never touches `gold` and chips are
+# never bought with gold or converted back. The roll parameter mirrors
+# training_boss_drop(roll): the harness calls with a fixed roll.
+func casino_gamble(forced_roll: float = -1.0) -> bool:
+	if casino_chips <= 0:
+		_update_ui("免费筹码已用完（每局开局赠 %d 枚，不可购买、不可兑换金币）。" % CASINO_CHIPS_PER_GAME)
+		return false
+	casino_chips -= 1
+	casino_pulls += 1
+	var r := forced_roll if forced_roll >= 0.0 else _rng.randf()
+	casino_last_roll = r
+	if r < 0.03:
+		casino_last_result = "beast"
+		var beast := String(CASINO_BEASTS[_rng.randi() % CASINO_BEASTS.size()])
+		casino_beast_name = beast
+		spawn_casino_beast(beast)
+		_update_ui("赌场惊动了神兽「%s」！它出现在森林一带——击败它有黄金装备。" % beast)
+	elif r < 0.10:
+		casino_last_result = "consumable"
+		var con: Dictionary = (SHOP_GROCERY[_rng.randi() % SHOP_GROCERY.size()] as Dictionary).duplicate()
+		if give_hero_item(con):
+			_update_ui("赌出一件消耗品「%s」！" % String(con.get("name", "")))
+		else:
+			_update_ui("赌出一件消耗品「%s」（背包已满，已暂存待领）。" % String(con.get("name", "")))
+	elif r < 0.30:
+		casino_last_result = "premium"
+		var prem := make_random_gold_gear()
+		if give_hero_item(prem):
+			_update_ui("赌出极品「%s」！" % String(prem.get("name", "")))
+		else:
+			_update_ui("赌出极品「%s」（背包已满，已暂存待领）。" % String(prem.get("name", "")))
+	else:
+		casino_last_result = "gear"
+		var stock: Array = shop_stock("equip")
+		var gear: Dictionary = (stock[_rng.randi() % stock.size()] as Dictionary).duplicate()
+		if give_hero_item(gear):
+			_update_ui("赌得「%s」。" % String(gear.get("name", "")))
+		else:
+			_update_ui("赌得「%s」（背包已满，已暂存待领）。" % String(gear.get("name", "")))
+	_refresh_hud()
+	return true
+
+
+func _on_casino_gamble() -> void:
+	if casino_gamble():
+		_refresh_shop_panel()
+
+
+func _build_casino_panel_rows() -> void:
+	_shop_section_label("免费筹码：%d 枚（每局开局赠 %d 枚）" % [casino_chips, CASINO_CHIPS_PER_GAME], "chip")
+	var info := Label.new()
+	info.text = "筹码与金币完全隔离：不可购买、不可兑换金币。1 筹码赌一把：3% 惊动神兽 · 7% 消耗品 · 20% 极品 · 其余普通装备（跟随装备店档位）。"
+	info.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	info.custom_minimum_size = Vector2(460, 0)
+	info.add_theme_color_override("font_color", Color(0.92, 0.90, 0.82))
+	shop_items_box.add_child(info)
+	var b := _shop_row_button()
+	b.text = "赌一把（1 筹码）"
+	_add_btn_icon(b, _ui_icon("chip"), 26.0 if _touch_ui else 22.0)
+	b.set_meta("casino_gamble", true)
+	b.disabled = casino_chips <= 0
+	b.pressed.connect(_on_casino_gamble)
+	shop_items_box.add_child(b)
+	if casino_last_result != "":
+		var res := Label.new()
+		match casino_last_result:
+			"beast":
+				res.text = "上次：惊动神兽「%s」（在森林一带）" % casino_beast_name
+			"consumable":
+				res.text = "上次：赌出消耗品"
+			"premium":
+				res.text = "上次：赌出极品"
+			_:
+				res.text = "上次：赌得普通装备"
+		res.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		res.custom_minimum_size = Vector2(460, 0)
+		res.add_theme_color_override("font_color", Color(1.0, 0.84, 0.40))
+		shop_items_box.add_child(res)
+
+
+func spawn_casino_beast(beast_name: String) -> ArticulatedUnit:
+	# 2D spawnSaint: a wild-side saint unit in the forest (hp 5200, atk
+	# 95, lvl 20, xpV 1500, goldV 600). Scaled to this slice's wild
+	# economy (玄武 2400+150×波 / 赏金 300): a one-off challenge with no
+	# respawn point — it never joins wild_points.
+	var w := float(current_wave)
+	var pos := Vector3(60, 0, -36)
+	var u := _make_unit("beast", "enemy", beast_name, pos, 3000.0 + 150.0 * w, 2.2, 3.0, 20.0, 1.1, "", SAINT_TINTS.get(beast_name, Color.WHITE), 2.0)
+	u.set_meta("wild_kind", "saint_beast")
+	u.set_meta("home", pos)
+	u.set_meta("bounty", 300)
+	u.set_meta("xp", 200)
+	wilds.append(u)
+	return u
+
+
+# --- 圣痕 / 四圣兽 (stage-2, TEARDOWN section 7) -----------------------
+# Wild saints hold their four daises (240 s respawn, the 2D cadence)
+# and drop a 圣痕 on death; 朱雀 also leaves 铜雀， 白虎 和氏璧， 玄武
+# its 玉玺 (quest, pre-existing). Using a mark summons that beast as a
+# hero companion for 1 population; when it falls the mark returns to
+# the bag (2D: the beast reverts to its mark). 2D stats halve like
+# the rest of the slice (wild 5200/95 -> 2600/26 with wave scaling,
+# summoned 4200/90 -> 2100/45). 朱雀's 2D flight has no 3D analogue
+# yet and is noted, not faked.
+# ================= Status effects (hero skills, stage-2 kits) =================
+# Timed effects live in unit metas keyed against the `elapsed` clock;
+# DoTs tick from dot_effects; slow/hex restore on expiry via the sweep.
+
+func _status_track(u: ArticulatedUnit) -> void:
+	if not status_units.has(u):
+		status_units.append(u)
+
+
+func _apply_stun(u: ArticulatedUnit, dur: float) -> void:
+	if u.has_meta("bsk_transform_until") and elapsed < float(u.get_meta("bsk_transform_until")):
+		return # 天神下凡: immune to control
+	u.set_meta("stun_until", elapsed + dur)
+	_status_track(u)
+
+
+func _apply_root(u: ArticulatedUnit, dur: float) -> void:
+	if u.has_meta("bsk_transform_until") and elapsed < float(u.get_meta("bsk_transform_until")):
+		return # 天神下凡: immune to control
+	u.set_meta("root_until", elapsed + dur)
+	_status_track(u)
+
+
+func _apply_slow(u: ArticulatedUnit, factor: float, dur: float) -> void:
+	if u.has_meta("bsk_transform_until") and elapsed < float(u.get_meta("bsk_transform_until")):
+		return # 天神下凡: immune to control
+	if not u.has_meta("slow_base"):
+		u.set_meta("slow_base", u.move_speed)
+	u.set_meta("slow_factor", factor)
+	u.set_meta("slow_until", elapsed + dur)
+	u.move_speed = float(u.get_meta("slow_base")) * factor
+	_status_track(u)
+
+
+func _apply_vuln(u: ArticulatedUnit, pct: float, dur: float) -> void:
+	u.set_meta("vuln_pct", pct)
+	u.set_meta("vuln_until", elapsed + dur)
+	_status_track(u)
+
+
+func _apply_atk_cut(u: ArticulatedUnit, mul: float, dur: float) -> void:
+	u.set_meta("atk_cut_mul", mul)
+	u.set_meta("atk_cut_until", elapsed + dur)
+	_status_track(u)
+
+
+func _apply_hex(u: ArticulatedUnit, dur: float) -> void:
+	if u.has_meta("bsk_transform_until") and elapsed < float(u.get_meta("bsk_transform_until")):
+		return # 天神下凡: immune to control
+	if not u.has_meta("hex_base_scale"):
+		u.set_meta("hex_base_scale", u.scale)
+	u.scale = (u.get_meta("hex_base_scale") as Vector3) * 0.55
+	u.set_meta("hex_until", elapsed + dur)
+	_status_track(u)
+
+
+func _apply_dot(u: ArticulatedUnit, dps: float, dur: float, kind: String, src: Node = null, from_boss_skill: bool = false) -> void:
+	if u.has_meta("bsk_transform_until") and elapsed < float(u.get_meta("bsk_transform_until")):
+		return # 天神下凡: immune to DoT
+	dot_effects.append({"u": u, "dps": dps, "left": dur, "acc": 0.0, "kind": kind, "src": src, "bsk": from_boss_skill})
+
+
+func _unit_disabled(u: ArticulatedUnit) -> bool:
+	for k in ["stun_until", "root_until", "hex_until"]:
+		if u.has_meta(k) and elapsed < float(u.get_meta(k)):
+			return true
+	return false
+
+
+# --- Boss skill engine (stage 2) -------------------------------------------
+# The boss AI mirrors the 2D bossCast: pick the hero (else the general,
+# else the nearest defender) and fire the first ready active skill from
+# the boss's list, one cast per 1.5 s per boss. Passives and auras live in
+# apply_damage / the aura tick below.
+
+func _defender_units() -> Array:
+	var out: Array = []
+	if is_instance_valid(strategist) and strategist.alive:
+		out.append(strategist)
+	if is_instance_valid(general) and general.alive:
+		out.append(general)
+	for m in mercs:
+		if is_instance_valid(m) and m.alive:
+			out.append(m)
+	for s in saints_active:
+		if is_instance_valid(s) and s is ArticulatedUnit and s.alive:
+			out.append(s)
+	return out
+
+
+func _boss_drum_near(pos: Vector3) -> bool:
+	for e in enemies:
+		if is_instance_valid(e) and e.alive and e.has_meta("boss_skills") and (e.get_meta("boss_skills") as Array).has("战鼓"):
+			if Vector2(e.global_position.x - pos.x, e.global_position.z - pos.z).length() <= 10.0:
+				return true
+	return false
+
+
+func _boss_splash(src: ArticulatedUnit, center: ArticulatedUnit, amount: float, radius: float, ring: bool = false) -> void:
+	# Caller holds _boss_splash_busy.
+	for d in _defender_units():
+		if d == center:
+			continue
+		if Vector2(d.global_position.x - center.global_position.x, d.global_position.z - center.global_position.z).length() <= radius:
+			apply_damage(src, d, amount, "cleave")
+	if ring:
+		_spawn_burst(center.get_hit_position(), Color(1.0, 0.48, 0.32), 12, 0.28, 0.4)
+
+
+func _boss_predthunder(src: ArticulatedUnit, first: ArticulatedUnit) -> void:
+	# Caller holds _boss_splash_busy. 红色怒雷: 22% on-hit chain to the
+	# nearest other defender (2D predthunder).
+	var best: ArticulatedUnit = null
+	var best_d := 7.0
+	for d in _defender_units():
+		if d == first:
+			continue
+		var dd := Vector2(d.global_position.x - first.global_position.x, d.global_position.z - first.global_position.z).length()
+		if dd < best_d:
+			best_d = dd
+			best = d
+	if best != null:
+		_spawn_lightning([first.get_hit_position(), best.get_hit_position()])
+		apply_damage(src, best, src.attack_damage * 3.0, "lightning")
+
+
+func _hande_death_curse(boss: ArticulatedUnit) -> void:
+	# 韩德 (2D special 'hande'): on death, if more than 2 distinct
+	# defenders hit him in the last 6 s, the curse blasts every one of
+	# them; with 2 or fewer attackers it fizzles — the intended counter.
+	var attackers: Array = []
+	if boss.has_meta("atk_by"):
+		var atk_by: Dictionary = boss.get_meta("atk_by")
+		for id in atk_by.keys():
+			var rec: Array = atk_by[id]
+			var u = rec[0]
+			if is_instance_valid(u) and u.alive and elapsed - float(rec[1]) < 6.0:
+				attackers.append(u)
+	if attackers.size() > 2:
+		_update_ui("韩德临死触发玄冰咒！")
+		_spawn_burst(boss.get_hit_position(), Color(0.65, 0.85, 1.0), 16, 0.3, 0.5)
+		for a in attackers:
+			apply_damage(null, a, boss.attack_damage * 12.0, "boss_skill")
+			_apply_stun(a, 2.5)
+	else:
+		_update_ui("玄冰咒未触发（围攻者 ≤2）。")
+
+
+func _boss_say(u: ArticulatedUnit, text: String) -> void:
+	var label := Label3D.new()
+	label.name = "BossSay"
+	label.text = text
+	label.font = CJK_FONT
+	label.font_size = 72
+	label.pixel_size = 0.012
+	label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+	label.modulate = Color(1.0, 0.62, 0.38)
+	label.outline_size = 12
+	label.outline_modulate = Color(0.25, 0.05, 0.0)
+	label.position = u.global_position + Vector3(0, 3.85 * clampf(u.scale.x, 1.3, 1.9) + 1.7, 0)
+	effects_root.add_child(label)
+	effects.append({"node": label, "ttl": 1.1, "kind": "bounty", "ttl0": 1.1})
+
+
+func _boss_pick_target(boss: ArticulatedUnit) -> ArticulatedUnit:
+	var bp := boss.global_position
+	if is_instance_valid(strategist) and strategist.alive and bp.distance_to(strategist.global_position) <= 16.0:
+		return strategist
+	if is_instance_valid(general) and general.alive and bp.distance_to(general.global_position) <= 16.0:
+		return general
+	var best: ArticulatedUnit = null
+	var best_d := 16.0
+	for d in _defender_units():
+		var dd := bp.distance_to(d.global_position)
+		if dd < best_d:
+			best_d = dd
+			best = d
+	return best
+
+
+func _boss_buff_tick(e: ArticulatedUnit) -> void:
+	if e.has_meta("bsk_haste_until") and elapsed >= float(e.get_meta("bsk_haste_until")):
+		e.remove_meta("bsk_haste_until")
+		if e.has_meta("bsk_base_cd"):
+			e.attack_cooldown_time = float(e.get_meta("bsk_base_cd"))
+			e.remove_meta("bsk_base_cd")
+	if e.has_meta("bsk_charge_until") and elapsed >= float(e.get_meta("bsk_charge_until")):
+		e.remove_meta("bsk_charge_until")
+		if e.has_meta("bsk_base_speed"):
+			var base_spd := float(e.get_meta("bsk_base_speed"))
+			if e.has_meta("slow_until") and elapsed < float(e.get_meta("slow_until")):
+				e.set_meta("slow_base", base_spd)
+			else:
+				e.move_speed = base_spd
+	if e.has_meta("bsk_transform_until") and elapsed >= float(e.get_meta("bsk_transform_until")):
+		e.remove_meta("bsk_transform_until")
+		if e.has_meta("bsk_base_scale"):
+			e.scale = e.get_meta("bsk_base_scale")
+			e.remove_meta("bsk_base_scale")
+		if e.has_meta("bsk_base_atk"):
+			e.attack_damage = float(e.get_meta("bsk_base_atk"))
+			e.remove_meta("bsk_base_atk")
+
+
+func cast_boss_skill(boss: ArticulatedUnit, skill_name: String, tgt: ArticulatedUnit) -> bool:
+	var def: Dictionary = BSK_DEF.get(skill_name, {})
+	if def.is_empty() or not is_instance_valid(boss) or not boss.alive:
+		return false
+	var kind := String(def.get("kind", ""))
+	var a := boss.attack_damage
+	var bp := boss.global_position
+	match kind:
+		"nuke":
+			if tgt == null:
+				return false
+			_boss_say(boss, skill_name + "！")
+			_spawn_burst(tgt.get_hit_position(), Color(0.65, 0.85, 1.0), 10, 0.24, 0.4)
+			apply_damage(boss, tgt, a * float(def.get("mult", 0.0)), "boss_skill")
+			if def.has("stun"):
+				_apply_stun(tgt, float(def["stun"]))
+			if def.has("slow"):
+				_apply_slow(tgt, 0.5, 3.0)
+			return true
+		"burnmp":
+			if tgt == null:
+				return false
+			_boss_say(boss, skill_name + "！")
+			_spawn_burst(tgt.get_hit_position(), Color(0.48, 0.72, 1.0), 8, 0.22, 0.35)
+			apply_damage(boss, tgt, a * float(def.get("mult", 0.0)), "boss_skill")
+			_apply_atk_cut(tgt, 0.7, 6.0) # no mana in 3D: 燃魔 lands as atk_cut
+			return true
+		"blink":
+			if tgt == null:
+				return false
+			_boss_say(boss, skill_name + "！")
+			var back := Vector3(bp.x - tgt.global_position.x, 0, bp.z - tgt.global_position.z)
+			if back.length() > 0.1:
+				back = back.normalized() * 1.8
+			else:
+				back = Vector3(1.8, 0, 0)
+			boss.global_position = tgt.global_position + back
+			boss.face_towards(tgt.global_position)
+			_spawn_burst(boss.get_hit_position(), Color(0.9, 0.85, 1.0), 8, 0.22, 0.35)
+			apply_damage(boss, tgt, a * float(def.get("mult", 0.0)), "boss_skill")
+			return true
+		"line":
+			if tgt == null:
+				return false
+			_boss_say(boss, skill_name + "！")
+			var dir := Vector3(tgt.global_position.x - bp.x, 0, tgt.global_position.z - bp.z)
+			if dir.length() < 0.1:
+				return false
+			dir = dir.normalized()
+			boss.face_towards(tgt.global_position)
+			var hit_any := false
+			for d in _defender_units():
+				var rel := Vector3(d.global_position.x - bp.x, 0, d.global_position.z - bp.z)
+				var along := rel.dot(dir)
+				var side := absf(rel.cross(dir).y)
+				if along >= 0.0 and along <= 13.0 and side <= 2.6:
+					apply_damage(boss, d, a * float(def.get("mult", 0.0)), "boss_skill")
+					_spawn_burst(d.get_hit_position(), Color(1.0, 0.6, 0.3) if def.has("flame") else Color(0.9, 0.9, 1.0), 6, 0.2, 0.3)
+					hit_any = true
+			return hit_any
+		"aoe":
+			if tgt == null:
+				return false
+			_boss_say(boss, skill_name + "！")
+			var center := tgt.global_position
+			_spawn_burst(center + Vector3(0, 1, 0), Color(1.0, 0.62, 0.36), 14, 0.3, 0.45)
+			var hit_any := false
+			for d in _defender_units():
+				if Vector2(d.global_position.x - center.x, d.global_position.z - center.z).length() <= 4.2:
+					apply_damage(boss, d, a * float(def.get("mult", 0.0)), "boss_skill")
+					if def.has("stun"):
+						_apply_stun(d, float(def["stun"]))
+					if def.has("dot"):
+						_apply_dot(d, a * float(def["dot"]), 4.0, "flame", boss, true)
+					hit_any = true
+			return hit_any
+		"bind":
+			if tgt == null:
+				return false
+			_boss_say(boss, skill_name + "！")
+			_apply_root(tgt, float(def.get("dur", 6.0)))
+			_apply_dot(tgt, a * float(def.get("dps_mult", 0.0)), float(def.get("dur", 6.0)), "poison", boss, true)
+			_spawn_burst(tgt.get_hit_position(), Color(0.6, 1.0, 0.55), 8, 0.22, 0.35)
+			return true
+		"chain":
+			if tgt == null:
+				return false
+			_boss_say(boss, skill_name + "！")
+			var targets: Array = [tgt]
+			var current: ArticulatedUnit = tgt
+			while targets.size() < 1 + int(def.get("jumps", 4)):
+				var best: ArticulatedUnit = null
+				var best_d := 7.0
+				for d in _defender_units():
+					if targets.has(d):
+						continue
+					var dd := Vector2(d.global_position.x - current.global_position.x, d.global_position.z - current.global_position.z).length()
+					if dd < best_d:
+						best_d = dd
+						best = d
+				if best == null:
+					break
+				targets.append(best)
+				current = best
+			var points: Array = [bp + Vector3(0, 2.0, 0)]
+			for t in targets:
+				points.append(t.get_hit_position())
+			_spawn_lightning(points)
+			var dmg := a * float(def.get("mult", 0.0))
+			for t in targets:
+				apply_damage(boss, t, dmg, "boss_skill")
+				_apply_stun(t, float(def.get("stun", 0.0)))
+				dmg *= 0.8
+			return true
+		"tianshi":
+			var defs := _defender_units()
+			if defs.is_empty():
+				return false
+			_boss_say(boss, "天石术！")
+			var best_center: Vector3 = (defs[0] as ArticulatedUnit).global_position
+			var best_n := -1
+			for c in defs:
+				var n := 0
+				for d in defs:
+					if Vector2(d.global_position.x - c.global_position.x, d.global_position.z - c.global_position.z).length() <= 3.2:
+						n += 1
+				if n > best_n:
+					best_n = n
+					best_center = c.global_position
+			boss_pending.append({"at": elapsed + 1.0, "pos": best_center, "r": 3.2, "dmg": a * float(def.get("mult", 0.0)), "src": boss})
+			_spawn_burst(best_center + Vector3(0, 1.2, 0), Color(1.0, 0.35, 0.25), 10, 0.26, 0.5)
+			_update_ui("天石术将至——散开！（陨石专砸人堆）")
+			return true
+		"dot":
+			if tgt == null:
+				return false
+			_boss_say(boss, skill_name + "！")
+			_apply_dot(tgt, a * float(def.get("dps_mult", 0.0)), float(def.get("dur", 12.0)), "curse", boss, true)
+			if tgt == strategist:
+				strategist.set_meta("silenced_until", elapsed + float(def.get("dur", 12.0)))
+				_update_ui("英雄被蚀心咒沉默 %.0f 秒！" % float(def.get("dur", 12.0)))
+			_spawn_burst(tgt.get_hit_position(), Color(0.72, 0.45, 1.0), 8, 0.22, 0.35)
+			return true
+		"debuff_vuln":
+			if tgt == null:
+				return false
+			_boss_say(boss, skill_name + "！")
+			_apply_vuln(tgt, float(def.get("v", 0.2)), float(def.get("dur", 10.0)))
+			_spawn_burst(tgt.get_hit_position(), Color(0.95, 0.8, 0.5), 6, 0.2, 0.3)
+			return true
+		"debuff_roar":
+			var roared := false
+			for d in _defender_units():
+				if Vector2(d.global_position.x - bp.x, d.global_position.z - bp.z).length() <= 6.0:
+					_apply_atk_cut(d, 0.65, 10.0)
+					_apply_vuln(d, 0.10, 10.0)
+					roared = true
+			if not roared:
+				return false
+			_boss_say(boss, skill_name + "！")
+			_spawn_burst(bp + Vector3(0, 1.5, 0), Color(1.0, 0.85, 0.45), 14, 0.3, 0.45)
+			return true
+		"healwave":
+			_boss_say(boss, skill_name + "！")
+			var healed := 0
+			for e in alive_enemies():
+				if healed >= 5:
+					break
+				if Vector2(e.global_position.x - bp.x, e.global_position.z - bp.z).length() <= 8.0:
+					e.hp = minf(e.max_hp, e.hp + e.max_hp * float(def.get("pct", 0.18)))
+					_spawn_burst(e.get_hit_position(), Color(0.55, 1.0, 0.6), 5, 0.18, 0.3)
+					healed += 1
+			return healed > 0
+		"healself":
+			_boss_say(boss, skill_name + "！")
+			boss.hp = minf(boss.max_hp, boss.hp + boss.max_hp * float(def.get("pct", 0.2)))
+			_spawn_burst(boss.get_hit_position(), Color(0.55, 1.0, 0.6), 8, 0.2, 0.35)
+			return true
+		"shield":
+			_boss_say(boss, skill_name + "！")
+			boss.set_meta("bsk_shield_hp", boss.max_hp * 0.30)
+			boss.set_meta("bsk_shield_until", elapsed + 18.0)
+			_spawn_burst(boss.get_hit_position(), Color(0.55, 0.75, 1.0), 10, 0.24, 0.4)
+			return true
+		"buff_haste":
+			_boss_say(boss, skill_name + "！")
+			if not boss.has_meta("bsk_base_cd"):
+				boss.set_meta("bsk_base_cd", boss.attack_cooldown_time)
+			boss.attack_cooldown_time = float(boss.get_meta("bsk_base_cd")) * 0.65
+			boss.set_meta("bsk_haste_until", elapsed + float(def.get("dur", 12.0)))
+			return true
+		"buff_invuln":
+			_boss_say(boss, skill_name + "！")
+			boss.set_meta("bsk_invuln_until", elapsed + float(def.get("dur", 5.0)))
+			_spawn_burst(boss.get_hit_position(), Color(1.0, 0.9, 0.45), 12, 0.26, 0.45)
+			return true
+		"buff_fire":
+			_boss_say(boss, skill_name + "！")
+			boss.set_meta("bsk_fire_until", elapsed + float(def.get("dur", 15.0)))
+			return true
+		"buff_charge":
+			_boss_say(boss, skill_name + "！")
+			if not boss.has_meta("bsk_base_speed"):
+				boss.set_meta("bsk_base_speed", boss.move_speed)
+			boss.set_meta("bsk_charge_until", elapsed + float(def.get("dur", 8.0)))
+			var base_spd := float(boss.get_meta("bsk_base_speed"))
+			if boss.has_meta("slow_until") and elapsed < float(boss.get_meta("slow_until")):
+				boss.set_meta("slow_base", base_spd)
+			else:
+				boss.move_speed = base_spd * 1.48
+			return true
+		"transform":
+			if boss.has_meta("bsk_transform_until") and elapsed < float(boss.get_meta("bsk_transform_until")):
+				return false
+			_boss_say(boss, skill_name + "！")
+			_update_ui("%s 天神下凡！（变大、攻击提升、免疫控制）" % boss.display_name)
+			boss.set_meta("bsk_base_scale", boss.scale)
+			boss.set_meta("bsk_base_atk", boss.attack_damage)
+			boss.scale = (boss.get_meta("bsk_base_scale") as Vector3) * 1.35
+			boss.attack_damage = float(boss.get_meta("bsk_base_atk")) * 1.5
+			boss.set_meta("bsk_transform_until", elapsed + float(def.get("dur", 20.0)))
+			_spawn_burst(boss.get_hit_position(), Color(1.0, 0.75, 0.4), 16, 0.32, 0.5)
+			return true
+		"mirror":
+			_boss_say(boss, skill_name + "！")
+			for i in int(def.get("cnt", 2)):
+				var clone := _make_unit("boss", "enemy", boss.display_name + "·影", bp + Vector3(_rng.randf_range(-2.0, 2.0), 0, _rng.randf_range(-2.0, 2.0)), boss.max_hp * float(def.get("pct", 0.6)), boss.move_speed, boss.attack_range, boss.attack_damage * float(def.get("pct", 0.6)), boss.attack_cooldown_time, "", Color(0.75, 0.78, 0.95), boss.scale.x)
+				clone.set_meta("is_clone", true)
+				clone.set_meta("bounty", 0)
+				clone.set_meta("xp", 0)
+				clone.set_meta("lane", boss.get_meta("lane", 0))
+				clone.set_meta("lane_path", boss.get_meta("lane_path", LANE_NORTH))
+				clone.set_meta("lane_z", boss.get_meta("lane_z", 0.0))
+				clone.set_meta("wp_index", boss.get_meta("wp_index", 1))
+				enemies.append(clone)
+			return true
+		"summon":
+			_boss_say(boss, skill_name + "！")
+			for i in int(def.get("cnt", 1)):
+				var pos := bp + Vector3(_rng.randf_range(-2.5, 2.5), 0, _rng.randf_range(-2.5, 2.5))
+				var minion: ArticulatedUnit
+				if String(def.get("sum", "")) == "puppet":
+					minion = _make_unit("enemy", "enemy", "傀儡", pos, 90.0 * wave_hp_scale(current_wave), 2.6, 2.1, a * 0.5, 0.9, "enemy", Color(0.62, 0.60, 0.58))
+				else:
+					minion = _make_beast(pos, wave_beast_scale(current_wave))
+				minion.set_meta("lane", boss.get_meta("lane", 0))
+				minion.set_meta("lane_path", boss.get_meta("lane_path", LANE_NORTH))
+				minion.set_meta("lane_z", boss.get_meta("lane_z", 0.0))
+				minion.set_meta("wp_index", boss.get_meta("wp_index", 1))
+				minion.set_meta("bounty", 10)
+				enemies.append(minion)
+			return true
+		"zone":
+			var center := bp
+			if tgt != null:
+				center = tgt.global_position
+			_boss_say(boss, skill_name + "！")
+			boss_zones.append({"pos": center, "r": 6.5, "dps": a * float(def.get("dps_mult", 2.0)), "until": elapsed + float(def.get("dur", 10.0)), "acc": 0.0, "src": boss, "name": skill_name})
+			_spawn_burst(center + Vector3(0, 1.2, 0), Color(0.75, 0.6, 1.0) if skill_name == "星辰爆" else Color(0.6, 0.8, 1.0), 14, 0.3, 0.5)
+			return true
+	return false
+
+
+func _update_boss_skills(delta: float) -> void:
+	if game_state != "battle":
+		return
+	# Pending 天石术 meteors.
+	for i in range(boss_pending.size() - 1, -1, -1):
+		var p: Dictionary = boss_pending[i]
+		if elapsed >= float(p["at"]):
+			boss_pending.remove_at(i)
+			var psrc = p["src"]
+			if is_instance_valid(psrc):
+				var ppos: Vector3 = p["pos"]
+				_spawn_burst(ppos + Vector3(0, 1.0, 0), Color(1.0, 0.62, 0.36), 18, 0.34, 0.5)
+				for d in _defender_units():
+					if Vector2(d.global_position.x - ppos.x, d.global_position.z - ppos.z).length() <= float(p["r"]):
+						apply_damage(psrc, d, float(p["dmg"]), "boss_skill")
+	# Ground zones （星辰爆 / 雷动九天）.
+	for i in range(boss_zones.size() - 1, -1, -1):
+		var z: Dictionary = boss_zones[i]
+		if elapsed >= float(z["until"]):
+			boss_zones.remove_at(i)
+			continue
+		z["acc"] = float(z["acc"]) + delta
+		if float(z["acc"]) >= 0.5:
+			z["acc"] = float(z["acc"]) - 0.5
+			var zsrc = z["src"]
+			if is_instance_valid(zsrc):
+				var zpos: Vector3 = z["pos"]
+				for d in _defender_units():
+					if Vector2(d.global_position.x - zpos.x, d.global_position.z - zpos.z).length() <= float(z["r"]):
+						apply_damage(zsrc, d, float(z["dps"]) * 0.5, "boss_skill")
+	# Per-boss buff expiry, auras and casting.
+	for e in enemies:
+		if not is_instance_valid(e) or not e.alive or e.archetype != "boss":
+			continue
+		if e.has_meta("finale_trapped") or not e.has_meta("boss_skills"):
+			continue
+		_boss_buff_tick(e)
+		var skills: Array = e.get_meta("boss_skills")
+		if skills.has("破甲阵") or skills.has("玄冰真气"):
+			for d in _defender_units():
+				if Vector2(d.global_position.x - e.global_position.x, d.global_position.z - e.global_position.z).length() <= 5.5:
+					if skills.has("破甲阵"):
+						_apply_vuln(d, 0.15, 0.7)
+					if skills.has("玄冰真气"):
+						_apply_slow(d, 0.75, 0.7)
+		if _unit_disabled(e):
+			continue
+		if elapsed < float(e.get_meta("bsk_next_cast", 0.0)):
+			continue
+		var tgt := _boss_pick_target(e)
+		for sn in skills:
+			var skill_name := String(sn)
+			var def: Dictionary = BSK_DEF.get(skill_name, {})
+			if def.is_empty():
+				continue
+			var kind := String(def.get("kind", ""))
+			if kind.begins_with("p") or kind.begins_with("paura"):
+				continue
+			if elapsed < float(e.get_meta(_bsk_cd_key(skill_name), 0.0)):
+				continue
+			if (kind == "healself" or kind == "healwave") and e.hp > e.max_hp * 0.75:
+				continue
+			if kind in ["nuke", "burnmp", "blink", "line", "aoe", "bind", "chain", "dot", "debuff_vuln"] and tgt == null:
+				continue
+			if kind in BSK_GATE_KINDS and elapsed < bsk_global_next_cast:
+				continue
+			if cast_boss_skill(e, skill_name, tgt):
+				e.set_meta(_bsk_cd_key(skill_name), elapsed + float(def.get("cd", 15.0)))
+				e.set_meta("bsk_next_cast", elapsed + 1.5)
+				if kind in BSK_GATE_KINDS:
+					# 0.1.52: 1.35 s spreads multi-boss casts below the single-boss 1.5 s throttle.
+					bsk_global_next_cast = elapsed + 1.35
+				break
+
+
+func _update_statuses(delta: float) -> void:
+	if game_state == "battle":
+		for i in range(dot_effects.size() - 1, -1, -1):
+			var d: Dictionary = dot_effects[i]
+			var u = d["u"]
+			if not is_instance_valid(u) or not u.alive:
+				dot_effects.remove_at(i)
+				continue
+			d["left"] = float(d["left"]) - delta
+			d["acc"] = float(d["acc"]) + delta
+			if float(d["acc"]) >= 0.5:
+				var ticks := int(float(d["acc"]) / 0.5)
+				d["acc"] = float(d["acc"]) - float(ticks) * 0.5
+				var src: Node = null
+				if d.has("src") and is_instance_valid(d["src"]):
+					src = d["src"]
+				elif is_instance_valid(strategist):
+					src = strategist
+				_dot_tick_active = true
+				apply_damage(src, u, float(d["dps"]) * 0.5 * float(ticks), "boss_skill" if bool(d.get("bsk", false)) else String(d["kind"]))
+				_dot_tick_active = false
+			if float(d["left"]) <= 0.0:
+				dot_effects.remove_at(i)
+	for i in range(status_units.size() - 1, -1, -1):
+		var su: ArticulatedUnit = status_units[i]
+		if not is_instance_valid(su):
+			status_units.remove_at(i)
+			continue
+		var active := false
+		if su.has_meta("slow_until"):
+			if elapsed < float(su.get_meta("slow_until")):
+				active = true
+			elif su.has_meta("slow_base"):
+				su.move_speed = float(su.get_meta("slow_base"))
+				su.remove_meta("slow_base")
+				su.remove_meta("slow_until")
+		if su.has_meta("hex_until"):
+			if elapsed < float(su.get_meta("hex_until")):
+				active = true
+			elif su.has_meta("hex_base_scale"):
+				su.scale = su.get_meta("hex_base_scale")
+				su.remove_meta("hex_base_scale")
+				su.remove_meta("hex_until")
+		for k in ["stun_until", "root_until", "vuln_until", "atk_cut_until"]:
+			if su.has_meta(k) and elapsed < float(su.get_meta(k)):
+				active = true
+		if not su.alive or not active:
+			status_units.remove_at(i)
+
+
+# ================= Finale: 三司马 + 上方谷 fire trap (2D §4) =================
+
+func _check_finale_done() -> void:
+	if String(sima_state["司马昭"]) == "dead" and String(sima_state["司马师"]) == "dead" and String(sima_state["司马懿"]) == "dead":
+		finale_done = true
+		if qstate("shangfanggu") != "done":
+			qset("shangfanggu", "done")
+
+
+func _update_finale_yi(e: ArticulatedUnit) -> void:
+	# In the finale 司马懿 hunts the hero personally — which is exactly
+	# what makes luring him into the 上方谷 fire trap possible.
+	if yi_trapped:
+		e.stop_moving()
+		return
+	if not is_instance_valid(strategist) or not strategist.alive:
+		e.move_to(_lane_target(e))
+		return
+	var d := Vector2(strategist.global_position.x - e.global_position.x, strategist.global_position.z - e.global_position.z).length()
+	if d > e.attack_range:
+		e.move_to(strategist.global_position)
+	else:
+		e.stop_moving()
+		e.face_towards(strategist.global_position)
+		if e.can_attack():
+			e.begin_attack()
+			_fire_arrow(e, strategist)
+
+
+func _trap_yi() -> void:
+	yi_trapped = true
+	sima_yi.set_meta("finale_trapped", true)
+	sima_yi.stop_moving()
+	var fm := StandardMaterial3D.new()
+	fm.albedo_color = Color(1.0, 0.45, 0.15)
+	fm.emission_enabled = true
+	fm.emission = Color(1.0, 0.42, 0.10)
+	fm.emission_energy_multiplier = 2.0
+	for i in range(6):
+		var a := TAU * float(i) / 6.0
+		var cone := MeshInstance3D.new()
+		var cm := CylinderMesh.new()
+		cm.top_radius = 0.06
+		cm.bottom_radius = 0.75
+		cm.height = 2.6
+		cone.mesh = cm
+		cone.material_override = fm
+		cone.position = sima_yi.global_position + Vector3(cos(a) * 3.4, 1.3, sin(a) * 3.4)
+		world_root.add_child(cone)
+		finale_flames.append(cone)
+	_update_ui("上方谷火起！司马懿被困谷中，刀兵难伤——趁现在先杀司马昭！")
+
+
+func _release_yi_trap() -> void:
+	yi_trapped = false
+	if is_instance_valid(sima_yi):
+		sima_yi.remove_meta("finale_trapped")
+	for f in finale_flames:
+		if is_instance_valid(f):
+			(f as Node).queue_free()
+	finale_flames.clear()
+	_update_ui("司马师、司马昭已死，谷口火势渐熄——司马懿脱困！决战！")
+
+
+func _respawn_sima_yi() -> void:
+	# 2D finale rule: while 师 or 昭 lives, 司马懿 revives after 5 s at
+	# 80% of his wave-20 health. Reuses _spawn_boss via a temporary list.
+	var saved_list: Array = current_boss_list
+	var saved_idx := boss_spawn_index
+	current_boss_list = [{"name": "司马懿", "visual": "strategist", "tint": Color(0.60, 0.62, 1.0), "mul": 2.08, "ranged": true}]
+	boss_spawn_index = 0
+	var u := _spawn_boss(0, LANE_NORTH, LANE_NORTH[0] + Vector3(0, 0, -1.5))
+	current_boss_list = saved_list
+	boss_spawn_index = saved_idx
+	u.set_meta("lane_z", -1.5)
+	u.set_meta("lane", 0)
+	u.set_meta("lane_path", LANE_NORTH)
+	u.set_meta("wp_index", 1)
+	enemies.append(u)
+	_update_ui("司马懿复活了！")
+
+
+func _update_finale(delta: float) -> void:
+	if not finale_active:
+		return
+	if finale_hint_stage < 2:
+		finale_hint_timer -= delta
+		if finale_hint_timer <= 0.0:
+			if finale_hint_stage == 0:
+				_update_ui("孔明：司马懿命不该绝于刀兵——他在师、昭未死时是不会真正倒下的。")
+				finale_hint_stage = 1
+				finale_hint_timer = 6.0
+			else:
+				_update_ui("孔明：上方谷已备好火油——把司马懿引进谷里，我自有火困之计。先昭、后师、再懿，顺序不可乱！")
+				finale_hint_stage = 2
+	if yi_revive_timer > 0.0:
+		yi_revive_timer -= delta
+		if yi_revive_timer <= 0.0:
+			yi_revive_timer = -1.0
+			_respawn_sima_yi()
+	if is_instance_valid(sima_yi) and sima_yi.alive and not yi_trapped and String(sima_state["司马懿"]) == "alive":
+		if VALLEY_ZONE.has_point(Vector2(sima_yi.global_position.x, sima_yi.global_position.z)):
+			_trap_yi()
+
+
+func saint_mark_item(beast: String) -> Dictionary:
+	return {"name": "圣痕·" + beast, "kind": "mark", "beast": beast, "desc": "使用：召唤%s助战（人口 1）；圣兽阵亡后变回圣痕" % beast}
+
+
+func hero_has_detection() -> bool:
+	# 和氏璧 held in the bag sees through stealth (the assassin
+	# system consumes this when it lands).
+	if soul_timer > 0.0:
+		return true # 魂形态：化魂期间反隐（2D soulform 原制）
+	for it in hero_inventory:
+		if String((it as Dictionary).get("name", "")) == "和氏璧":
+			return true
+	return false
+
+
+# --- 刺客偷袭 (stage-2) ------------------------------------------------
+func _assassin_hidden(a: ArticulatedUnit) -> bool:
+	# A live assassin is untargetable while hidden: it is revealed only
+	# while attacking (3 s window, 2D revealedUntil) or while the hero
+	# can see through stealth （和氏璧 / 魂形态）. Non-assassins are
+	# never hidden by this rule.
+	if a == null or not is_instance_valid(a) or not a.alive:
+		return false
+	if not a.has_meta("is_assassin"):
+		return false
+	if hero_has_detection():
+		return false
+	return elapsed >= float(a.get_meta("revealed_until", -1.0))
+
+
+func _enemy_targetable(e: ArticulatedUnit) -> bool:
+	return not _assassin_hidden(e)
+
+
+func spawn_assassin() -> ArticulatedUnit:
+	# 2D 原制 (game/index.html:1047): hp 900+160w, atk 55, spd 265
+	# （全场最快）, rng 95, 赏金 200, 经验 300，自裂隙口随机一门现身。
+	# 3D 尺度按本版换算：血量介于步兵与 Boss 之间（150+60w），攻击
+	# 14+1.5w（与 Boss 同档起步、随波次爬升），移速 5.0 全场最快。
+	var w := float(current_wave)
+	var gate: Vector3 = LANE_NORTH[0] if _rng.randf() < 0.5 else LANE_SOUTH[0]
+	var a := _make_unit("assassin", "enemy", "刺客", gate, 150.0 + 60.0 * w, 5.0, 2.4, 14.0 + 1.5 * w, 0.9, "rogue", Color(0.16, 0.16, 0.20), 1.0)
+	a.set_meta("is_assassin", true)
+	a.set_meta("bounty", 200)
+	a.set_meta("xp", 300)
+	a.set_meta("revealed_until", -1.0)
+	a.visible = false # 隐形：未现形/未反隐时不渲染（2D 同制：不绘制）
+	enemies.append(a)
+	_update_ui("有杀气逼近孔明……（刺客偷袭！持和氏璧或化魂可反隐）")
+	return a
+
+
+func _update_assassin(e: ArticulatedUnit) -> void:
+	# Beelines straight for 孔明， ignoring lanes, towers and defenders
+	# (2D: moveToward(km) every frame, no engagement on the way).
+	if not is_instance_valid(kongming_unit) or not kongming_unit.alive:
+		e.stop_moving()
+		return
+	var kp := kongming_unit.global_position
+	var d := Vector2(kp.x - e.global_position.x, kp.z - e.global_position.z).length()
+	if d <= e.attack_range + 0.35:
+		# In range: reveal for 3 s (2D sets revealedUntil before every
+		# attack attempt, so the assassin stays visible while engaged),
+		# then strike 孔明.
+		e.set_meta("revealed_until", elapsed + ASSASSIN_REVEAL_TIME)
+		e.stop_moving()
+		e.face_towards(kp)
+		e.set_combat_target(kongming_unit)
+		if e.try_attack():
+			apply_damage(e, kongming_unit, e.attack_damage, "melee")
+	else:
+		e.move_to(kp)
+	# Visibility follows the stealth state every frame: detection can
+	# flip live when 和氏璧 is picked up or 魂 fades.
+	e.visible = not _assassin_hidden(e)
+
+
+func _refresh_kongming_stats(full_heal: bool = false) -> void:
+	# 2D 原制 (game/index.html:536): 孔明 hp 3500 / atk 65 / rng 420，
+	# 每升 1 级 +500 血 +12 攻。3D 里 general_level 就是孔明的等级
+	# （人口上限 6+general_level 与 2D popCap 6+km.lvl 同式），故血量
+	# 3000+500*lvl（1 级即 3500），攻击按本版尺度取 10+2*lvl，射程 6
+	# （只覆盖帅帐一带，不抢守军的活）。
+	if not is_instance_valid(kongming_unit):
+		return
+	var new_max := 3000.0 + 500.0 * float(general_level)
+	var old_max := kongming_unit.max_hp
+	kongming_unit.max_hp = new_max
+	if full_heal:
+		kongming_unit.hp = new_max
+	else:
+		kongming_unit.hp = minf(new_max, kongming_unit.hp + maxf(new_max - old_max, 0.0))
+	kongming_unit.attack_damage = 10.0 + 2.0 * float(general_level)
+	kongming_unit.attack_range = 6.0
+	kongming_unit.attack_cooldown_time = 1.0
+
+
+func _update_kongming() -> void:
+	# 孔明自卫（2D 原制：最近敌人在射程内即反击，30% 概率套盾——
+	# 盾在 3D 无对应物，不做）。只打看得见的目标：隐形刺客未现形
+	# 时孔明也打不着它（与 2D nearestEnemy 的反隐 gating 同制）。
+	if not is_instance_valid(kongming_unit) or not kongming_unit.alive:
+		return
+	if _unit_disabled(kongming_unit):
+		kongming_unit.stop_moving()
+		return
+	var target: ArticulatedUnit = null
+	var best := kongming_unit.attack_range
+	for e in alive_enemies():
+		if not _enemy_targetable(e):
+			continue
+		var d := Vector2(e.global_position.x - kongming_unit.global_position.x, e.global_position.z - kongming_unit.global_position.z).length()
+		if d < best:
+			best = d
+			target = e
+	if target != null:
+		kongming_unit.set_combat_target(target)
+		if kongming_unit.try_attack():
+			apply_damage(kongming_unit, target, kongming_unit.attack_damage, "melee")
+
+
+func summon_saint(beast: String) -> bool:
+	if beast == "" or not SAINT_TINTS.has(beast) or not is_instance_valid(strategist):
+		return false
+	if pop_used() + 1 > pop_cap():
+		_update_ui("人口不足（%d/%d）——「%s」召唤需要 1 人口。" % [pop_used(), pop_cap(), beast])
+		return false
+	var pos := strategist.global_position + Vector3(2.5, 0, 2.5)
+	var u := _make_unit("beast", "ally", beast, pos, 2100.0, 3.2, 2.6, 45.0, 1.0, "", SAINT_TINTS[beast], 2.0)
+	u.set_meta("saint_name", beast)
+	u.set_meta("pop", 1)
+	saints_active.append(u)
+	_update_ui("「%s」现身助战！（人口 %d/%d）圣兽阵亡后变回圣痕。" % [beast, pop_used(), pop_cap()])
+	_refresh_hud()
+	return true
+
+
+func _update_saints(delta: float) -> void:
+	for sb in saints_active:
+		if not is_instance_valid(sb) or not (sb as ArticulatedUnit).alive:
+			continue
+		var u := sb as ArticulatedUnit
+		var target: ArticulatedUnit = null
+		var best := 999.0
+		for e in alive_enemies():
+			if not _enemy_targetable(e):
+				continue
+			var d := Vector2(e.global_position.x - u.global_position.x, e.global_position.z - u.global_position.z).length()
+			if d <= 14.0 and d < best:
+				best = d
+				target = e
+		if target != null:
+			u.set_combat_target(target)
+			if u.try_attack():
+				apply_damage(u, target, u.attack_damage, "melee")
+		elif is_instance_valid(strategist):
+			var dh := Vector2(strategist.global_position.x - u.global_position.x, strategist.global_position.z - u.global_position.z).length()
+			if dh > 4.5:
+				u.move_to(strategist.global_position)
+			else:
+				u.stop_moving()
+
+
+# --- 雇佣兵 (stage-2, TEARDOWN section 5 / PARITY) ---------------------
+# The quartermaster sells AI guards that hold the base. Population
+# follows the 2D formula (cap 6 + strategist level, used = living
+# mercenaries' pop). Upkeep starts at wave 12 like the 2D game, but
+# at 2 gold per head per 20 s instead of 4: the 2D upkeep was offset
+# by a 20 s income stream this slice does not have (noted in the
+# ledger). Since the stage-2 tower round the farmer also repairs
+# damaged built towers (nearest first), his other 2D job.
+func pop_used() -> int:
+	var p := 0
+	for m in mercs:
+		if is_instance_valid(m) and (m as ArticulatedUnit).alive:
+			p += int((m as ArticulatedUnit).get_meta("pop", 1))
+	for sb in saints_active:
+		if is_instance_valid(sb) and (sb as ArticulatedUnit).alive:
+			p += int((sb as ArticulatedUnit).get_meta("pop", 1))
+	for t in towers:
+		if not bool(t.get("dead", false)) and not bool(t.get("fixed", false)):
+			p += 1 # player-built towers occupy 1 pop each (2D); wall fixtures don't
+	return p
+
+
+func pop_cap() -> int:
+	return 6 + general_level
+
+
+func buy_mercenary(idx: int) -> bool:
+	if idx < 0 or idx >= MERC_DEFS.size():
+		return false
+	var def: Dictionary = MERC_DEFS[idx]
+	if current_wave < int(def.get("wave", 0)):
+		_update_ui("「%s」第 %d 波才解锁。" % [String(def.get("name", "")), int(def.get("wave", 0))])
+		return false
+	if pop_used() + int(def.get("pop", 1)) > pop_cap():
+		_update_ui("人口不足（%d/%d）——完成玉玺任务升军师可扩人口。" % [pop_used(), pop_cap()])
+		return false
+	var cost := int(def.get("cost", 0))
+	if gold < cost:
+		_update_ui("金币不足！雇佣「%s」需要 %d 金，现有 %d 金。" % [String(def.get("name", "")), cost, gold])
+		return false
+	gold -= cost
+	var slot := mercs.size()
+	var anchor := Vector3(-62.0 + float(slot % 4) * 3.2, 0, -19.0 + float(slot / 4) * 3.6)
+	if String(def.get("id", "")) == "farmer":
+		anchor = Vector3(-66.0, 0, 5.0)
+	var u := _make_unit(String(def.get("visual", "general")), "ally", String(def.get("name", "")), anchor + Vector3(0, 0, 5.0), float(def.get("hp", 200.0)), float(def.get("speed", 2.5)), float(def.get("range", 2.2)), float(def.get("dmg", 10.0)), float(def.get("cd", 1.0)), "", def.get("tint", Color.WHITE), float(def.get("scale", 1.0)))
+	u.set_meta("pop", int(def.get("pop", 1)))
+	u.set_meta("merc_id", String(def.get("id", "")))
+	u.set_meta("merc_anchor", anchor)
+	if bool(def.get("siege", false)):
+		u.set_meta("siege", true)
+	mercs.append(u)
+	_update_ui("雇佣「%s」（人口 %d/%d）。" % [String(def.get("name", "")), pop_used(), pop_cap()])
+	_refresh_hud()
+	return true
+
+
+func merc_upkeep_tick() -> int:
+	if current_wave < 12:
+		return 0
+	var fee := mini(pop_used() * 2, gold)
+	if fee <= 0:
+		return 0
+	gold -= fee
+	_update_ui("军饷结算：人口维护费 -%d 金（人口 %d）。" % [fee, pop_used()])
+	_refresh_hud()
+	return fee
+
+
+func _update_mercs(delta: float) -> void:
+	for m in mercs:
+		if not is_instance_valid(m) or not (m as ArticulatedUnit).alive:
+			continue
+		var u := m as ArticulatedUnit
+		var anchor: Vector3 = u.get_meta("merc_anchor") if u.has_meta("merc_anchor") else u.global_position
+		if String(u.get_meta("merc_id", "")) == "farmer":
+			# Stage-2 tower system: the farmer's full 2D job — repair the
+			# nearest damaged built tower first, else the seal core.
+			var tw := _nearest_damaged_tower(u.global_position)
+			if not tw.is_empty():
+				var twp: Vector3 = tw["position"]
+				var td := Vector2(twp.x - u.global_position.x, twp.z - u.global_position.z).length()
+				if td > 3.5:
+					u.move_to(twp)
+				else:
+					u.stop_moving()
+					tw["hp"] = minf(float(tw["max_hp"]), float(tw["hp"]) + 20.0 * delta)
+				continue
+			if core_hp < CORE_MAX_HP:
+				var cd2 := Vector2(CORE_POS.x - u.global_position.x, CORE_POS.z - u.global_position.z).length()
+				if cd2 > 4.2:
+					u.move_to(CORE_POS + Vector3(2.2, 0, 2.2))
+				else:
+					u.stop_moving()
+					core_hp = minf(CORE_MAX_HP, core_hp + 8.0 * delta)
+				continue
+		var target: ArticulatedUnit = null
+		var best := 999.0
+		for e in alive_enemies():
+			if not _enemy_targetable(e):
+				continue
+			var d := Vector2(e.global_position.x - u.global_position.x, e.global_position.z - u.global_position.z).length()
+			if d <= 18.0 and d < best:
+				best = d
+				target = e
+		if target != null:
+			u.set_combat_target(target)
+			if u.try_attack():
+				apply_damage(u, target, u.attack_damage, "spear")
+		else:
+			var back := Vector2(anchor.x - u.global_position.x, anchor.z - u.global_position.z).length()
+			if back > 0.8:
+				u.move_to(anchor)
+			else:
+				u.stop_moving()
+
+
+func _on_merc_buy(idx: int) -> void:
+	if buy_mercenary(idx):
+		_refresh_shop_panel()
+
+
+func _build_merc_panel_rows() -> void:
+	_shop_section_label("人口 %d/%d（军师每升 1 级 +1 上限）" % [pop_used(), pop_cap()], "pop")
+	var info := Label.new()
+	info.text = "佣兵驻守基地、自动迎敌。第 12 波起每 20 秒按人口收维护费（2 金/人）。农民优先修理受损防御塔、其次修封印核。防御塔占人口 1，休整期点基座可升级。"
+	info.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	info.custom_minimum_size = Vector2(460, 0)
+	info.add_theme_color_override("font_color", Color(0.92, 0.90, 0.82))
+	shop_items_box.add_child(info)
+	for i in range(MERC_DEFS.size()):
+		var def: Dictionary = MERC_DEFS[i]
+		var b := _shop_row_button()
+		var locked := current_wave < int(def.get("wave", 0))
+		var pop_full := pop_used() + int(def.get("pop", 1)) > pop_cap()
+		b.text = "%s · %d 金 · 人口 %d — %s" % [String(def.get("name", "")), int(def.get("cost", 0)), int(def.get("pop", 1)), String(def.get("desc", ""))]
+		if locked:
+			b.text += "（第 %d 波解锁）" % int(def.get("wave", 0))
+		elif pop_full:
+			b.text += "（人口已满）"
+		b.set_meta("price", int(def.get("cost", 0)))
+		b.set_meta("is_book", true)
+		_add_btn_icon(b, _ui_icon(String(MERC_ICONS.get(String(def.get("id", "")), "pop"))), 26.0 if _touch_ui else 22.0)
+		b.set_meta("merc_idx", i)
+		b.disabled = locked or pop_full or gold < int(def.get("cost", 0))
+		b.pressed.connect(_on_merc_buy.bind(i))
+		shop_items_box.add_child(b)
+
+
+func _apply_item_effect(item: Dictionary) -> void:
+	# Bonuses are stored on the hero (hero_bonus_*), so they flow through
+	# hero_stats_at into spawn / respawn / level-up / HUD alike.
+	# Consumables have no purchase-time effect — they act on use.
+	match String(item.get("kind", "")):
+		"weapon", "book_atk":
+			hero_bonus_damage += float(item.get("val", 0.0))
+		"armor":
+			hero_bonus_max_hp += float(item.get("val", 0.0))
+		"boots":
+			hero_bonus_speed += float(item.get("val", 0.0))
+		"trinket":
+			hero_bonus_damage += float(item.get("val", 0.0))
+			hero_bonus_max_hp += float(item.get("val2", 0.0))
+		"book_str":
+			hero_bonus_str += float(item.get("val", 0.0))
+		"book_agi":
+			hero_bonus_agi += float(item.get("val", 0.0))
+		"book_int":
+			hero_bonus_int += float(item.get("val", 0.0))
+		"book_all":
+			hero_bonus_str += float(item.get("val", 0.0))
+			hero_bonus_agi += float(item.get("val", 0.0))
+			hero_bonus_int += float(item.get("val", 0.0))
+		"gear":
+			# Crafted gear (炼化合成): explicit 3D stat fields, converted
+			# from the 2D tables (see the REFINE_* conversion note).
+			hero_bonus_damage += float(item.get("dmg", 0.0))
+			hero_bonus_max_hp += float(item.get("hp", 0.0))
+			hero_bonus_str += float(item.get("str", 0.0))
+			hero_bonus_agi += float(item.get("agi", 0.0))
+			hero_bonus_int += float(item.get("int", 0.0))
+			hero_bonus_speed += float(item.get("spd", 0.0))
+		# "material" has no case on purpose: it sits in the bag until
+		# the refiner consumes it; it grants no stats.
+	_apply_hero_live_stats()
+
+
+func _apply_hero_live_stats() -> void:
+	if hero_index < 0 or not is_instance_valid(strategist):
+		return
+	var st := hero_stats_at(hero_index, hero_level)
+	var old_max := strategist.max_hp
+	strategist.max_hp = float(st["hp"])
+	strategist.hp = clampf(strategist.hp + (strategist.max_hp - old_max), 1.0, strategist.max_hp)
+	strategist.attack_damage = float(st["damage"])
+	strategist.move_speed = float(st["speed"])
+	_refresh_hud()
+
+
+func _on_inventory_button(slot: int) -> void:
+	_use_inventory_item(slot)
+
+
+func _use_inventory_item(slot: int) -> void:
+	if slot < 0 or slot >= hero_inventory.size():
+		return
+	var item: Dictionary = hero_inventory[slot]
+	var kind := String(item.get("kind", ""))
+	var iname := String(item.get("name", ""))
+	if item.has("growth"):
+		var gk := int(item.get("kills", 0))
+		var gl := int(item.get("level", 0))
+		_update_ui("「%s」成长装：已击杀 %d · 第 %d 阶（每 40 击杀升 1 阶，最高 20 阶）。%s" % [iname, gk, gl, String(item.get("desc", ""))])
+		return
+	match kind:
+		"potion_heal":
+			if not is_instance_valid(strategist) or not strategist.alive:
+				_update_ui("英雄已阵亡，金创药用不上——等复活或用复活石。")
+				return
+			var heal := strategist.max_hp * 0.5
+			strategist.hp = minf(strategist.max_hp, strategist.hp + heal)
+			hero_inventory.remove_at(slot)
+			_refresh_inventory_row()
+			_refresh_hud()
+			_update_ui("使用「金创药」，恢复 %.0f 气血。" % heal)
+		"stone_home":
+			if not is_instance_valid(strategist) or not strategist.alive:
+				_update_ui("英雄已阵亡，天遁石用不上——等复活或用复活石。")
+				return
+			strategist.global_position = HERO_HOME
+			strategist.move_to(HERO_HOME)
+			hero_inventory.remove_at(slot)
+			_refresh_inventory_row()
+			_update_ui("天遁石发动，英雄回到主城。")
+		"stone_revive":
+			if hero_index < 0:
+				_update_ui("尚未选择英雄，复活石先留着。")
+				return
+			if is_instance_valid(strategist) and strategist.alive:
+				_update_ui("英雄未阵亡，复活石先留着。")
+				return
+			hero_inventory.remove_at(slot)
+			_refresh_inventory_row()
+			_respawn_hero()
+			_update_ui("复活石发动，英雄立即在主城复活！")
+		"material":
+			_update_ui("「%s」是合成材料——带去西南角找炼化师，打造套装与专属武器。" % iname)
+		"soul":
+			hero_inventory.remove_at(slot)
+			_refresh_inventory_row()
+			soul_timer = 8.0
+			_update_ui("化魂！8 秒内不受任何伤害。")
+		"mark":
+			var beast := String(item.get("beast", ""))
+			if summon_saint(beast):
+				hero_inventory.remove_at(slot)
+				_refresh_inventory_row()
+		"tongque":
+			if not is_instance_valid(strategist) or not strategist.alive:
+				_update_ui("英雄已阵亡，铜雀先留着。")
+				return
+			hero_inventory.remove_at(slot)
+			_refresh_inventory_row()
+			strategist.hp = minf(strategist.max_hp, strategist.hp + 500.0)
+			var tg := hero_level * 50
+			gold += tg
+			_refresh_hud()
+			_update_ui("铜雀：恢复 500 气血，金 +%d。" % tg)
+		"quest":
+			_update_ui("「%s」：%s" % [iname, String(item.get("desc", ""))])
+		_:
+			_update_ui("「%s」已装备在身（%s）。" % [iname, String(item.get("desc", ""))])
+
+
+func _refresh_inventory_row() -> void:
+	for i in range(inv_buttons.size()):
+		var b := inv_buttons[i] as Button
+		if b == null:
+			continue
+		if i < hero_inventory.size():
+			var item: Dictionary = hero_inventory[i]
+			b.text = String(item.get("name", ""))
+			b.disabled = false
+			_set_btn_icon(b, _item_icon(item), 30.0 if _touch_ui else 24.0)
+		else:
+			b.text = "空"
+			b.disabled = true
+			_set_btn_icon(b, null, 24.0)
+
+
+func _shop_index_at_screen(screen_pos: Vector2) -> int:
+	for i in range(shop_defs.size()):
+		var def: Dictionary = shop_defs[i]
+		var npc := def.get("npc") as Node3D
+		if npc == null:
+			continue
+		var sp := camera.unproject_position(npc.global_position + Vector3(0, 1.2, 0))
+		if sp.distance_to(screen_pos) <= 56.0:
+			return i
+		var ground := _ground_point_from_screen(screen_pos)
+		var np: Vector3 = npc.global_position
+		if Vector2(ground.x - np.x, ground.z - np.z).length() <= 1.8:
+			return i
+	return -1
+
+
+func _try_open_shop_at(screen_pos: Vector2) -> bool:
+	var idx := _shop_index_at_screen(screen_pos)
+	if idx < 0:
+		return false
+	_open_shop_panel(idx)
+	return true
+
+
+func _on_build_choice(tower_type: String) -> void:
+	if _popup_pad_index >= 0:
+		build_tower(_popup_pad_index, tower_type)
+	_close_build_popup()
+
+
+func restart_game() -> void:
+	reset_game()
+
+
+func _spawn_lightning(points: Array) -> void:
+	if points.size() < 2:
+		return
+	var root := Node3D.new()
+	root.name = "ChainLightning"
+	effects_root.add_child(root)
+	var outer_mat := _mat(Color(0.38, 0.55, 1.0), 0.3, 0.0, Color(0.36, 0.55, 1.0), 2.6)
+	outer_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	outer_mat.albedo_color = Color(0.38, 0.55, 1.0, 0.55)
+	var inner_mat := _mat(Color(0.92, 0.97, 1.0), 0.25, 0.0, Color(0.85, 0.93, 1.0), 3.2)
+	for s in range(points.size() - 1):
+		var a: Vector3 = points[s]
+		var b: Vector3 = points[s + 1]
+		var subdiv := 5
+		var prev := a
+		for i in range(1, subdiv + 1):
+			var t := float(i) / float(subdiv)
+			var pt := a.lerp(b, t)
+			if i < subdiv:
+				var side := Vector3(b.z - a.z, 0, -(b.x - a.x)).normalized()
+				pt += side * _rng.randf_range(-0.38, 0.38)
+				pt.y += _rng.randf_range(-0.22, 0.30)
+			_add_lightning_segment(root, prev, pt, 0.13, outer_mat)
+			_add_lightning_segment(root, prev, pt, 0.05, inner_mat)
+			prev = pt
+	var mid: Vector3 = points[points.size() / 2]
+	_add_omni_light(root, "ArcFlash", mid, Color(0.55, 0.70, 1.0), 3.2, 13.0)
+	effects.append({"node": root, "ttl": 0.24})
+
+
+func _add_lightning_segment(parent: Node, a: Vector3, b: Vector3, radius: float, material: Material) -> void:
+	var length := a.distance_to(b)
+	if length < 0.03:
+		return
+	var mi := MeshInstance3D.new()
+	var mesh := CylinderMesh.new()
+	mesh.top_radius = radius
+	mesh.bottom_radius = radius
+	mesh.height = 1.0
+	mesh.radial_segments = 6
+	mi.mesh = mesh
+	mi.material_override = material
+	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	parent.add_child(mi)
+	var mid := (a + b) * 0.5
+	mi.look_at_from_position(mid, b, Vector3.UP)
+	mi.rotate_object_local(Vector3.RIGHT, PI / 2.0)
+	mi.scale = Vector3(1, length, 1)
+
+
+func _spawn_burst(pos: Vector3, color: Color, count: int, shard_size: float = 0.22, ttl: float = 0.55) -> void:
+	var root := Node3D.new()
+	root.name = "Burst"
+	root.position = pos
+	effects_root.add_child(root)
+	var burst_mat := _mat(color, 0.35, 0.0, color, 2.2)
+	for i in range(count):
+		var dir := Vector3(_rng.randf_range(-1, 1), _rng.randf_range(0.2, 1.2), _rng.randf_range(-1, 1)).normalized()
+		_add_box(root, "Shard", Vector3(shard_size, shard_size, shard_size), dir * _rng.randf_range(0.4, 1.6), burst_mat, dir)
+	effects.append({"node": root, "ttl": ttl})
+
+
+func _fire_projectile(tower: Dictionary, target: ArticulatedUnit, dmg: float, tint: Color, kind: String = "bolt") -> void:
+	var node := MeshInstance3D.new()
+	node.name = "Bolt"
+	var mesh := SphereMesh.new()
+	mesh.radius = 0.16
+	mesh.height = 0.32
+	mesh.radial_segments = 8
+	mesh.rings = 4
+	node.mesh = mesh
+	node.material_override = _mat(tint, 0.3, 0.0, tint, 2.4)
+	node.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	projectiles_root.add_child(node)
+	node.global_position = tower["muzzle"]
+	_spawn_burst(tower["muzzle"], tint, 3, 0.11, 0.14)
+	projectiles.append({"node": node, "kind": kind, "target": target, "speed": PROJECTILE_SPEED, "damage": dmg})
+
+
+func _tower_chain(tower: Dictionary, first: ArticulatedUnit, dmg: float) -> void:
+	var targets: Array = [first]
+	var current: ArticulatedUnit = first
+	while targets.size() < THUNDER_MAX_TARGETS:
+		var nxt := _nearest_enemy(current.global_position, THUNDER_JUMP_RANGE, targets)
+		if nxt == null:
+			break
+		targets.append(nxt)
+		current = nxt
+	var points: Array = [tower["muzzle"]]
+	for t in targets:
+		points.append(t.get_hit_position())
+	_spawn_lightning(points)
+	_spawn_burst(tower["muzzle"], Color(0.70, 0.85, 1.0), 4, 0.12, 0.16)
+	for t in targets:
+		apply_damage(null, t, dmg, "lightning")
+	built_tower_damage_events += targets.size()
+
+
+func _fire_shell_projectile(tower: Dictionary, target: ArticulatedUnit, dmg: float, kind: String) -> void:
+	var node := MeshInstance3D.new()
+	var mesh := SphereMesh.new()
+	if kind == "stone":
+		node.name = "StoneShell"
+		mesh.radius = 0.36
+		mesh.height = 0.72
+	else:
+		node.name = "Fireball"
+		mesh.radius = 0.30
+		mesh.height = 0.60
+	mesh.radial_segments = 10
+	mesh.rings = 6
+	node.mesh = mesh
+	if kind == "stone":
+		node.material_override = _mat(Color(0.45, 0.40, 0.34), 0.9)
+	else:
+		node.material_override = _mat(Color(1.0, 0.45, 0.12), 0.3, 0.0, Color(1.0, 0.40, 0.08), 2.8)
+	node.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	projectiles_root.add_child(node)
+	node.global_position = tower["muzzle"]
+	if kind == "stone":
+		_spawn_burst(tower["muzzle"], Color(0.60, 0.55, 0.45), 4, 0.13, 0.16)
+	else:
+		_spawn_burst(tower["muzzle"], Color(1.0, 0.55, 0.18), 4, 0.13, 0.16)
+		_add_omni_light(node, "FireGlow", Vector3.ZERO, Color(1.0, 0.5, 0.15), 2.0, 7.0)
+	projectiles.append({"node": node, "kind": kind, "target": target, "last_pos": target.get_hit_position(), "speed": 23.0, "damage": dmg, "aoe": STONE_AOE if kind == "stone" else FLAME_AOE, "burn": kind == "flame"})
+
+
+func _flame_impact(pos: Vector3, dmg: float, aoe: float = FLAME_AOE, burn: bool = false) -> void:
+	var hits := 0
+	for e in alive_enemies():
+		if not _enemy_targetable(e):
+			continue
+		if Vector2(e.global_position.x - pos.x, e.global_position.z - pos.z).length() <= aoe:
+			apply_damage(null, e, dmg, "flame")
+			if burn:
+				_apply_dot(e, dmg * 0.25, 3.0, "flame")
+			hits += 1
+	built_tower_damage_events += hits
+	_spawn_burst(pos, Color(1.0, 0.5, 0.15), 8)
+
+
+func _fire_arrow(from_unit: ArticulatedUnit, target_unit: ArticulatedUnit) -> void:
+	var node := MeshInstance3D.new()
+	node.name = "Arrow"
+	var mesh := BoxMesh.new()
+	mesh.size = Vector3(0.07, 0.07, 0.95)
+	node.mesh = mesh
+	node.material_override = _mat(Color.html("#7a5a33"), 0.7)
+	node.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	projectiles_root.add_child(node)
+	node.global_position = from_unit.global_position + Vector3(0, 1.6, 0)
+	projectiles.append({"node": node, "kind": "arrow", "target": target_unit, "target_pos": CORE_POS + Vector3(0, 2.4, 0), "speed": 27.0, "damage": from_unit.attack_damage, "source": from_unit})
+
+
+func _update_towers(delta: float) -> void:
+	for t in towers:
+		if bool(t.get("dead", false)):
+			continue
+		t["cooldown"] = float(t["cooldown"]) - delta
+		var tower_type: String = String(t.get("type", "arrow"))
+		var tdef: Dictionary = TOWER_DEFS.get(tower_type, TOWER_DEFS["arrow"])
+		var target := _nearest_enemy(t["muzzle"], float(tdef.get("range", TOWER_RANGE)))
+		if target == null:
+			continue
+		var head: Node3D = t.get("head")
+		if is_instance_valid(head):
+			var tp: Vector3 = target.global_position
+			head.rotation.y = atan2(tp.x - t["position"].x, tp.z - t["position"].z)
+		if float(t["cooldown"]) > 0.0:
+			continue
+		t["cooldown"] = float(tdef.get("cd", TOWER_COOLDOWN_TIME))
+		var dmg := float(t.get("dmg", 9.0))
+		match tower_type:
+			"thunder":
+				_tower_chain(t, target, dmg)
+			"flame":
+				_fire_shell_projectile(t, target, dmg, "flame")
+			"stone":
+				_fire_shell_projectile(t, target, dmg, "stone")
+			"frost":
+				_fire_projectile(t, target, dmg, Color(0.70, 0.88, 1.0), "frost")
+			"crossbow":
+				_fire_projectile(t, target, dmg, Color(1.0, 0.50, 0.38))
+			_:
+				_fire_projectile(t, target, dmg, Color(1.0, 0.80, 0.45))
+
+
+func _update_projectiles(delta: float) -> void:
+	for i in range(projectiles.size() - 1, -1, -1):
+		var p: Dictionary = projectiles[i]
+		var node: MeshInstance3D = p["node"]
+		if not is_instance_valid(node):
+			projectiles.remove_at(i)
+			continue
+		var kind: String = String(p.get("kind", "bolt"))
+		var target: ArticulatedUnit = p.get("target")
+		var dest: Vector3
+		if kind == "arrow" and target == null:
+			dest = p["target_pos"]
+		elif target == null or not is_instance_valid(target) or not target.alive:
+			# Homing target is gone: shells still burst where it fell.
+			if kind == "flame" or kind == "stone":
+				_flame_impact(p["last_pos"], float(p["damage"]), float(p.get("aoe", FLAME_AOE)), bool(p.get("burn", false)))
+			node.free()
+			projectiles.remove_at(i)
+			continue
+		else:
+			dest = target.get_hit_position()
+			if kind == "flame" or kind == "stone":
+				p["last_pos"] = dest
+				projectiles[i] = p
+		var to_dest := dest - node.global_position
+		var dist := to_dest.length()
+		var step := float(p["speed"]) * delta
+		if dist <= step + 0.25:
+			match kind:
+				"bolt":
+					apply_damage(null, target, float(p["damage"]), "tower")
+				"frost":
+					apply_damage(null, target, float(p["damage"]), "frost")
+					for e in alive_enemies():
+						if not _enemy_targetable(e):
+							continue
+						if Vector2(e.global_position.x - dest.x, e.global_position.z - dest.z).length() <= FROST_AOE:
+							_apply_slow(e, FROST_SLOW_MUL, FROST_SLOW_TIME)
+					_spawn_burst(dest, Color(0.65, 0.85, 1.0), 6, 0.2, 0.3)
+				"flame", "stone":
+					_flame_impact(dest, float(p["damage"]), float(p.get("aoe", FLAME_AOE)), bool(p.get("burn", false)))
+				"arrow":
+					if target != null and is_instance_valid(target) and target.alive:
+						apply_damage(p.get("source"), target, float(p["damage"]), "arrow")
+					else:
+						damage_core(float(p["damage"]), p.get("source"))
+			node.free()
+			projectiles.remove_at(i)
+		else:
+			node.global_position += to_dest / dist * step
+			if kind == "arrow" and dist > 0.01:
+				node.look_at(node.global_position + to_dest / dist, Vector3.UP)
+
+
+func _update_effects(delta: float) -> void:
+	for i in range(effects.size() - 1, -1, -1):
+		var fx: Dictionary = effects[i]
+		fx["ttl"] = float(fx["ttl"]) - delta
+		if float(fx["ttl"]) <= 0.0:
+			if is_instance_valid(fx.get("node")):
+				fx["node"].free()
+			effects.remove_at(i)
+		else:
+			if String(fx.get("kind", "")) == "bounty":
+				var label: Label3D = fx.get("node")
+				if is_instance_valid(label):
+					label.position += Vector3(0, 1.6, 0) * delta
+					var a := clampf(float(fx["ttl"]) / float(fx.get("ttl0", 0.9)), 0.0, 1.0)
+					label.modulate = Color(1.0, 0.84, 0.35, a)
+					label.outline_modulate = Color(0.16, 0.10, 0.0, a)
+			effects[i] = fx
+
+
+func _update_enemies(_delta: float) -> void:
+	for e in enemies:
+		if not is_instance_valid(e) or not e.alive:
+			continue
+		if _unit_disabled(e):
+			e.stop_moving()
+			continue
+		# Stage-2 assassin: beelines for 孔明， never fights the lanes
+		# or batters towers — it slips past the whole defence.
+		if e.has_meta("is_assassin"):
+			_update_assassin(e)
+			continue
+		# Stage-2 towers: an enemy with a built tower in reach and no
+		# defender on top of it stops to batter the tower (2D towers are
+		# units with HP; the pads sit off-lane, so this triggers when a
+		# fight spills onto a pad).
+		var tt := _tower_in_reach(e)
+		if not tt.is_empty():
+			e.stop_moving()
+			e.face_towards(tt["position"])
+			if e.can_attack():
+				e.begin_attack()
+				damage_tower(tt, e.attack_damage)
+			continue
+		match e.archetype:
+			"archer":
+				_update_archer(e)
+			"beast":
+				_update_beast(e)
+			"boss":
+				_update_boss(e)
+			_:
+				_update_infantry(e)
+
+
+func _tower_in_reach(e: ArticulatedUnit) -> Dictionary:
+	if towers.is_empty():
+		return {}
+	for d in [general, strategist]:
+		if is_instance_valid(d) and d.alive:
+			if Vector2(d.global_position.x - e.global_position.x, d.global_position.z - e.global_position.z).length() <= 2.6:
+				return {} # a defender on top of the enemy takes priority
+	var reach := e.attack_range + 3.4 # tower footprint radius on its pad
+	var best: Dictionary = {}
+	var best_d := 1.0e9
+	for t in towers:
+		if bool(t.get("dead", false)) or bool(t.get("fixed", false)):
+			continue
+		var tp: Vector3 = t["position"]
+		var dd := Vector2(tp.x - e.global_position.x, tp.z - e.global_position.z).length()
+		if dd <= reach and dd < best_d:
+			best_d = dd
+			best = t
+	return best
+
+
+# Waypoint following along the unit's lane (stage-1 two-lane map): walk
+# the lane polyline, then converge on the core with the lane offset.
+func _lane_target(e: ArticulatedUnit) -> Vector3:
+	var path: Array = []
+	if e.has_meta("lane_path"):
+		path = e.get_meta("lane_path")
+	var lane_z: float = float(e.get_meta("lane_z", 0.0)) if e.has_meta("lane_z") else 0.0
+	if path.is_empty():
+		return CORE_POS + Vector3(0, 0, lane_z * 0.25)
+	var idx: int = int(e.get_meta("wp_index", 1)) if e.has_meta("wp_index") else 1
+	# Skip-ahead: if a later waypoint is already nearer than the current
+	# target (unit spawned past it, or was repositioned), advance — else
+	# the unit would walk backwards along the lane.
+	while idx < path.size() - 1:
+		var cur: Vector3 = path[idx] + Vector3(0, 0, lane_z * 0.25)
+		var nxt: Vector3 = path[idx + 1] + Vector3(0, 0, lane_z * 0.25)
+		var d_cur := Vector2(cur.x - e.global_position.x, cur.z - e.global_position.z).length()
+		var d_nxt := Vector2(nxt.x - e.global_position.x, nxt.z - e.global_position.z).length()
+		if d_nxt < d_cur - 0.5:
+			idx += 1
+			e.set_meta("wp_index", idx)
+		else:
+			break
+	while idx < path.size():
+		var wp: Vector3 = path[idx]
+		wp = wp + Vector3(0, 0, lane_z * 0.25)
+		var d := Vector2(wp.x - e.global_position.x, wp.z - e.global_position.z).length()
+		if d <= 2.6:
+			idx += 1
+			e.set_meta("wp_index", idx)
+		else:
+			return wp
+	return CORE_POS + Vector3(0, 0, lane_z * 0.25)
+
+
+func _update_infantry(e: ArticulatedUnit) -> void:
+	# Prefer fighting a defender who is right on top of them.
+	var blocker: ArticulatedUnit = null
+	for d in [general, strategist]:
+		if is_instance_valid(d) and d.alive:
+			var dist := Vector2(d.global_position.x - e.global_position.x, d.global_position.z - e.global_position.z).length()
+			if dist <= 2.35:
+				blocker = d
+				break
+	if blocker != null:
+		e.set_combat_target(blocker)
+		if e.try_attack():
+			apply_damage(e, blocker, e.attack_damage, "melee")
+		return
+	var dist_core := Vector2(CORE_POS.x - e.global_position.x, CORE_POS.z - e.global_position.z).length()
+	if dist_core <= 3.1:
+		e.stop_moving()
+		e.face_towards(CORE_POS)
+		if e.can_attack():
+			e.begin_attack()
+			damage_core(e.attack_damage, e)
+	else:
+		e.move_to(_lane_target(e))
+
+
+func _update_archer(e: ArticulatedUnit) -> void:
+	# Shoot the nearest hero inside bow range; otherwise shoot the core once
+	# in range; otherwise advance toward the core and stop at bow range.
+	var target_hero: ArticulatedUnit = null
+	var best := e.attack_range
+	for d in [general, strategist]:
+		if is_instance_valid(d) and d.alive:
+			var dist := Vector2(d.global_position.x - e.global_position.x, d.global_position.z - e.global_position.z).length()
+			if dist < best:
+				best = dist
+				target_hero = d
+	if target_hero != null:
+		e.stop_moving()
+		e.face_towards(target_hero.global_position)
+		if e.can_attack():
+			e.begin_attack()
+			_fire_arrow(e, target_hero)
+		return
+	var dist_core := Vector2(CORE_POS.x - e.global_position.x, CORE_POS.z - e.global_position.z).length()
+	if dist_core <= e.attack_range:
+		e.stop_moving()
+		e.face_towards(CORE_POS)
+		if e.can_attack():
+			e.begin_attack()
+			_fire_arrow(e, null)
+	else:
+		e.move_to(_lane_target(e))
+
+
+func _update_beast(e: ArticulatedUnit) -> void:
+	# Trample a defender who gets underfoot; otherwise batter the core.
+	var blocker: ArticulatedUnit = null
+	for d in [general, strategist]:
+		if is_instance_valid(d) and d.alive:
+			var dist := Vector2(d.global_position.x - e.global_position.x, d.global_position.z - e.global_position.z).length()
+			if dist <= 3.8:
+				blocker = d
+				break
+	if blocker != null:
+		e.set_combat_target(blocker)
+		if e.try_attack():
+			apply_damage(e, blocker, e.attack_damage, "trample")
+		return
+	var dist_core := Vector2(CORE_POS.x - e.global_position.x, CORE_POS.z - e.global_position.z).length()
+	if dist_core <= 4.6:
+		e.stop_moving()
+		e.face_towards(CORE_POS)
+		if e.can_attack():
+			e.begin_attack()
+			damage_core(e.attack_damage, e)
+	else:
+		e.move_to(_lane_target(e))
+
+
+func _update_boss(e: ArticulatedUnit) -> void:
+	if e.has_meta("finale_yi"):
+		_update_finale_yi(e)
+		return
+	# Bosses behave like heavy infantry; ranged bosses (attack_range > 6)
+	# shoot heroes first, then the core, like archers do.
+	var blocker: ArticulatedUnit = null
+	for d in [general, strategist]:
+		if is_instance_valid(d) and d.alive:
+			var dist := Vector2(d.global_position.x - e.global_position.x, d.global_position.z - e.global_position.z).length()
+			if dist <= maxf(e.attack_range, 3.2):
+				blocker = d
+				break
+	if blocker != null:
+		if e.attack_range > 6.0:
+			e.stop_moving()
+			e.face_towards(blocker.global_position)
+			if e.can_attack():
+				e.begin_attack()
+				_fire_arrow(e, blocker)
+		else:
+			e.set_combat_target(blocker)
+			if e.try_attack():
+				apply_damage(e, blocker, e.attack_damage, "melee")
+		return
+	var dist_core := Vector2(CORE_POS.x - e.global_position.x, CORE_POS.z - e.global_position.z).length()
+	if dist_core <= maxf(e.attack_range, 3.6):
+		e.stop_moving()
+		e.face_towards(CORE_POS)
+		if e.can_attack():
+			e.begin_attack()
+			if e.attack_range > 6.0:
+				_fire_arrow(e, null)
+			else:
+				damage_core(e.attack_damage, e)
+	else:
+		e.move_to(_lane_target(e))
+
+
+func _update_trainees() -> void:
+	for i in range(trainees.size() - 1, -1, -1):
+		var t: ArticulatedUnit = trainees[i]
+		if not is_instance_valid(t):
+			trainees.remove_at(i)
+			continue
+		if not t.alive:
+			continue
+		if is_instance_valid(strategist) and strategist.alive:
+			var d := Vector2(strategist.global_position.x - t.global_position.x, strategist.global_position.z - t.global_position.z).length()
+			if d <= 15.0:
+				t.set_combat_target(strategist)
+				if t.try_attack():
+					apply_damage(t, strategist, t.attack_damage, "melee")
+				continue
+		t.stop_moving()
+
+
+# --- Training rooms (stage 2) -----------------------------------------
+# 2D rules: brush room = paid entry, soldiers spawn in batches while
+# the hero stays inside, each entry raises the officer level （刷兵次
+# 数， quest gates read it later); boss room = one training boss,
+# 65% drops a growth item. Growth items gain a level per 40 hero
+# kills (cap 20): atk +2 dmg, armor +60 hp, spd +0.03 spd/+30 hp —
+# the 2D per-level gains at the established stat scale. Fees follow
+# the 1/10 price scale (books / refine): 500 -> 50, 3000 -> 300.
+func trainer_enter(room: String) -> bool:
+	if hero_index < 0 or not is_instance_valid(strategist):
+		return false
+	if room == "brush":
+		if brush_session:
+			_update_ui("刷兵训练房进行中——走出围栏即结束本次练级。")
+			return false
+		if gold < TRAIN_BRUSH_FEE:
+			_update_ui("金币不足！刷兵训练房入场 %d 金，现有 %d 金。" % [TRAIN_BRUSH_FEE, gold])
+			return false
+		gold -= TRAIN_BRUSH_FEE
+		train_level += 1
+		brush_session = true
+		brush_timer = 3.2
+		_teleport_hero(Vector3(-52, 0, 33))
+		training_spawn_brush_batch()
+		_update_ui("进入刷兵训练房（第 %d 次）——杀兵练级刷钱！训练长官等级 = 刷兵次数。" % train_level)
+		_refresh_hud()
+		return true
+	if room == "boss":
+		if boss_session:
+			_update_ui("小Boss训练房进行中——走出围栏，训练小Boss 即撤走。")
+			return false
+		if gold < TRAIN_BOSS_FEE:
+			_update_ui("金币不足！小Boss训练房入场 %d 金，现有 %d 金。" % [TRAIN_BOSS_FEE, gold])
+			return false
+		gold -= TRAIN_BOSS_FEE
+		boss_session = true
+		_teleport_hero(Vector3(-48, 0, -33))
+		_spawn_training_boss()
+		_update_ui("小Boss训练房：击杀训练小Boss，65% 掉落成长紫装（随击杀成长，最高 20 阶）！")
+		_refresh_hud()
+		return true
+	return false
+
+
+func _teleport_hero(pos: Vector3) -> void:
+	strategist.stop_moving()
+	strategist.global_position = pos
+
+
+func training_spawn_brush_batch() -> void:
+	for i in range(3):
+		spawn_training_soldier()
+
+
+func _spawn_training_boss() -> void:
+	var b := _make_unit("beast", "enemy", "训练小Boss", Vector3(-48, 0, -36),
+		1100.0 + 130.0 * float(current_wave), 2.4, 2.8, 13.0 + 1.2 * float(current_wave), 1.0,
+		"", Color.WHITE, 1.45)
+	b.set_meta("bounty", 250)
+	b.set_meta("xp", 120)
+	b.set_meta("is_train_boss", true)
+	trainees.append(b)
+	train_boss = b
+
+
+func _alive_trainee_count() -> int:
+	var n := 0
+	for t in trainees:
+		if is_instance_valid(t) and t.alive:
+			n += 1
+	return n
+
+
+func _update_training(delta: float) -> void:
+	if game_state != "battle" and game_state != "intermission":
+		return
+	if not is_instance_valid(strategist) or not strategist.alive:
+		return
+	var hp2 := Vector2(strategist.global_position.x, strategist.global_position.z)
+	if brush_session:
+		if not TRAIN_ZONE.has_point(hp2):
+			_end_brush_session()
+		else:
+			brush_timer -= delta
+			if brush_timer <= 0.0:
+				brush_timer = 3.2
+				if _alive_trainee_count() < 9:
+					training_spawn_brush_batch()
+	if boss_session and not TRAIN_BOSS_ZONE.has_point(hp2):
+		_end_boss_session()
+
+
+func _despawn_trainees(keep_boss: bool) -> void:
+	for i in range(trainees.size() - 1, -1, -1):
+		var t: ArticulatedUnit = trainees[i]
+		if keep_boss and t == train_boss:
+			continue
+		if is_instance_valid(t):
+			t.free()
+		trainees.remove_at(i)
+
+
+func _end_brush_session() -> void:
+	brush_session = false
+	_despawn_trainees(true)
+	_update_ui("离开刷兵训练房，本次练级结束（训练长官等级 %d）。" % train_level)
+
+
+func _end_boss_session() -> void:
+	boss_session = false
+	if is_instance_valid(train_boss) and train_boss.alive:
+		_despawn_trainees(false)
+		train_boss = null
+		_update_ui("离开小Boss训练房，训练小Boss 已撤走（入场费不退）。")
+
+
+func training_boss_drop(roll: float) -> void:
+	# Called on the training boss's death (roll = randf) and directly
+	# by the harness with a fixed roll.
+	if boss_session:
+		boss_session = false
+	train_boss = null
+	if roll < 0.65:
+		var gname := String(GROWTH_ITEM_NAMES[_rng.randi() % GROWTH_ITEM_NAMES.size()])
+		if hero_inventory.size() >= SHOP_MAX_SLOTS:
+			gold += 300
+			_update_ui("训练小Boss 掉落成长紫装「%s」，但背包已满——折价 300 金。" % gname)
+		else:
+			var git := make_growth_item(gname)
+			hero_inventory.append(git)
+			_apply_item_effect(git)
+			_refresh_inventory_row()
+			_update_ui("训练小Boss 掉落成长紫装「%s」！（随击杀成长，最高 20 阶）" % gname)
+	else:
+		gold += 200
+		_update_ui("训练小Boss 未掉成长装，安慰奖 200 金。")
+	_refresh_hud()
+
+
+func make_growth_item(item_name: String) -> Dictionary:
+	# Base stats converted like refine gear (2D atk x0.5, armor x15 hp).
+	match item_name:
+		"的卢":
+			return {"name": "的卢", "kind": "gear", "hp": 200.0, "spd": 0.3, "growth": "spd", "kills": 0, "level": 0, "desc": "成长装：随击杀提升移速/生命"}
+		"李广之弓":
+			return {"name": "李广之弓", "kind": "gear", "dmg": 30.0, "agi": 18.0, "growth": "atk", "owner": "赵广", "kills": 0, "level": 0, "desc": "成长装：随击杀提升攻击（赵广专属底子）"}
+		"龙鳞铠甲":
+			return {"name": "龙鳞铠甲", "kind": "gear", "hp": 450.0, "growth": "armor", "kills": 0, "level": 0, "desc": "成长装：随击杀提升生命"}
+		"方天画戟":
+			return {"name": "方天画戟", "kind": "gear", "dmg": 22.0, "str": 8.0, "growth": "atk", "kills": 0, "level": 0, "desc": "成长装：随击杀提升攻击"}
+	return {}
+
+
+func _growth_level_delta(growth_kind: String) -> Dictionary:
+	match growth_kind:
+		"atk":
+			return {"kind": "gear", "dmg": 2.0}
+		"armor":
+			return {"kind": "gear", "hp": 60.0}
+		"spd":
+			return {"kind": "gear", "spd": 0.03, "hp": 30.0}
+	return {"kind": "gear"}
+
+
+func _growth_on_hero_kill() -> void:
+	# 2D rule: every hero kill feeds each growth item in the bag;
+	# level = min(20, kills / 40); each new level applies its delta.
+	for item in hero_inventory:
+		var d: Dictionary = item
+		if not d.has("growth"):
+			continue
+		var kills := int(d.get("kills", 0)) + 1
+		d["kills"] = kills
+		var lvl := mini(20, kills / 40)
+		if lvl > int(d.get("level", 0)):
+			d["level"] = lvl
+			_apply_item_effect(_growth_level_delta(String(d["growth"])))
+			_update_ui("成长装「%s」升到第 %d 阶！" % [String(d.get("name", "")), lvl])
+			_refresh_inventory_row()
+
+
+func _on_trainer_enter(room: String) -> void:
+	if trainer_enter(room):
+		_close_shop_panel()
+	else:
+		_refresh_shop_panel()
+
+
+func _build_trainer_panel_rows() -> void:
+	_shop_section_label("训练长官等级（刷兵次数）：%d" % train_level, "swords")
+	var info := Label.new()
+	info.text = "刷兵房：付费进场，训练兵成批刷新（场上≤9），练级刷钱；走出围栏结束。小Boss房：单挑训练小Boss，65% 掉成长紫装——紫装随你的击杀成长（每 40 击杀 +1 阶，最高 20 阶）。"
+	info.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	info.custom_minimum_size = Vector2(460, 0)
+	info.add_theme_color_override("font_color", Color(0.92, 0.90, 0.82))
+	shop_items_box.add_child(info)
+	var bb := _shop_row_button()
+	if brush_session:
+		bb.text = "刷兵训练房 · 进行中（走出围栏结束）"
+		bb.disabled = true
+	else:
+		bb.text = "进入刷兵训练房 · %d 金" % TRAIN_BRUSH_FEE
+		bb.disabled = gold < TRAIN_BRUSH_FEE
+	_add_btn_icon(bb, _ui_icon("swords"), 26.0 if _touch_ui else 22.0)
+	bb.pressed.connect(_on_trainer_enter.bind("brush"))
+	shop_items_box.add_child(bb)
+	var ob := _shop_row_button()
+	if boss_session:
+		ob.text = "小Boss训练房 · 进行中"
+		ob.disabled = true
+	else:
+		ob.text = "进入小Boss训练房 · %d 金 · 65%% 掉成长紫装" % TRAIN_BOSS_FEE
+		ob.disabled = gold < TRAIN_BOSS_FEE
+	_add_btn_icon(ob, _ui_icon("skull"), 26.0 if _touch_ui else 22.0)
+	ob.pressed.connect(_on_trainer_enter.bind("boss"))
+	shop_items_box.add_child(ob)
+	for item in hero_inventory:
+		var d: Dictionary = item
+		if d.has("growth"):
+			_shop_section_label("%s（成长装）：击杀 %d · 第 %d 阶" % [String(d.get("name", "")), int(d.get("kills", 0)), int(d.get("level", 0))])
+
+
+
+# --- Quests (stage 2) --------------------------------------------------
+# The 2D quest catalogue on 3D machinery: neutral/challenge units
+# live in `wilds` (never in `enemies`, so waves, towers and wave-clear
+# ignore them), quest tokens ride the bag as kind "quest" items, and
+# NPC talks route through quest_npc_interact(). Approximations are
+# marked inline and in BUILD_LOG.
+func qstate(id: String) -> String:
+	return String(quest_state.get(id, "no"))
+
+
+func qset(id: String, st: String) -> void:
+	quest_state[id] = st
+
+
+func _build_quest_npcs() -> void:
+	# 村长 (quest giver: bandit bounty + villager charm), south of the
+	# market row; 村外老头 (poison-gland quest) at the forest's south
+	# edge; 孔明 by the command tent (letter pickup + 玉玺 delivery).
+	var cunzh := _spawn_static_npc(Vector3(-40, 0, 18), "general", Color(0.98, 0.90, 0.72), "村长")
+	_add_label3d(world_root, "村长", Vector3(-40, 5.6, 18), 48, Color(1.0, 0.94, 0.80))
+	var laotou := _spawn_static_npc(Vector3(38, 0, -26), "general", Color(0.88, 0.88, 0.80), "村外老头")
+	_add_label3d(world_root, "村外老头", Vector3(38, 5.6, -26), 48, Color(0.95, 0.95, 0.88))
+	var kongming := _spawn_static_npc(Vector3(-71.5, 0, -15.5), "general", Color(0.80, 0.90, 1.0), "孔明")
+	kongming_unit = kongming
+	_refresh_kongming_stats(true)
+	_add_label3d(world_root, "孔明", Vector3(-71.5, 5.6, -15.5), 48, Color(0.85, 0.92, 1.0))
+	quest_npc_defs = [
+		{"id": "cunzh", "pos": Vector3(-40, 0, 18)},
+		{"id": "laotou", "pos": Vector3(38, 0, -26)},
+		{"id": "kongming", "pos": Vector3(-71.5, 0, -15.5)},
+		{"id": "mengda", "pos": Vector3(-75, 0, -28.5)},
+		{"id": "hunter", "pos": Vector3(44.5, 0, -28.6)},
+	]
+	# The static NPC nodes double as tap targets through the pos table.
+
+
+func _setup_wild_points() -> void:
+	# Spawn points for neutral beasts + quest/challenge bosses.
+	# respawn seconds; -1 = never (quest one-offs respawn via events).
+	var defs: Array = [
+		["beast", Vector3(58, 0, -34), 25.0], ["beast", Vector3(68, 0, -37), 25.0],
+		["beast", Vector3(76, 0, -35), 25.0], ["beast", Vector3(63, 0, -39), 25.0],
+		["beast", Vector3(56, 0, 34), 25.0], ["beast", Vector3(71, 0, 39), 25.0],
+		["bandit", Vector3(48, 0, -37), 300.0],
+		["bloodmother", Vector3(78, 0, -32.5), 120.0],
+		["yaoshu", Vector3(47, 0, -40), 240.0],
+		["xuanwu", Vector3(63, 0, 37), 240.0],
+		["qinglong", Vector3(77, 0, -37), 240.0],
+		["zhuque", Vector3(80, 0, 0), 240.0],
+		["baihu", Vector3(-8, 0, -36), 240.0],
+		["xiangyu", Vector3(-20, 0, -36), 180.0],
+		["xingtian", Vector3(-84, 0, 38), 180.0],
+		["hunboss", Vector3(-28, 0, -40), 180.0],
+	]
+	for d in defs:
+		var pt := {"kind": String(d[0]), "pos": d[1], "respawn": float(d[2]), "timer": 0.0, "unit": null}
+		pt["unit"] = spawn_wild_at(String(d[0]), d[1])
+		wild_points.append(pt)
+
+
+func spawn_wild_at(kind: String, pos: Vector3) -> ArticulatedUnit:
+	var w := float(current_wave)
+	var u: ArticulatedUnit = null
+	match kind:
+		"beast":
+			u = _make_unit("beast", "enemy", "野兽", pos, 90.0 + 8.0 * w, 3.2, 2.4, 7.0, 1.0, "", Color.WHITE, 0.8)
+			u.set_meta("xp", 6)
+		"bandit":
+			u = _make_unit("enemy", "enemy", "强盗头子", pos, 700.0 + 60.0 * w, 3.4, 2.6, 12.0, 0.9, "enemy", Color(0.45, 0.40, 0.38))
+			u.set_meta("bounty", 120)
+			u.set_meta("xp", 60)
+			u.set_meta("revive_once", true)
+		"escort_bandit":
+			u = _make_unit("enemy", "enemy", "强盗", pos, 260.0 + 20.0 * w, 3.6, 2.4, 9.0, 0.9, "enemy", Color(0.50, 0.42, 0.40))
+			u.set_meta("bounty", 15)
+			u.set_meta("xp", 8)
+			u.set_meta("hunt", "villager")
+		"bloodmother":
+			u = _make_unit("beast", "enemy", "血浴之母", pos, 900.0 + 70.0 * w, 2.8, 2.6, 13.0, 1.0, "", Color.WHITE, 1.2)
+			u.set_meta("bounty", 150)
+			u.set_meta("xp", 90)
+		"yaoshu":
+			u = _make_unit("enemy", "enemy", "妖术师头目", pos, 1000.0 + 80.0 * w, 2.6, 9.0, 16.0, 1.1, "enemy", Color(0.62, 0.45, 0.85))
+			u.set_meta("bounty", 180)
+			u.set_meta("xp", 110)
+		"xuanwu":
+			u = _make_unit("beast", "enemy", "玄武", pos, 2400.0 + 150.0 * w, 2.2, 3.0, 20.0, 1.1, "", SAINT_TINTS["玄武"], 2.0)
+			u.set_meta("bounty", 300)
+			u.set_meta("xp", 200)
+			u.set_meta("aggro_range", 10.0)
+		"qinglong":
+			u = _make_unit("beast", "enemy", "青龙", pos, 2600.0 + 150.0 * w, 2.4, 3.0, 26.0, 1.1, "", SAINT_TINTS["青龙"], 2.0)
+			u.set_meta("bounty", 300)
+			u.set_meta("xp", 250)
+			u.set_meta("aggro_range", 10.0)
+		"zhuque":
+			u = _make_unit("beast", "enemy", "朱雀", pos, 2600.0 + 150.0 * w, 2.4, 3.0, 26.0, 1.1, "", SAINT_TINTS["朱雀"], 2.0)
+			u.set_meta("bounty", 300)
+			u.set_meta("xp", 250)
+			u.set_meta("aggro_range", 10.0)
+		"baihu":
+			u = _make_unit("beast", "enemy", "白虎", pos, 2600.0 + 150.0 * w, 2.4, 3.0, 26.0, 1.1, "", SAINT_TINTS["白虎"], 2.0)
+			u.set_meta("bounty", 300)
+			u.set_meta("xp", 250)
+			u.set_meta("aggro_range", 10.0)
+		"xiangyu":
+			u = _make_unit("enemy", "enemy", "项羽之魂", pos, 1800.0 + 120.0 * w, 3.0, 2.8, 22.0, 0.9, "enemy", Color(0.95, 0.80, 0.35), 1.5)
+			u.set_meta("bounty", 200)
+			u.set_meta("xp", 150)
+		"xingtian":
+			u = _make_unit("enemy", "enemy", "刑天", pos, 1800.0 + 120.0 * w, 3.0, 2.8, 22.0, 0.9, "enemy", Color(0.70, 0.55, 0.45), 1.5)
+			u.set_meta("bounty", 200)
+			u.set_meta("xp", 150)
+		"hunboss":
+			u = _make_unit("enemy", "enemy", "幽冥魂主", pos, 1500.0 + 100.0 * w, 2.8, 2.8, 18.0, 1.0, "enemy", Color(0.75, 0.85, 0.95), 1.4)
+			u.set_meta("bounty", 200)
+			u.set_meta("xp", 140)
+		"xuhuang":
+			u = _make_unit("enemy", "enemy", "徐晃", pos, 1500.0 + 120.0 * w, 3.8, 2.8, 16.0, 0.9, "enemy", Color(0.60, 0.55, 0.50), 1.3)
+			u.set_meta("bounty", 200)
+			u.set_meta("xp", 130)
+			u.set_meta("hunt", "mengda")
+	if u != null:
+		u.set_meta("wild_kind", kind)
+		u.set_meta("home", pos)
+		wilds.append(u)
+	return u
+
+
+func _update_wilds(delta: float) -> void:
+	# Respawn timers for point-based wilds.
+	for pt in wild_points:
+		var u: ArticulatedUnit = pt.get("unit")
+		if u != null and (not is_instance_valid(u) or not u.alive):
+			pt["unit"] = null
+		if pt.get("unit") == null:
+			pt["timer"] = float(pt.get("timer", 0.0)) + delta
+			if float(pt.get("timer", 0.0)) >= float(pt.get("respawn", 60.0)):
+				pt["timer"] = 0.0
+				pt["unit"] = spawn_wild_at(String(pt.get("kind", "beast")), pt.get("pos"))
+	# Behavior: hunt target (villager / 孟达）, else the hero inside
+	# aggro range; otherwise leash back home.
+	for i in range(wilds.size() - 1, -1, -1):
+		var wd: ArticulatedUnit = wilds[i]
+		if not is_instance_valid(wd):
+			wilds.remove_at(i)
+			continue
+		if not wd.alive:
+			continue
+		if _unit_disabled(wd):
+			wd.stop_moving()
+			continue
+		var target: ArticulatedUnit = null
+		var hunt := String(wd.get_meta("hunt", "")) if wd.has_meta("hunt") else ""
+		if hunt == "villager":
+			var best := 999.0
+			for v in villagers:
+				if is_instance_valid(v) and v.alive:
+					var d := Vector2(v.global_position.x - wd.global_position.x, v.global_position.z - wd.global_position.z).length()
+					if d < best:
+						best = d
+						target = v
+		elif hunt == "mengda":
+			if is_instance_valid(mengda_unit) and mengda_unit.alive:
+				target = mengda_unit
+		if target == null and is_instance_valid(strategist) and strategist.alive:
+			var dh := Vector2(strategist.global_position.x - wd.global_position.x, strategist.global_position.z - wd.global_position.z).length()
+			var agr := 15.0
+			if wd.has_meta("aggro_range"):
+				agr = float(wd.get_meta("aggro_range"))
+			if dh <= agr:
+				target = strategist
+		if target != null:
+			wd.set_combat_target(target)
+			var dt := Vector2(target.global_position.x - wd.global_position.x, target.global_position.z - wd.global_position.z).length()
+			if dt > wd.attack_range + 0.4:
+				wd.move_to(target.global_position)
+			elif wd.try_attack():
+				apply_damage(wd, target, wd.attack_damage, "melee")
+		else:
+			var home: Vector3 = wd.get_meta("home") if wd.has_meta("home") else wd.global_position
+			var dhome := Vector2(home.x - wd.global_position.x, home.z - wd.global_position.z).length()
+			if dhome > 2.0:
+				wd.move_to(home)
+			else:
+				wd.stop_moving()
+
+
+func _on_wild_death(kind: String, _unit: ArticulatedUnit) -> void:
+	match kind:
+		"beast":
+			if _rng.randf() < 0.5:
+				if _rng.randf() < 0.85:
+					hides_n += 1
+					_update_ui("野兽掉落兽皮（普通）——猎人收购，现有普通 %d / 优质 %d。" % [hides_n, hides_f])
+				else:
+					hides_f += 1
+					_update_ui("野兽掉落兽皮（优质）！猎人收购，现有普通 %d / 优质 %d。" % [hides_n, hides_f])
+		"bandit":
+			give_hero_item({"name": "人头", "kind": "quest", "desc": "强盗头子的人头，交给村长领赏"})
+			if qstate("qiangdao") == "no":
+				qset("qiangdao", "on")
+			_update_ui("强盗头子授首！带「人头」回村长处领赏。")
+		"xuanwu":
+			if qstate("yuxi") != "done" and not has_hero_item("玉玺"):
+				give_hero_item({"name": "玉玺", "kind": "quest", "desc": "把玉玺交给孔明，孔明大幅成长"})
+				_update_ui("击败玄武！获得「玉玺」——快交给帅帐旁的孔明。")
+			give_hero_item(saint_mark_item("玄武"))
+			_update_ui("击败玄武！获得「圣痕·玄武」——背包使用可召唤玄武助战。")
+		"qinglong":
+			give_hero_item(saint_mark_item("青龙"))
+			_update_ui("击败青龙！获得「圣痕·青龙」——背包使用可召唤青龙助战。")
+		"zhuque":
+			give_hero_item(saint_mark_item("朱雀"))
+			give_hero_item({"name": "铜雀", "kind": "tongque", "desc": "使用：恢复英雄 500 气血，并得英雄等级×50 金"})
+			_update_ui("击败朱雀！获得「圣痕·朱雀」与信物「铜雀」。")
+		"baihu":
+			give_hero_item(saint_mark_item("白虎"))
+			give_hero_item({"name": "和氏璧", "kind": "token", "desc": "持有：反隐（看破隐形单位）"})
+			_update_ui("击败白虎！获得「圣痕·白虎」与信物「和氏璧」（持有反隐）。")
+		"bloodmother":
+			if qstate("dudan") == "on":
+				give_hero_item({"name": "毒腺", "kind": "quest", "desc": "血浴之母的毒腺，带回给村外老头"})
+				_update_ui("取得「毒腺」！带回给村外老头。")
+		"yaoshu":
+			give_hero_item({"name": "斩蛇剑", "kind": "gear", "dmg": 26.0, "str": 6.0, "desc": "妖术师头目掉落"})
+			give_hero_item({"name": "轩辕剑", "kind": "gear", "dmg": 20.0, "int": 6.0, "desc": "未开光：持它杀项羽之魂取魄，再回炼化师处开光"})
+			if qstate("yaoshu") == "no":
+				qset("yaoshu", "done")
+			if qstate("xuanyuan") == "no":
+				qset("xuanyuan", "on")
+			_update_ui("妖术师头目掉落「斩蛇剑」与「轩辕剑」（未开光）！")
+		"hunboss":
+			give_hero_item({"name": "魂", "kind": "soul", "desc": "使用后化魂 8 秒，不受任何伤害"})
+			if qstate("hun") == "no":
+				qset("hun", "done")
+			_update_ui("幽冥魂主掉落圣物「魂」——点背包使用，化魂 8 秒不受伤害。")
+		"xiangyu":
+			give_hero_item(make_random_gold_gear())
+			if qstate("xiangyu") == "no":
+				qset("xiangyu", "done")
+			if has_hero_item("轩辕剑") and qstate("xuanyuan") != "done" and not has_hero_item("魄"):
+				give_hero_item({"name": "魄", "kind": "quest", "desc": "项羽之魂的魄，持魄与轩辕剑回炼化师处开光"})
+				_update_ui("项羽之魂掉落「魄」！带回炼化师处为轩辕剑开光。")
+		"xingtian":
+			give_hero_item(make_random_gold_gear())
+			if qstate("xingtian") == "no":
+				qset("xingtian", "done")
+		"saint_beast":
+			# Casino event beast: bounty 300 is paid by the generic
+			# death handler via the bounty meta; the beast also leaves
+			# a gold gear (2D goldV 600, scaled to this economy) and,
+			# since the saint system landed, its summoning mark.
+			give_hero_item(make_random_gold_gear())
+			var cbn := _unit.display_name
+			if SAINT_TINTS.has(cbn):
+				give_hero_item(saint_mark_item(cbn))
+				_update_ui("神兽退去，留下黄金装备与「圣痕·%s」！" % cbn)
+			else:
+				_update_ui("神兽退去，留下黄金装备！")
+		"xuhuang":
+			if qstate("xincheng") == "on2":
+				qset("xincheng", "done")
+				_update_ui("徐晃已退！新城开放——孟达留守新城助战。")
+
+
+func make_random_gold_gear() -> Dictionary:
+	var pool: Array = [
+		{"name": "黄金剑", "kind": "gear", "dmg": 34.0, "desc": "黄金装备"},
+		{"name": "黄金甲", "kind": "gear", "hp": 380.0, "desc": "黄金装备"},
+		{"name": "黄金靴", "kind": "gear", "spd": 0.7, "desc": "黄金装备"},
+		{"name": "黄金戒指", "kind": "gear", "dmg": 10.0, "hp": 150.0, "desc": "黄金装备"},
+	]
+	return pool[_rng.randi() % pool.size()]
+
+
+func has_hero_item(item_name: String) -> bool:
+	for it in hero_inventory:
+		if String((it as Dictionary).get("name", "")) == item_name:
+			return true
+	return false
+
+
+func take_hero_item(item_name: String) -> bool:
+	for i in range(hero_inventory.size()):
+		if String((hero_inventory[i] as Dictionary).get("name", "")) == item_name:
+			hero_inventory.remove_at(i)
+			_refresh_inventory_row()
+			return true
+	return false
+
+
+func give_hero_item(it: Dictionary) -> bool:
+	# Gear effects apply on receipt (the bag is worn, 2D-style); when
+	# the bag is full the item waits in the pending queue instead of
+	# dropping on the ground (3D has no ground-item system).
+	if hero_inventory.size() < SHOP_MAX_SLOTS:
+		hero_inventory.append(it)
+		_apply_item_effect(it)
+		_refresh_inventory_row()
+		return true
+	pending_quest_items.append(it)
+	_update_ui("背包已满！「%s」暂存待领——腾出一格后点任意任务 NPC 领取。" % String(it.get("name", "")))
+	return false
+
+
+func _deliver_pending_items() -> void:
+	while not pending_quest_items.is_empty() and hero_inventory.size() < SHOP_MAX_SLOTS:
+		var it: Dictionary = pending_quest_items.pop_front()
+		hero_inventory.append(it)
+		_apply_item_effect(it)
+		_refresh_inventory_row()
+		_update_ui("领取暂存物品「%s」。" % String(it.get("name", "")))
+
+
+# --- Escort event （百姓护送） ------------------------------------------
+func spawn_escort_event() -> void:
+	escort_active = true
+	escort_saved_round = 0
+	escort_pending = 4
+	for i in range(4):
+		var v := _make_unit("trainee", "ally", "百姓", Vector3(94, 0, -12 + i * 7), 60.0, 2.6, 0.0, 0.0, 1.0, "enemy", Color(0.78, 0.86, 1.0))
+		villagers.append(v)
+	spawn_wild_at("escort_bandit", Vector3(34, 0, -6))
+	spawn_wild_at("escort_bandit", Vector3(34, 0, 8))
+	_update_ui("百姓自东面逃来，强盗半路截杀——护住他们到基地！（累计已救 %d/30）" % saved_villagers)
+
+
+func _update_villagers() -> void:
+	var dest := Vector3(-64, 0, 2)
+	for i in range(villagers.size() - 1, -1, -1):
+		var v: ArticulatedUnit = villagers[i]
+		if not is_instance_valid(v):
+			villagers.remove_at(i)
+			continue
+		if not v.alive:
+			villagers.remove_at(i)
+			escort_pending -= 1
+			continue
+		var d := Vector2(dest.x - v.global_position.x, dest.z - v.global_position.z).length()
+		if d <= 4.0:
+			saved_villagers += 1
+			escort_saved_round += 1
+			gold += 30
+			v.free()
+			villagers.remove_at(i)
+			escort_pending -= 1
+		else:
+			v.move_to(dest)
+	if escort_active and escort_pending <= 0:
+		escort_active = false
+		for wd in wilds:
+			if is_instance_valid(wd) and String(wd.get_meta("wild_kind", "")) == "escort_bandit" and wd.alive:
+				wd.free()
+		_update_ui("本批百姓：救下 %d 人（每人谢礼 30 金，累计已救 %d/30）。" % [escort_saved_round, saved_villagers])
+		_refresh_hud()
+
+
+func _update_mengda() -> void:
+	if not is_instance_valid(mengda_unit):
+		return
+	if not mengda_unit.alive:
+		if qstate("xincheng") == "on2":
+			qset("xincheng", "no")
+			letter_pending = true
+			_update_ui("孟达遇害！回孔明处再取一封书信，重送新城。")
+			mengda_unit = null
+		return
+	# During the 徐晃 hunt 孟达 fights back; afterwards he guards 新城.
+	var post := Vector3(-72, 0, -30)
+	var target: ArticulatedUnit = null
+	var best := 18.0
+	for e in alive_enemies():
+		if not _enemy_targetable(e):
+			continue
+		var d := Vector2(e.global_position.x - mengda_unit.global_position.x, e.global_position.z - mengda_unit.global_position.z).length()
+		if d < best:
+			best = d
+			target = e
+	if qstate("xincheng") == "on2":
+		for wd in wilds:
+			if is_instance_valid(wd) and wd.alive and String(wd.get_meta("wild_kind", "")) == "xuhuang":
+				var dx := Vector2(wd.global_position.x - mengda_unit.global_position.x, wd.global_position.z - mengda_unit.global_position.z).length()
+				if dx < best:
+					best = dx
+					target = wd
+	if target != null:
+		mengda_unit.set_combat_target(target)
+		if best > mengda_unit.attack_range + 0.4:
+			mengda_unit.move_to(target.global_position)
+		elif mengda_unit.try_attack():
+			apply_damage(mengda_unit, target, mengda_unit.attack_damage, "spear")
+	else:
+		var back := Vector2(post.x - mengda_unit.global_position.x, post.z - mengda_unit.global_position.z).length()
+		if back > 0.8:
+			mengda_unit.move_to(post)
+		else:
+			mengda_unit.stop_moving()
+
+
+# --- NPC talks ----------------------------------------------------------
+func quest_npc_interact(id: String) -> void:
+	_deliver_pending_items()
+	match id:
+		"cunzh":
+			if has_hero_item("人头"):
+				take_hero_item("人头")
+				qset("qiangdao", "done")
+				# The gold gear IS the reward: when the bag is full
+				# give_hero_item already stashes it for later pickup,
+				# so no gold fallback — the old `gold += 300` paid out
+				# on top of the stashed gear (a double reward).
+				give_hero_item(make_random_gold_gear())
+				_update_ui("村长：强盗已除！这是谢礼（黄金装备）。")
+			elif saved_villagers >= 30 and qstate("baixing") != "done":
+				qset("baixing", "done")
+				give_hero_item({"name": "幽灵护符", "kind": "gear", "hp": 200.0, "dmg": 8.0, "desc": "护送百姓的谢礼"})
+				_update_ui("村长：三十位百姓都平安，这枚幽灵护符赠予你。")
+			elif qstate("qiangdao") != "done":
+				if qstate("qiangdao") == "no":
+					qset("qiangdao", "on")
+				_update_ui("村长：森林西缘有个强盗头子（他会复活一次），取他的人头来，我重重有赏。已救百姓 %d/30。" % saved_villagers)
+			else:
+				_update_ui("村长：村子太平了。已救百姓 %d/30。" % saved_villagers)
+		"laotou":
+			if qstate("dudan") == "on" and has_hero_item("毒腺"):
+				take_hero_item("毒腺")
+				qset("dudan", "done")
+				give_hero_item({"name": "徐夫人", "kind": "gear", "dmg": 18.0, "agi": 14.0, "desc": "鱼肠剑·毒腺任务奖励（匕首）"})
+				_update_ui("老头：毒腺成色不错，这把徐夫人归你了。")
+			elif qstate("dudan") == "no":
+				if train_level > 6:
+					qset("dudan", "on")
+					_update_ui("老头：森林东南的血浴之母有毒腺，取来给我，我用徐夫人换。")
+				else:
+					_update_ui("老头：先去训练场历练（刷兵次数 > 6，当前 %d），我才放心把秘密告诉你。" % train_level)
+			elif qstate("dudan") == "on":
+				_update_ui("老头：血浴之母就在森林东南角，毒腺带来了吗？")
+			else:
+				_update_ui("老头：徐夫人用着顺手吧？")
+		"mengda":
+			if has_hero_item("书信"):
+				take_hero_item("书信")
+				qset("xincheng", "on2")
+				mengda_unit = _make_unit("general", "ally", "孟达", Vector3(-72, 0, -30), 1100.0, 4.0, 3.0, 15.0, 0.8)
+				spawn_wild_at("xuhuang", Vector3(-84, 0, -38))
+				_update_ui("孟达：孔明来信！新城即刻开关——徐晃奉命来杀我，护住我！")
+			elif qstate("xincheng") == "on2":
+				_update_ui("孟达：徐晃就在附近，护住我！")
+			elif qstate("xincheng") == "done":
+				_update_ui("孟达：新城已开，我在此助守。")
+			else:
+				_update_ui("孟达：新城城门紧闭（需要孔明的书信：第 8 波雅丹死后回孔明处领取）。")
+		"hunter":
+			var total := hides_n * 150 + hides_f * 400
+			if total > 0:
+				gold += total
+				_update_ui("猎人收购兽皮：普通 %d 张 + 优质 %d 张，共 %d 金。" % [hides_n, hides_f, total])
+				hides_n = 0
+				hides_f = 0
+				_refresh_hud()
+			else:
+				_update_ui("猎人：森林和水边有野兽，剥了皮拿来——普通 150、优质 400 一张。")
+		"kongming":
+			var said := false
+			if letter_pending:
+				letter_pending = false
+				give_hero_item({"name": "书信", "kind": "quest", "desc": "孔明的书信，送往左上新城交给孟达"})
+				_update_ui("孔明：此信送往新城孟达，路上小心。")
+				said = true
+			if has_hero_item("玉玺"):
+				take_hero_item("玉玺")
+				qset("yuxi", "done")
+				general_level += 2
+				_refresh_kongming_stats()
+				if is_instance_valid(general) and general.alive:
+					general.max_hp += 120.0
+					general.hp = general.max_hp
+					general.attack_damage += 8.0
+				_update_ui("孔明得玉玺，连升 2 级！守将受其调度，气血与攻击提升。")
+				said = true
+			if not said:
+				_update_ui("孔明：守住封印核，二十波之后是三司马。（孔明等级 %d）" % general_level)
+
+
+func xuanyuan_bless() -> bool:
+	# Refiner-panel action: 轩辕剑 + 魄 -> 开光轩辕剑 (stats replace the
+	# unblessed pair via a fresh gear item; the plain sword's own stat
+	# contribution is NOT unwound — the bless delta pricing assumes
+	# the upgrade margin, same bookkeeping as refine gear swaps).
+	if not has_hero_item("轩辕剑") or not has_hero_item("魄"):
+		return false
+	take_hero_item("轩辕剑")
+	take_hero_item("魄")
+	qset("xuanyuan", "done")
+	give_hero_item({"name": "开光轩辕剑", "kind": "gear", "dmg": 46.0, "str": 12.0, "int": 12.0, "desc": "轩辕剑开光：项羽之魄已封入剑身"})
+	_update_ui("炼化师以项羽之魄为轩辕剑开光——「开光轩辕剑」成！")
+	return true
+
+
+# --- Quest log panel ------------------------------------------------------
+func _quest_status_text(def: Dictionary) -> String:
+	var id := String(def.get("id", ""))
+	if id == "shangfanggu":
+		return "未开放（终局阶段）"
+	if id == "shoupi":
+		return "常驻 · 现有兽皮 普通 %d / 优质 %d" % [hides_n, hides_f]
+	if id == "baixing":
+		return "进行中 · 已救 %d/30" % saved_villagers
+	match qstate(id):
+		"on", "on2":
+			return "进行中"
+		"done":
+			return "已完成"
+	return "未接"
+
+
+func _refresh_quest_panel() -> void:
+	if not is_instance_valid(quest_box):
+		return
+	for c in quest_box.get_children():
+		c.queue_free()
+	for def in QUEST_DEFS:
+		var head := Label.new()
+		head.text = "%s · %s（交付：%s）" % [String(def.get("n", "")), _quest_status_text(def), String(def.get("g", ""))]
+		head.add_theme_font_size_override("font_size", 17)
+		head.add_theme_color_override("font_color", Color(1.0, 0.85, 0.45))
+		quest_box.add_child(head)
+		var body := Label.new()
+		body.text = "%s 奖励：%s" % [String(def.get("d", "")), String(def.get("r", ""))]
+		body.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		body.custom_minimum_size = Vector2(500, 0)
+		body.add_theme_font_size_override("font_size", 14)
+		body.add_theme_color_override("font_color", Color(0.90, 0.88, 0.82))
+		quest_box.add_child(body)
+
+
+func _open_wallet_panel() -> void:
+	_refresh_wallet_panel()
+	wallet_panel.move_to_front()
+	wallet_panel.visible = true
+	var ms := wallet_panel.get_combined_minimum_size()
+	wallet_panel.offset_left = -ms.x * 0.5
+	wallet_panel.offset_right = ms.x * 0.5
+	wallet_panel.offset_top = -ms.y * 0.5
+	wallet_panel.offset_bottom = ms.y * 0.5
+
+
+func _close_wallet_panel() -> void:
+	wallet_panel.visible = false
+
+
+func _refresh_wallet_panel() -> void:
+	var connected := Wallet.is_wallet_connected()
+	wallet_status_label.text = "已连接 " + Wallet.short_address() + (" · %.4f SOL" % Wallet.last_balance_sol if Wallet.last_balance_sol >= 0.0 else " · 余额查询中…") if connected else "游客模式 · 未连接钱包"
+	wallet_disconnect_button.disabled = not connected
+	wallet_sign_button.disabled = not connected
+	wallet_p0_button.disabled = not connected
+	wallet_connect_button.disabled = connected
+	var fallback := not Wallet.is_mwa_available()
+	wallet_fallback_label.visible = fallback
+	wallet_address_edit.get_parent().visible = fallback
+
+
+func _on_wallet_connect_pressed() -> void:
+	var err := Wallet.request_authorize()
+	if err != "":
+		_refresh_wallet_panel()
+		_update_ui(err)
+	else:
+		_update_ui("正在打开钱包…")
+
+
+func _on_wallet_disconnect_pressed() -> void:
+	Wallet.disconnect_wallet()
+	_refresh_wallet_panel()
+	_update_ui("已断开钱包，回到游客模式。")
+
+
+func _on_wallet_sign_pressed() -> void:
+	if not Wallet.is_wallet_connected():
+		_update_ui("请先连接钱包。")
+		return
+	if Wallet.request_sign_message("Jiange P0 smoke test"):
+		_update_ui("签名请求已发送到钱包…")
+
+
+func _on_wallet_p0_pressed() -> void:
+	if not Wallet.is_wallet_connected():
+		_update_ui("请先连接钱包。")
+		return
+	var oid := Wallet.create_order("p0_smoke", 10_000_000, Wallet.address)
+	if oid == "":
+		_update_ui("订单创建失败。")
+		return
+	Wallet.transfer_sol(oid)
+	_update_ui("P0 冒烟转账已提交，等待钱包签名…")
+
+
+func _on_wallet_balance_pressed() -> void:
+	Wallet.connect_with_address(wallet_address_edit.text)
+
+
+func _on_wallet_state_changed() -> void:
+	_refresh_wallet_panel()
+	_update_ui("钱包已连接 " + Wallet.short_address() + "。" if Wallet.is_wallet_connected() else "钱包已断开，回到游客模式。")
+
+
+func _on_wallet_balance_updated(_sol: float) -> void:
+	_refresh_wallet_panel()
+
+
+func _on_wallet_balance_failed(reason: String) -> void:
+	_refresh_wallet_panel()
+	_update_ui("余额查询失败：" + reason)
+
+
+func _on_wallet_auth_failed(reason: String) -> void:
+	_refresh_wallet_panel()
+	_update_ui("钱包授权失败：" + reason)
+
+
+func _on_wallet_message_signed(_message: String, _signature: String) -> void:
+	_update_ui("签名测试通过，验签成功。")
+
+
+func _on_wallet_message_sign_failed(reason: String) -> void:
+	_update_ui("签名失败：" + reason)
+
+
+func _on_wallet_transfer_submitted(order_id: String, _signature: String) -> void:
+	_update_ui("P0 冒烟转账已提交（订单 " + order_id + "）。")
+
+
+func _on_wallet_transfer_failed(_order_id: String, reason: String) -> void:
+	_update_ui("P0 冒烟转账失败：" + reason)
+
+
+func _open_quest_panel() -> void:
+	_refresh_quest_panel()
+	if is_instance_valid(quest_panel):
+		quest_panel.visible = true
+		var ms := quest_panel.get_combined_minimum_size()
+		quest_panel.offset_left = -ms.x * 0.5
+		quest_panel.offset_right = ms.x * 0.5
+		quest_panel.offset_top = -ms.y * 0.5
+		quest_panel.offset_bottom = ms.y * 0.5
+
+
+func _close_quest_panel() -> void:
+	if is_instance_valid(quest_panel):
+		quest_panel.visible = false
+
+
+func _quest_npc_at_screen(screen_pos: Vector2) -> String:
+	for def in quest_npc_defs:
+		var np: Vector3 = def.get("pos")
+		var sp := camera.unproject_position(np + Vector3(0, 1.2, 0))
+		if sp.distance_to(screen_pos) <= 56.0:
+			return String(def.get("id", ""))
+		var ground := _ground_point_from_screen(screen_pos)
+		if Vector2(ground.x - np.x, ground.z - np.z).length() <= 1.8:
+			return String(def.get("id", ""))
+	return ""
+
+
+
+func _update_defenders(_delta: float) -> void:
+	if is_instance_valid(general) and general.alive and _unit_disabled(general):
+		general.stop_moving()
+	elif is_instance_valid(general) and general.alive:
+		var target: ArticulatedUnit = null
+		var best := 999.0
+		for e in alive_enemies():
+			if not _enemy_targetable(e):
+				continue
+			var gd := Vector2(e.global_position.x - general.global_position.x, e.global_position.z - general.global_position.z).length()
+			if gd <= 18.0:
+				if gd < best:
+					best = gd
+					target = e
+		if target != null:
+			general.set_combat_target(target)
+			if general.try_attack():
+				apply_damage(general, target, general.attack_damage, "spear")
+		else:
+			var post: Vector3 = general.get_meta("guard_post") if general.has_meta("guard_post") else GUARD_POS
+			var back := Vector2(post.x - general.global_position.x, post.z - general.global_position.z).length()
+			if back > 0.6:
+				general.move_to(post)
+			else:
+				general.stop_moving()
+	# Hero basic attacks (stage-1): the slice hero was a pure caster; with
+	# the full roster the hero strikes whatever is inside weapon reach —
+	# no chasing, so player move orders are never overridden.
+	if is_instance_valid(strategist) and strategist.alive and _unit_disabled(strategist):
+		strategist.stop_moving()
+	elif is_instance_valid(strategist) and strategist.alive:
+		# A standing move order wins over auto-attack: set_combat_target
+		# would cancel the order (unit contract), which used to strand
+		# the hero dueling every wild beast on a cross-map walk.
+		var hero_ordered_move := bool(strategist.get("_has_move_target"))
+		var htarget: ArticulatedUnit = null
+		var hbest := strategist.attack_range + 0.3
+		for e in alive_enemies():
+			if not _enemy_targetable(e):
+				continue
+			var hd := Vector2(e.global_position.x - strategist.global_position.x, e.global_position.z - strategist.global_position.z).length()
+			if hd < hbest:
+				hbest = hd
+				htarget = e
+		if htarget == null:
+			for t in trainees:
+				if is_instance_valid(t) and t.alive:
+					var td := Vector2(t.global_position.x - strategist.global_position.x, t.global_position.z - strategist.global_position.z).length()
+					if td < hbest:
+						hbest = td
+						htarget = t
+		if htarget == null:
+			for w2 in wilds:
+				if is_instance_valid(w2) and w2.alive:
+					var wd2 := Vector2(w2.global_position.x - strategist.global_position.x, w2.global_position.z - strategist.global_position.z).length()
+					if wd2 < hbest:
+						hbest = wd2
+						htarget = w2
+		if htarget != null and not hero_ordered_move:
+			strategist.set_combat_target(htarget)
+			if strategist.try_attack():
+				apply_damage(strategist, htarget, strategist.attack_damage, "hero")
+
+
+func _apply_separation() -> void:
+	var units: Array = []
+	for e in alive_enemies():
+		units.append(e)
+	for d in [general, strategist]:
+		if is_instance_valid(d) and d.alive:
+			units.append(d)
+	for i in range(units.size()):
+		for j in range(i + 1, units.size()):
+			var a: ArticulatedUnit = units[i]
+			var b: ArticulatedUnit = units[j]
+			var delta := Vector2(b.global_position.x - a.global_position.x, b.global_position.z - a.global_position.z)
+			var dist := delta.length()
+			var min_dist: float = a.body_radius + b.body_radius + 0.30
+			if dist > 0.001 and dist < min_dist:
+				# Push split in inverse proportion to body size: the beast
+				# barely budges, infantry get shoved aside.
+				var overlap := min_dist - dist
+				var dir := delta / dist
+				var wa: float = b.body_radius / (a.body_radius + b.body_radius)
+				var wb: float = a.body_radius / (a.body_radius + b.body_radius)
+				a.global_position -= Vector3(dir.x * overlap * wa, 0, dir.y * overlap * wa)
+				b.global_position += Vector3(dir.x * overlap * wb, 0, dir.y * overlap * wb)
+
+
+func _check_wave_clear() -> void:
+	if game_state != "battle":
+		return
+	if finale_active and not finale_done:
+		return # the finale ends only when all three Simas are truly dead
+	if spawn_queue.is_empty() and alive_enemy_count() == 0:
+		_enter_intermission()
+
+
+func _process(delta: float) -> void:
+	elapsed += delta
+	_perf_sample(delta)
+	skill_cooldown = maxf(skill_cooldown - delta, 0.0)
+	core_flash = maxf(core_flash - delta, 0.0)
+	# Ambient animation: crystal spin/pulse, rift ring swirl.
+	if is_instance_valid(crystal_group):
+		crystal_group.rotation.y += delta * 0.35
+		var pulse := 1.0 + sin(elapsed * 2.2) * 0.03
+		crystal_group.scale = Vector3.ONE * pulse
+	if is_instance_valid(crystal_light):
+		crystal_light.light_energy = 3.3 + sin(elapsed * 2.2) * 0.5 + (2.2 if core_flash > 0.0 else 0.0)
+	for i in range(rift_rings.size()):
+		var ring: MeshInstance3D = rift_rings[i]
+		if is_instance_valid(ring):
+			ring.rotation.z += delta * (0.55 + float(i) * 0.30) * (1.0 if i % 2 == 0 else -1.0)
+	for rl in rift_lights:
+		if is_instance_valid(rl):
+			rl.light_energy = 2.9 + sin(elapsed * 3.1) * 0.45
+	if is_instance_valid(selection_ring):
+		selection_ring.visible = selected and is_instance_valid(strategist) and strategist.alive and (game_state == "battle" or game_state == "intermission")
+		if selection_ring.visible:
+			selection_ring.global_position = strategist.global_position + Vector3(0, 0.18, 0)
+			var pulse := 1.0 + 0.07 * sin(elapsed * 4.0)
+			selection_ring.scale = Vector3(pulse, 1.0, pulse)
+			if is_instance_valid(selection_chevron):
+				selection_chevron.position.y = 3.85 + 0.16 * sin(elapsed * 3.2)
+			if is_instance_valid(selection_diamond):
+				selection_diamond.position.y = 4.30 + 0.16 * sin(elapsed * 3.2)
+			if is_instance_valid(selection_pillar):
+				var pmat := selection_pillar.material_override as StandardMaterial3D
+				if pmat != null:
+					pmat.albedo_color.a = 0.22 + 0.07 * sin(elapsed * 4.0)
+	if move_marker_timer > 0.0:
+		move_marker_timer -= delta
+		move_marker.visible = move_marker_timer > 0.0
+
+	# Touch control revamp: joystick drive (touch only). The camera is
+	# NOT touched here — free view pans persist (see _pan_by_screen_delta).
+	if _touch_ui and _joy_index != -1 and _joy != null and is_instance_valid(strategist) and strategist.alive and (game_state == "battle" or game_state == "intermission"):
+		var jv: Vector2 = _joy.call("value")
+		if jv.length() > 0.01:
+			_joy_drove = true
+			selected = true
+			strategist.move_to(strategist.global_position + Vector3(jv.x, 0, jv.y) * 7.0)
+
+	if game_state == "battle":
+		if not spawn_queue.is_empty():
+			spawn_timer -= delta
+			if spawn_timer <= 0.0:
+				spawn_timer = spawn_interval
+				_spawn_from_queue()
+		_update_enemies(delta)
+		_update_defenders(delta)
+		_update_towers(delta)
+		_apply_separation()
+		_check_wave_clear()
+		_update_kongming()
+		# Stage-2 assassin: only in battle, only from wave 6, on the
+		# 2D timer (first 50 s, then rand 75–130 s between attempts).
+		if current_wave >= 6:
+			assassin_timer -= delta
+			if assassin_timer <= 0.0:
+				assassin_timer = _rng.randf_range(ASSASSIN_MIN_DELAY, ASSASSIN_MAX_DELAY)
+				spawn_assassin()
+	elif game_state == "intermission":
+		intermission_timer -= delta
+		_update_defenders(delta)
+		_update_kongming()
+		if intermission_timer <= 0.0:
+			_start_wave(current_wave + 1)
+	# Training rooms (stage 2): paid sessions only — see trainer_enter.
+	_update_training(delta)
+	_update_trainees()
+	_update_wilds(delta)
+	_update_mercs(delta)
+	_update_saints(delta)
+	_update_finale(delta)
+	_update_statuses(delta)
+	_update_boss_skills(delta)
+	if current_wave >= 12 and pop_used() > 0:
+		upkeep_timer += delta
+		if upkeep_timer >= 20.0:
+			upkeep_timer = 0.0
+			merc_upkeep_tick()
+	_update_villagers()
+	_update_mengda()
+	if soul_timer > 0.0:
+		soul_timer = maxf(soul_timer - delta, 0.0)
+	# Hero death / respawn (stage-1: timer scales with the wave).
+	if hero_index >= 0 and game_state != "select":
+		if hero_was_alive and (not is_instance_valid(strategist) or not strategist.alive):
+			hero_was_alive = false
+			hero_respawn_timer = 6.0 + float(current_wave) * 1.2
+			_update_ui("英雄阵亡！%.0f 秒后在主城复活。" % hero_respawn_timer)
+		if not hero_was_alive:
+			hero_respawn_timer -= delta
+			if hero_respawn_timer <= 0.0 and (game_state == "battle" or game_state == "intermission"):
+				_respawn_hero()
+	# Built towers grow in after purchase; empty pads pulse while building
+	# is available (intermission).
+	for t in towers:
+		if t.has("build_t"):
+			var bt := float(t["build_t"])
+			if bt < 1.0:
+				bt = minf(bt + delta / 0.45, 1.0)
+				t["build_t"] = bt
+				var tnode: Node3D = t.get("node")
+				if is_instance_valid(tnode):
+					var s := 0.25 + 0.75 * bt
+					tnode.scale = Vector3.ONE * s
+	for p in pads:
+		var rm: StandardMaterial3D = p["ring_mat"]
+		if game_state == "intermission" and p.get("tower") == null:
+			rm.emission_energy_multiplier = 1.5 + sin(elapsed * 4.0) * 0.7
+		else:
+			rm.emission_energy_multiplier = 0.35
+	_update_projectiles(delta)
+	_update_effects(delta)
+	_refresh_hud()
+
+
+func _refresh_hud() -> void:
+	if not is_instance_valid(core_bar):
+		return
+	core_bar.value = core_hp
+	if is_instance_valid(core_bar_fill_style):
+		var frac := core_hp / CORE_MAX_HP
+		if frac > 0.5:
+			core_bar_fill_style.bg_color = UI_PURPLE
+		elif frac > 0.25:
+			core_bar_fill_style.bg_color = Color(0.95, 0.65, 0.20)
+		else:
+			core_bar_fill_style.bg_color = Color(0.90, 0.25, 0.20)
+	core_label.text = "封印核耐久  %d / %d" % [int(core_hp), int(CORE_MAX_HP)]
+	if is_instance_valid(gold_label):
+		gold_label.text = "金币  %d" % gold
+	if is_instance_valid(fps_label):
+		var ft := "帧率统计中 · 画质%s" % PERF_TIER_NAMES[quality_tier]
+		if _perf_fps_avg > 0.0:
+			ft = "帧率 %.0f · 画质%s" % [_perf_fps_avg, PERF_TIER_NAMES[quality_tier]]
+		if ft != _perf_fps_text:
+			_perf_fps_text = ft
+			fps_label.text = ft
+	if is_instance_valid(hero_emblem_label):
+		hero_emblem_label.text = String(HERO_ROSTER[hero_index]["name"]).substr(0, 1) if hero_index >= 0 else "?"
+	if is_instance_valid(hero_emblem_portrait):
+		var ptex: Texture2D = null
+		if hero_index >= 0 and hero_index < hero_portrait_circ_textures.size():
+			ptex = hero_portrait_circ_textures[hero_index]
+		hero_emblem_portrait.texture = ptex
+		hero_emblem_portrait.visible = ptex != null
+	if is_instance_valid(hero_name_label):
+		if hero_index >= 0:
+			var hst := hero_stats_at(hero_index, hero_level)
+			var hhp := 0
+			var hmhp := int(float(hst["hp"]))
+			if is_instance_valid(strategist):
+				hhp = int(strategist.hp)
+				hmhp = int(strategist.max_hp)
+			hero_name_label.text = "%s Lv%d" % [String(HERO_ROSTER[hero_index]["name"]), hero_level]
+			hero_atk_label.text = "攻 %d" % int(float(hst["damage"]))
+			hero_hp_label.text = "气血 %d/%d" % [hhp, hmhp]
+			hero_xp_label.text = "经验 %d/%d" % [hero_xp, xp_to_next(hero_level)]
+		else:
+			hero_name_label.text = "尚未选择英雄"
+			hero_atk_label.text = ""
+			hero_hp_label.text = ""
+			hero_xp_label.text = ""
+	var alive_n := alive_enemy_count()
+	match game_state:
+		"victory":
+			wave_label.text = "二十波全清 · 胜利"
+		"defeat":
+			wave_label.text = "%s · 失败" % (defeat_reason if defeat_reason != "" else "封印核已毁")
+		"select":
+			wave_label.text = "选将中 · 挑选你的英雄"
+		"intermission":
+			wave_label.text = "休整中 · 第 %d 波 %.0fs 后来袭" % [current_wave + 1, maxf(intermission_timer, 0.0)]
+		_:
+			wave_label.text = "第 %d / %d 波 · 待出场 %d · 场上 %d" % [current_wave, MAX_WAVES, spawn_queue.size(), alive_n]
+	if is_instance_valid(wave_preview_label):
+		if game_state == "intermission" and current_wave < MAX_WAVES:
+			wave_preview_label.visible = true
+			wave_preview_label.text = "下一波（第 %d 波）：%s" % [current_wave + 1, wave_preview_text(current_wave + 1)]
+		else:
+			wave_preview_label.visible = false
+	if is_instance_valid(repair_button):
+		repair_button.disabled = game_state != "intermission"
+	if is_instance_valid(next_wave_button):
+		next_wave_button.visible = game_state == "intermission"
+	var skill_name := "链式闪电"
+	if hero_index >= 0:
+		skill_name = String(HERO_ROSTER[hero_index]["skill_name"])
+	if skill_cooldown > 0.0:
+		skill_button.disabled = true
+		skill_button.text = "%s（%d 秒）" % [skill_name, int(ceil(skill_cooldown))]
+		cooldown_label.text = "冷却中 %.1f 秒" % skill_cooldown
+	else:
+		skill_button.disabled = false
+		skill_button.text = skill_name
+		cooldown_label.text = "就绪（按钮释放英雄技能）"
+	if _big_skill_button != null and is_instance_valid(_big_skill_button):
+		_big_skill_button.text = skill_name
+		var cur_sid := String(HERO_ROSTER[hero_index].get("skill", "")) if hero_index >= 0 else ""
+		if _big_skill_name_label != null:
+			_big_skill_name_label.text = skill_name
+		if _big_skill_icon != null:
+			_big_skill_icon.texture = _skill_icon(cur_sid)
+			_big_skill_icon.visible = _big_skill_icon.texture != null
+		_set_btn_icon(skill_button, _skill_icon(cur_sid), 30.0 if _touch_ui else 24.0)
+		if skill_cooldown > 0.0:
+			_big_skill_button.modulate = Color(0.55, 0.55, 0.62)
+			if _big_skill_cd_label != null:
+				_big_skill_cd_label.text = "%d" % int(ceil(skill_cooldown))
+		else:
+			_big_skill_button.modulate = Color.WHITE
+			if _big_skill_cd_label != null:
+				_big_skill_cd_label.text = ""
+
+
+func _update_ui(message: String) -> void:
+	if is_instance_valid(message_label):
+		message_label.text = message
+		# The top message duplicates the select panel's own title while
+		# the panel is open, and on phones with a top safe-area inset it
+		# overlaps the panel title — hide it until battle starts. The
+		# call order already fits: select_hero hides the panel before
+		# calling here, reset_game shows it before calling here.
+		if select_panel != null:
+			message_label.visible = not select_panel.visible
+	_refresh_hud()
+
+
+func _ground_point_from_screen(screen_pos: Vector2) -> Vector3:
+	var origin := camera.project_ray_origin(screen_pos)
+	var dir := camera.project_ray_normal(screen_pos)
+	if absf(dir.y) < 0.0001:
+		return Vector3.ZERO
+	var t := -origin.y / dir.y
+	if t < 0.0:
+		return Vector3.ZERO
+	return origin + dir * t
+
+
+func _issue_move_order(screen_pos: Vector2) -> void:
+	if not is_instance_valid(strategist) or not strategist.alive:
+		return
+	var target := _ground_point_from_screen(screen_pos)
+	target.x = clampf(target.x, -80.0, 80.0)
+	target.z = clampf(target.z, -44.0, 44.0)
+	target.y = 0.0
+	strategist.move_to(target)
+	move_marker.global_position = target + Vector3(0, 0.09, 0)
+	move_marker_timer = 0.7
+	move_marker.visible = true
+
+
+# Touch tap resolution (mobile): tap the strategist to select him, tap
+# ground with a hero selected to order a move, tap a build pad in
+# intermission to open the build popup. Kept parallel to the left-click
+# branch below on purpose: desktop left-click stays select-only (move is
+# right-click there), while a single finger has to carry both roles.
+func _handle_tap(screen_pos: Vector2) -> void:
+	if game_state == "intermission":
+		var pad_ground := _ground_point_from_screen(screen_pos)
+		for i in range(pads.size()):
+			var pad: Dictionary = pads[i]
+			var pad_pos: Vector3 = pad["pos"]
+			if Vector2(pad_ground.x - pad_pos.x, pad_ground.z - pad_pos.z).length() <= 2.1:
+				if pad.get("tower") == null:
+					_open_build_popup(i)
+				else:
+					_open_tower_popup(i)
+				return
+	if _try_open_shop_at(screen_pos):
+		return
+	var qid := _quest_npc_at_screen(screen_pos)
+	if qid != "":
+		quest_npc_interact(qid)
+		return
+	if is_instance_valid(strategist) and strategist.alive:
+		var screen_pos_strat := camera.unproject_position(strategist.global_position + Vector3(0, 1.2, 0))
+		if screen_pos_strat.distance_to(screen_pos) <= 64.0:
+			selected = true
+			_update_ui("已选中军师。点地面下令移动，点技能放链式闪电。")
+			return
+		var ground := _ground_point_from_screen(screen_pos)
+		if Vector2(ground.x - strategist.global_position.x, ground.z - strategist.global_position.z).length() <= 1.6:
+			selected = true
+			_update_ui("已选中军师。点地面下令移动，点技能放链式闪电。")
+			return
+	if selected:
+		_issue_move_order(screen_pos)
+
+
+func _unhandled_input(event: InputEvent) -> void:
+	if game_state != "battle" and game_state != "intermission":
+		return
+	if event is InputEventKey:
+		var key_event := event as InputEventKey
+		if key_event.pressed and not key_event.echo and key_event.keycode == KEY_SPACE and game_state == "battle":
+			_cast_chain_lightning()
+			get_viewport().set_input_as_handled()
+		return
+	if event is InputEventScreenTouch:
+		var st := event as InputEventScreenTouch
+		if st.pressed:
+			if _touch_ui and _joy != null and _joy_index == -1 and not _touch_active and not _pinch_active and bool(_joy.call("is_in_zone", st.position, get_viewport().get_visible_rect().size)):
+				# Joystick zone (lower-left): this finger drives the hero.
+				# A quick low-travel release still resolves as a tap below.
+				_joy_index = st.index
+				_joy_press_msec = Time.get_ticks_msec()
+				_joy_drove = false
+				_joy.call("engage", st.position)
+				get_viewport().set_input_as_handled()
+				return
+			if _joy_index != -1 and not _touch_active and not _pinch_active:
+				# Second finger while the joystick is held: hand the
+				# joystick finger over to the pinch as its primary touch.
+				if _joy_drove and is_instance_valid(strategist) and strategist.alive:
+					strategist.stop_moving()
+				_touch_active = true
+				_touch_index = _joy_index
+				_touch_last_pos = _joy.get("knob")
+				_touch_press_pos = _touch_last_pos
+				_touch_press_time_msec = Time.get_ticks_msec()
+				_touch_dragged = true
+				_joy.call("disengage")
+				_joy_index = -1
+				_joy_drove = false
+			if not _touch_active:
+				_touch_active = true
+				_touch_index = st.index
+				_touch_press_pos = st.position
+				_touch_press_time_msec = Time.get_ticks_msec()
+				_touch_dragged = false
+				_touch_last_pos = st.position
+			elif not _pinch_active:
+				# Second finger down: enter pinch mode; the pending tap is
+				# cancelled so a pinch never also issues a move order.
+				_pinch_active = true
+				_pinch_indices = [_touch_index, st.index]
+				_pinch_pos = {_touch_index: _touch_last_pos, st.index: st.position}
+				_pinch_prev_dist = _touch_last_pos.distance_to(st.position)
+				_pinch_prev_center = (_touch_last_pos + st.position) * 0.5
+				_touch_dragged = true
+			get_viewport().set_input_as_handled()
+		else:
+			if _joy_index != -1 and st.index == _joy_index:
+				var joy_held := (Time.get_ticks_msec() - _joy_press_msec) / 1000.0
+				var joy_tap := not _joy_drove and joy_held <= TAP_MAX_TIME and float(_joy.call("travel")) <= TAP_MAX_DIST
+				var joy_pos := st.position
+				if _joy_drove and is_instance_valid(strategist) and strategist.alive:
+					strategist.stop_moving()
+				_joy.call("disengage")
+				_joy_index = -1
+				_joy_drove = false
+				if joy_tap:
+					_handle_tap(joy_pos)
+				get_viewport().set_input_as_handled()
+				return
+			if _pinch_active and _pinch_indices.has(st.index):
+				# One pinch finger lifted: exit pinch; the remaining finger
+				# becomes the single touch again from its last position,
+				# marked dragged so its lift never resolves as a tap.
+				var other: int = _pinch_indices[0] if _pinch_indices[1] == st.index else _pinch_indices[1]
+				_pinch_active = false
+				_pinch_indices.clear()
+				_touch_active = true
+				_touch_index = other
+				_touch_press_pos = _pinch_pos.get(other, _touch_last_pos)
+				_touch_last_pos = _pinch_pos.get(other, _touch_last_pos)
+				_touch_press_time_msec = Time.get_ticks_msec()
+				_touch_dragged = true
+				_pinch_pos.clear()
+			elif _touch_active and st.index == _touch_index:
+				var held_sec := (Time.get_ticks_msec() - _touch_press_time_msec) / 1000.0
+				if not _touch_dragged and held_sec <= TAP_MAX_TIME:
+					_handle_tap(st.position)
+				_touch_active = false
+				_touch_index = -1
+			get_viewport().set_input_as_handled()
+		return
+	if event is InputEventScreenDrag:
+		var sd := event as InputEventScreenDrag
+		if _joy_index != -1 and sd.index == _joy_index:
+			_joy.call("drag_to", sd.position)
+			if float(_joy.call("travel")) > TAP_MAX_DIST:
+				_joy_drove = true
+			get_viewport().set_input_as_handled()
+			return
+		if _pinch_active and _pinch_indices.has(sd.index):
+			_pinch_pos[sd.index] = sd.position
+			var p0: Vector2 = _pinch_pos[_pinch_indices[0]]
+			var p1: Vector2 = _pinch_pos[_pinch_indices[1]]
+			var new_dist := p0.distance_to(p1)
+			var new_center := (p0 + p1) * 0.5
+			if _pinch_prev_dist > 1.0 and new_dist > 1.0:
+				camera_zoom_by(_pinch_prev_dist / new_dist)
+			_pan_by_screen_delta(new_center - _pinch_prev_center)
+			_pinch_prev_dist = new_dist
+			_pinch_prev_center = new_center
+			get_viewport().set_input_as_handled()
+		elif _touch_active and sd.index == _touch_index:
+			if not _touch_dragged and sd.position.distance_to(_touch_press_pos) > TAP_MAX_DIST:
+				_touch_dragged = true
+			if _touch_dragged:
+				_pan_by_screen_delta(sd.relative)
+			_touch_last_pos = sd.position
+			get_viewport().set_input_as_handled()
+		return
+	if event is InputEventMagnifyGesture:
+		var mg := event as InputEventMagnifyGesture
+		if mg.factor > 0.0:
+			camera_zoom_by(1.0 / mg.factor)
+		get_viewport().set_input_as_handled()
+		return
+	if event is InputEventMouseMotion:
+		var mm := event as InputEventMouseMotion
+		if _mid_dragging:
+			_pan_by_screen_delta(mm.relative)
+			get_viewport().set_input_as_handled()
+		elif _right_held:
+			if not _right_dragged and mm.position.distance_to(_right_press_pos) > 10.0:
+				_right_dragged = true
+			if _right_dragged:
+				_pan_by_screen_delta(mm.relative)
+				get_viewport().set_input_as_handled()
+		return
+	if event is InputEventMouseButton:
+		var mb := event as InputEventMouseButton
+		if mb.button_index == MOUSE_BUTTON_WHEEL_UP or mb.button_index == MOUSE_BUTTON_WHEEL_DOWN:
+			if mb.pressed:
+				camera_zoom_by(0.9 if mb.button_index == MOUSE_BUTTON_WHEEL_UP else 1.1)
+				get_viewport().set_input_as_handled()
+			return
+		if mb.button_index == MOUSE_BUTTON_MIDDLE:
+			_mid_dragging = mb.pressed
+			if mb.pressed:
+				get_viewport().set_input_as_handled()
+			return
+		if mb.button_index == MOUSE_BUTTON_RIGHT:
+			# Right-click resolution (optimization round): a plain click
+			# (press + release within 10px) issues the hero move order on
+			# release; dragging beyond the threshold pans the camera and
+			# issues no order.
+			if mb.pressed:
+				_right_held = true
+				_right_dragged = false
+				_right_press_pos = mb.position
+			else:
+				if _right_held and not _right_dragged and selected:
+					_issue_move_order(mb.position)
+					get_viewport().set_input_as_handled()
+				_right_held = false
+				_right_dragged = false
+			return
+		if not mb.pressed:
+			return
+		if mb.button_index == MOUSE_BUTTON_LEFT:
+			# During intermission, clicking a build pad opens the build popup.
+			if game_state == "intermission":
+				var pad_ground := _ground_point_from_screen(mb.position)
+				for i in range(pads.size()):
+					var pad: Dictionary = pads[i]
+					var pad_pos: Vector3 = pad["pos"]
+					if Vector2(pad_ground.x - pad_pos.x, pad_ground.z - pad_pos.z).length() <= 2.1:
+						if pad.get("tower") == null:
+							_open_build_popup(i)
+						else:
+							_open_tower_popup(i)
+						get_viewport().set_input_as_handled()
+						return
+			# Clicking a shopkeeper opens the shop panel.
+			if _try_open_shop_at(mb.position):
+				get_viewport().set_input_as_handled()
+				return
+			# Select the strategist when the click lands near him.
+			if is_instance_valid(strategist) and strategist.alive:
+				var screen_pos := camera.unproject_position(strategist.global_position + Vector3(0, 1.2, 0))
+				if screen_pos.distance_to(mb.position) <= 64.0:
+					selected = true
+					_update_ui("已选中军师。右键地面下令移动，空格放链式闪电。")
+					get_viewport().set_input_as_handled()
+					return
+				var ground := _ground_point_from_screen(mb.position)
+				if Vector2(ground.x - strategist.global_position.x, ground.z - strategist.global_position.z).length() <= 1.6:
+					selected = true
+					_update_ui("已选中军师。右键地面下令移动，空格放链式闪电。")
+					get_viewport().set_input_as_handled()
+					return
+
+
+
+func _start_capture() -> void:
+	_capture_sequence()
+
+
+func _capture_sequence() -> void:
+	# Capture staging (optimization round): screenshots are real-time
+	# renders of the live game. Wave jumps, the wave-1 clear and the gold
+	# top-up are capture probes through the game's own functions, recorded
+	# as such in BUILD_LOG; combat, movement and tower fire are unscripted.
+	var shot_dir := _capture_dir
+	if shot_dir == "":
+		shot_dir = "res://shots"
+	# Stage A: wave 3, strategist ordered to mid-field through the real
+	# command path. Poll for a mid-field fight: >= 5 enemies with x in
+	# [-12, 12], >= 2 of them damaged (HP bars up), the general engaged,
+	# then fire chain lightning through the real skill path and capture
+	# candidates for shot_05_midfield_combat.png.
+	await get_tree().create_timer(1.2).timeout
+	_start_wave(3)
+	_issue_move_order(Vector2(640, 400))
+	var cand_dir := "/tmp/opt_candidates"
+	DirAccess.make_dir_recursive_absolute(cand_dir)
+	var waited := 0.0
+	var cand_count := 0
+	var since_cand := 99.0
+	var probed := false
+	while waited < 120.0 and cand_count < 3:
+		await get_tree().create_timer(0.15).timeout
+		waited += 0.15
+		since_cand += 0.15
+		if game_state != "battle":
+			break
+		var mid: Array = []
+		var damaged_mid := 0
+		for e in alive_enemies():
+			var ex: float = e.global_position.x
+			if ex >= -12.0 and ex <= 12.0:
+				mid.append(e)
+				if e.hp < e.max_hp - 1.0:
+					damaged_mid += 1
+		var general_engaged := false
+		if is_instance_valid(general) and general.alive:
+			for e in alive_enemies():
+				if Vector2(e.global_position.x - general.global_position.x, e.global_position.z - general.global_position.z).length() <= 7.0:
+					general_engaged = true
+					break
+		# Probe (documented): if tower fire alone has not bloodied two
+		# mid-field enemies by 55s, chip two of them through the damage
+		# pipeline so their HP bars are up for the frame.
+		if waited > 55.0 and not probed and damaged_mid < 2 and mid.size() >= 2:
+			probed = true
+			for i in range(mini(2, mid.size())):
+				apply_damage(null, mid[i], mid[i].max_hp * 0.4, "capture_probe")
+			print("CAPTURE probe_damage applied to 2 mid-field enemies")
+			damaged_mid = 2
+		if mid.size() >= 5 and damaged_mid >= 2 and general_engaged and since_cand >= 1.2:
+			if skill_cooldown <= 0.0:
+				var near_strat := 0
+				for e in alive_enemies():
+					if Vector2(e.global_position.x - strategist.global_position.x, e.global_position.z - strategist.global_position.z).length() <= CHAIN_RANGE:
+						near_strat += 1
+				if near_strat >= 3:
+					_cast_chain_lightning()
+					await get_tree().create_timer(0.10).timeout
+			cand_count += 1
+			print("CAPTURE combat_candidate ", cand_count, " mid=", mid.size(),
+				" damaged=", damaged_mid, " waited=", snappedf(waited, 0.1))
+			await _save_screenshot(cand_dir.path_join("combat_cand_%02d.png" % cand_count))
+			since_cand = 0.0
+	print("CAPTURE combat_candidates total=", cand_count)
+	if cand_count == 0:
+		print("CAPTURE combat_frame FALLBACK (conditions unmet in 120s)")
+		await _save_screenshot(cand_dir.path_join("combat_cand_00.png"))
+	# Stage B: fresh run, clear wave 1 via the damage pipeline, then use
+	# the real intermission to build one thunder and one flame tower; the
+	# HUD now also shows the next-wave composition -> shot_06.
+	reset_game()
+	await get_tree().create_timer(1.0).timeout
+	var guard := 0
+	while game_state == "battle" and guard < 280:
+		for e in alive_enemies():
+			apply_damage(null, e, 9999.0, "capture_probe")
+		await get_tree().create_timer(0.25).timeout
+		guard += 1
+	if game_state == "intermission":
+		gold = maxi(gold, 300)
+		intermission_timer = 90.0
+		build_tower(0, "thunder")
+		build_tower(1, "flame")
+		await get_tree().create_timer(1.4).timeout
+		await _save_screenshot(shot_dir.path_join("shot_06_intermission_preview.png"))
+	await get_tree().create_timer(0.4).timeout
+	get_tree().quit()
+
+
+func _save_screenshot(path: String) -> void:
+	await RenderingServer.frame_post_draw
+	var img := get_viewport().get_texture().get_image()
+	if img == null:
+		push_error("CAPTURE: viewport image null for " + path)
+		return
+	var base := path.get_base_dir()
+	if base.begins_with("/"):
+		DirAccess.make_dir_recursive_absolute(base)
+	var err := img.save_png(path)
+	print("CAPTURE saved=", path, " err=", err, " size=", img.get_size())

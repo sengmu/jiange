@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://bprobefinale01"]
+
+[ext_resource type="Script" path="res://scripts/probe_finale.gd" id="1"]
+
+[node name="ProbeFinale" type="Node3D"]
+script = ExtResource("1")

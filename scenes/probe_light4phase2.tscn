@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://bphase2x7jiange"]
+
+[ext_resource type="Script" path="res://scripts/probe_light4phase2.gd" id="1"]
+
+[node name="ProbeLight4Phase2" type="Node3D"]
+script = ExtResource("1")

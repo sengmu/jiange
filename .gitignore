@@ -1,0 +1,16 @@
+# Godot 导入缓存（可重建）
+.godot/
+# 构建产物
+build/
+android/build/
+# 临时文件、验证包、日志、探针产物
+.tmp/
+# 审查对照截图（留本地）
+shots/
+# 二进制包与签名产物
+*.apk
+*.pck
+*.idsig
+*.tmp
+# 导出预设含非默认 keystore 口令（本地留存，不进仓）
+export_presets.cfg
