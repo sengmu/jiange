@@ -14,6 +14,9 @@ func _grab(path: String) -> void:
 	print("PROBE_WALLET saved=", path)
 
 func _run() -> void:
+	var _probe_wallet := get_node_or_null("/root/Wallet")
+	if _probe_wallet != null:
+		_probe_wallet.disconnect_wallet()
 	await get_tree().create_timer(2.5).timeout
 	await _grab("res://shots/wallet_select.png")
 	game.call("_open_wallet_panel")

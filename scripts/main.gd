@@ -4772,13 +4772,20 @@ func _build_ui() -> void:
 	wtitle.add_theme_font_size_override("font_size", 20 if _touch_ui else 18)
 	wtitle.add_theme_color_override("font_color", UI_GOLD_HI)
 	wtitle.add_theme_font_override("font", CJK_FONT_BOLD)
-	wv.add_child(wtitle)
+	var wallet_title_row := HBoxContainer.new()
+	var wallet_title_sp := Control.new()
+	wallet_title_sp.custom_minimum_size = Vector2(34, 0)
+	wallet_title_sp.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	wallet_title_row.add_child(wallet_title_sp)
+	wallet_title_row.add_child(wtitle)
+	wv.add_child(wallet_title_row)
 	wallet_status_label = Label.new()
 	wallet_status_label.name = "WalletStatus"
 	wallet_status_label.text = "游客模式 · 未连接钱包"
 	wallet_status_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	wallet_status_label.add_theme_font_size_override("font_size", 16 if _touch_ui else 15)
 	wallet_status_label.add_theme_color_override("font_color", Color(0.90, 0.88, 0.82))
+	wallet_status_label.custom_minimum_size = Vector2(500, 0)
 	wv.add_child(wallet_status_label)
 	wallet_connect_button = Button.new()
 	wallet_disconnect_button = Button.new()
@@ -4803,6 +4810,7 @@ func _build_ui() -> void:
 	wallet_fallback_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	wallet_fallback_label.add_theme_font_size_override("font_size", 15 if _touch_ui else 14)
 	wallet_fallback_label.add_theme_color_override("font_color", Color(0.75, 0.72, 0.62))
+	wallet_fallback_label.custom_minimum_size = Vector2(500, 0)
 	wv.add_child(wallet_fallback_label)
 	var address_row := HBoxContainer.new()
 	address_row.add_theme_constant_override("separation", 8)
@@ -9905,8 +9913,9 @@ func _on_wallet_p0_pressed() -> void:
 	if oid == "":
 		_update_ui("订单创建失败。")
 		return
-	Wallet.transfer_sol(oid)
-	_update_ui("P0 冒烟转账已提交，等待钱包签名…")
+	var submitted := Wallet.transfer_sol(oid)
+	if submitted != "":
+		_update_ui("P0 冒烟转账已提交，等待钱包签名…")
 
 
 func _on_wallet_balance_pressed() -> void:

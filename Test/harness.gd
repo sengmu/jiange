@@ -3852,6 +3852,7 @@ func _run() -> void:
 	check("wallet_entry_panel_initially_hidden", panel_wallet != null and not panel_wallet.visible, "initially hidden")
 	wallet_game.call("_open_wallet_panel")
 	check("wallet_entry_panel_opens_unconnected", panel_wallet.visible and fallback_wallet.text == WalletManager.ERR_MWA_UNAVAILABLE and (wallet.is_mwa_available() or fallback_wallet.visible), "open and fallback")
+	check("wallet_entry_panel_sane_size", panel_wallet.get_combined_minimum_size().y < 900.0 and panel_wallet.get_combined_minimum_size().x <= 600.0, "min_size=" + str(panel_wallet.get_combined_minimum_size()))
 	wallet_game.call("_close_wallet_panel")
 	check("wallet_entry_panel_closes", not panel_wallet.visible, "closed")
 	check("wallet_entry_status_guest_text", "游客" in status_wallet.text, status_wallet.text)
