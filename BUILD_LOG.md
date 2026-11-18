@@ -2351,3 +2351,14 @@
 - **截图亲看（本轮直接读图，只读）**：`shots/compare_attr_row.png` 上下两半均正常渲染、无黑屏／空白、中文零 tofu——上半改前 22 卡无属性行，下半改后每卡姓名条上方均有绢黄属性条（赵统 攻 26 · 防 4.6、关兴 攻 28 · 防 5.1 等），锁定三卡（陆逊／木鹿大王／刘谌）属性行亮度正常、与姓名条无重叠；22 张手绘头像卡片式选将面板、口令行与「开始守城」钮完整。既有观察：顶部横幅与「墓地」牌重叠、「新城」牌压 HUD 信息板区、底部帮助文案右缘被切，均非新缺陷。
 - **下载地址**：https://jiange-packs-game.musen-ai-9527.workers.dev/game.apk（0.1.69，111,111,521 B，sha256 `219b9f2f…`）；装上后重点看：选将界面每张卡姓名条上方绢黄属性条（攻/防 Lv1 值）是否可读、与姓名条无重叠。钱包入口修复（0.1.70）尚未出包，不要按线上包验收钱包按钮。
 - **下一项**：待并行会话交付钱包入口修复（0.1.70 harness＋探针＋出包）；待用户——Seeker 真机 P0 五项（装 0.1.69→Phantom 切 devnet→领水龙头→连接→签名测试→转 0.01 SOL→断开重连）；画面三项裁定（⑤地面补光、⑦色调分离、⑥扩围或封存）；Seeker 实机验收（手游化第 5 项）与真人式试玩记录仍待后续轮次。
+
+## 上仓首版（2026-11-18 23:3x，用户改令「先推仓库，不等 0.1.70」）
+
+- **仓库**：https://github.com/sengmu/jiange（私有，用户已建好空仓；远端推送前 `git ls-remote` 对 HEAD 为空，确认空仓）
+- **首版提交**：`68a6748`「剑阁 0.1.69 + 钱包入口（进行中，harness 未完待 0.1.70 续补）」，main 分支，1,171 文件、142,720,849 B（约 136MB）、86,108 行插入
+- **状态如实标注（WIP，非已完成）**：树＝0.1.69（code 70）＋钱包入口代码已入 main.gd（「连接钱包」按钮 5 处、接 wallet.gd 连接/断开/签名测试/转账 0.01 SOL），但 harness 未完（0.1.70 单内常规轨复跑中、触控轨 821/821 全绿）、探针与出包未做；**本提交只求树快照，不代表已验证、已完成**。提交时 0.1.70 协调器仍在同一树上跑，其后续改动不在本提交内；0.1.70 落地后另补提交。
+- **完整性检查**：Godot 4.4.1 `--check-only` 过 `scripts/main.gd` 与 `scripts/wallet.gd`，双双 exit 0（仅一条既有无头关机噪声 `free_static p_ptr is null`，非解析错误）。
+- **排除清单**：`.godot/`（681M 导入缓存）、`build/`（2.4G）、`android/build/`（Gradle 构建产物，内含 >90MB 的 .aar/.so/APK）、`.tmp/`（3.6G）、`shots/`（896M 对照截图留本地）；`*.apk`、`*.pck`、`*.idsig`、`*.tmp`；**`export_presets.cfg` 暂不进仓**——内含一处非默认、非空的 keystore 口令值（已用 MATCH/NOMATCH 法核实既非公开默认值 "android"、亦非空），按凭证纪律不提交；keystore 文件本身不在树内（在 ~/.local/share/godot/keystores/debug.keystore）。复核：提交前全树扫 >90MB 文件，staged 最大仅 8.5MB、>90MB 计 0。
+- **推送与验证**：`git push -u origin main` 一次成功；`git ls-remote` 对 HEAD 与本地一致 `68a6748693e853885cf9e27ae018355a6db5f1cf`；中立目录 clone 核对：1,171 文件、HEAD 一致，`scripts/main.gd`、`project.godot`、`scripts/wallet.gd`、`scripts/ed25519_verify.gd`、`.gitignore`、`LOOP_STATE.md`、`BUILD_LOG.md` 均在，`export_presets.cfg` 确认不在，克隆 main.gd 中「连接钱包」5 处；验证 clone 已删除。
+- **本地 git 配置**：仓库级 `core.sshCommand=~/workspace/tools/git-ssh-github.sh`（走 egress 代理 CONNECT＋显式 `-i ~/.ssh/id_ed25519`）；提交身份本地配为 sengmu / sengmu@users.noreply.github.com（全局未配）；树内原空目录占位 `.git` 与 `.tmp/.git` 已 rmdir 清除后 `git init -b main`。
+- **下一项**：0.1.70 落地后另补提交（presets 改 0.1.70/code 71＋harness 数＋探针图）；export_presets.cfg 的口令处置待用户/主控裁定（改回默认 "android" 或长期本地留存）。
