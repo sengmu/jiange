@@ -12,5 +12,3 @@ shots/
 *.pck
 *.idsig
 *.tmp
-# 导出预设含非默认 keystore 口令（本地留存，不进仓）
-export_presets.cfg
